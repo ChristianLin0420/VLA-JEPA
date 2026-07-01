@@ -15,6 +15,7 @@ def make_LeRobotSingleDataset(
     data_name: str,
     robot_type: str,  # 新增参数
     delete_pause_frame: bool = False,
+    sample_mode: str = "single_step",
     action_horizon: int = 7,
     video_horizon: int = 16,
 ) -> LeRobotSingleDataset:
@@ -47,6 +48,7 @@ def make_LeRobotSingleDataset(
         embodiment_tag=embodiment_tag,
         video_backend="torchvision_av",
         delete_pause_frame=delete_pause_frame,
+        sample_mode=sample_mode,
     )
 
 def get_vla_dataset(
@@ -55,7 +57,11 @@ def get_vla_dataset(
     balance_dataset_weights: bool = False,
     balance_trajectory_weights: bool = False,
     seed: int = 42,
-    delete_pause_frame: bool = True,
+    delete_pause_frame: bool | None = None,
+    sample_mode: str | None = None,
+    segment_length: int | None = None,
+    burn_in_max_decisions: int | None = None,
+    segment_stride: int | None = None,
     action_horizon: int = 7,
     video_horizon: int = 16,
     **kwargs: dict,
@@ -65,6 +71,31 @@ def get_vla_dataset(
     """
     data_root_dir = data_cfg.data_root_dir
     data_mix = data_cfg.data_mix
+    delete_pause_frame = (
+        bool(data_cfg.get("delete_pause_frame", True))
+        if delete_pause_frame is None
+        else bool(delete_pause_frame)
+    )
+    sample_mode = (
+        str(data_cfg.get("sample_mode", "single_step"))
+        if sample_mode is None
+        else str(sample_mode)
+    )
+    segment_length = (
+        int(data_cfg.get("segment_length", 4))
+        if segment_length is None
+        else int(segment_length)
+    )
+    burn_in_max_decisions = (
+        int(data_cfg.get("burn_in_max_decisions", 8))
+        if burn_in_max_decisions is None
+        else int(burn_in_max_decisions)
+    )
+    segment_stride = (
+        int(data_cfg.get("segment_stride", action_horizon))
+        if segment_stride is None
+        else int(segment_stride)
+    )
     mixture_spec = DATASET_NAMED_MIXTURES[data_mix]
     included_datasets, filtered_mixture_spec = set(), []
     for d_name, d_weight, robot_type in mixture_spec:  
@@ -81,7 +112,8 @@ def get_vla_dataset(
         dataset_mixture.append((make_LeRobotSingleDataset(Path(data_root_dir), 
                                                           d_name, 
                                                           robot_type, 
-                                                          delete_pause_frame=delete_pause_frame, 
+                                                          delete_pause_frame=delete_pause_frame,
+                                                          sample_mode=sample_mode,
                                                           action_horizon=action_horizon,
                                                           video_horizon=video_horizon), d_weight))
 
@@ -94,6 +126,10 @@ def get_vla_dataset(
         resolution_size=data_cfg.get("resolution_size", 224),
         video_resolution_size=data_cfg.get("video_resolution_size", 256),
         seed=seed,
+        sample_mode=sample_mode,
+        segment_length=segment_length,
+        burn_in_max_decisions=burn_in_max_decisions,
+        segment_stride=segment_stride,
         **kwargs,
     )
 

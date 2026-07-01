@@ -317,15 +317,36 @@ class FlowmatchingActionHead(nn.Module):
         return loss
 
     @torch.no_grad()
-    def predict_action(self, vl_embs: torch.Tensor, state: torch.Tensor = None) -> torch.Tensor:
+    def predict_action(
+        self,
+        vl_embs: torch.Tensor,
+        state: torch.Tensor = None,
+        generator: torch.Generator | None = None,
+        initial_noise: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Integrate the action flow from caller-owned or explicitly supplied noise.
+
+        ``generator`` lets serving keep random-number state private to one session.
+        ``initial_noise`` is useful for deterministic parity tests.  Existing callers
+        that provide neither argument retain the original behavior.
+        """
         # Set initial actions as the sampled noise.
         batch_size = vl_embs.shape[0]
         device = vl_embs.device
-        actions = torch.randn(
-            size=(batch_size, self.config.action_horizon, self.config.action_dim),
-            dtype=vl_embs.dtype,
-            device=device,
-        )
+        expected_shape = (batch_size, self.config.action_horizon, self.config.action_dim)
+        if initial_noise is not None:
+            if tuple(initial_noise.shape) != expected_shape:
+                raise ValueError(
+                    f"initial_noise must have shape {expected_shape}, got {tuple(initial_noise.shape)}"
+                )
+            actions = initial_noise.to(device=device, dtype=vl_embs.dtype)
+        else:
+            actions = torch.randn(
+                size=expected_shape,
+                dtype=vl_embs.dtype,
+                device=device,
+                generator=generator,
+            )
 
         num_steps = self.num_inference_timesteps
         dt = 1.0 / num_steps

@@ -87,6 +87,7 @@ class ModelClient:
         else:
             self.action_ensembler = None
         self.num_image_history = 0
+        self._episode_counter = 0
 
         self.action_norm_stats = self.get_action_stats(self.unnorm_key, policy_ckpt_path=policy_ckpt_path)
         
@@ -96,6 +97,12 @@ class ModelClient:
         self.num_image_history = min(self.num_image_history + 1, self.horizon)
 
     def reset(self, task_description: str) -> None:
+        self._episode_counter += 1
+        self.client.reset(
+            instruction=task_description,
+            episode_id=f"simpler-{self._episode_counter}",
+            episode_seed=self._episode_counter,
+        )
         self.task_description = task_description
         self.image_history.clear()
         if self.action_ensemble:

@@ -63,6 +63,12 @@ LE_ROBOT_STATS_FILENAME = "meta/stats_gr00t.json"
 LE_ROBOT_DATA_FILENAME = "data/*/*.parquet"
 LE_ROBOT_STEPS_FILENAME = "meta/steps.pkl"
 EPSILON = 5e-4
+SAMPLE_MODE_SINGLE_STEP = "single_step"
+SAMPLE_MODE_CONTIGUOUS_SEGMENT = "contiguous_segment"
+SUPPORTED_SAMPLE_MODES = {
+    SAMPLE_MODE_SINGLE_STEP,
+    SAMPLE_MODE_CONTIGUOUS_SEGMENT,
+}
 
 def calculate_dataset_statistics(parquet_paths: list[Path]) -> dict:
     """Calculate the dataset statistics of all columns for a list of parquet files."""
@@ -124,6 +130,7 @@ class LeRobotSingleDataset(Dataset):
         video_backend_kwargs: dict | None = None,
         transforms: ComposedModalityTransform | None = None,
         delete_pause_frame: bool = False,
+        sample_mode: str = SAMPLE_MODE_SINGLE_STEP,
     ):
         """
         Initialize the dataset.
@@ -141,7 +148,14 @@ class LeRobotSingleDataset(Dataset):
         if not Path(dataset_path).exists():
             raise FileNotFoundError(f"Dataset path {dataset_path} does not exist")
 
+        if sample_mode not in SUPPORTED_SAMPLE_MODES:
+            raise ValueError(
+                f"Unsupported sample_mode {sample_mode!r}; expected one of "
+                f"{sorted(SUPPORTED_SAMPLE_MODES)}"
+            )
+
         self.delete_pause_frame = delete_pause_frame
+        self.sample_mode = sample_mode
 
         self.modality_configs = modality_configs
         self.video_backend = video_backend
@@ -172,7 +186,14 @@ class LeRobotSingleDataset(Dataset):
         self._trajectory_ids, self._trajectory_lengths = self._get_trajectories()
         self._modality_keys = self._get_modality_keys()
         self._delta_indices = self._get_delta_indices()
-        self._all_steps = self._get_all_steps()
+        # The recurrent path samples from raw trajectory metadata.  In particular,
+        # it must not construct or consult the pause-filtered ``all_steps`` cache:
+        # filtered positions are not a temporally meaningful decision lattice.
+        self._all_steps = (
+            self._get_all_steps()
+            if self.sample_mode == SAMPLE_MODE_SINGLE_STEP
+            else None
+        )
         self.set_transforms_metadata(self.metadata)
         self.set_epoch(0)
 
@@ -216,6 +237,11 @@ class LeRobotSingleDataset(Dataset):
                 ("traj_2", 0), ("traj_2", 1), ("traj_2", 2), ("traj_2", 3)
             ]
         """
+        if self._all_steps is None:
+            raise RuntimeError(
+                "all_steps is intentionally unavailable in contiguous_segment mode; "
+                "sample from raw trajectory metadata instead"
+            )
         return self._all_steps
 
     @property
@@ -713,6 +739,8 @@ class LeRobotSingleDataset(Dataset):
         Returns:
             int: the total number of data points in the dataset.
         """
+        if self.sample_mode == SAMPLE_MODE_CONTIGUOUS_SEGMENT:
+            return int(np.asarray(self.trajectory_lengths, dtype=np.int64).sum())
         return len(self.all_steps)
 
     def __str__(self) -> str:
@@ -798,7 +826,9 @@ class LeRobotSingleDataset(Dataset):
                 episode_chunk=chunk_index, episode_index=trajectory_id
             )
             assert parquet_path.exists(), f"Parquet file not found at {parquet_path}"
-            return pd.read_parquet(parquet_path)
+            self.curr_traj_data = pd.read_parquet(parquet_path)
+            self.curr_traj_id = trajectory_id
+            return self.curr_traj_data
 
     def get_trajectory_index(self, trajectory_id: int) -> int:
         """Get the index of the trajectory in the dataset by the trajectory ID.
@@ -1380,6 +1410,10 @@ class LeRobotMixtureDataset(Dataset):
         resolution_size: int = 224,
         video_resolution_size: int = 256,
         seed: int = 42,
+        sample_mode: str = SAMPLE_MODE_SINGLE_STEP,
+        segment_length: int = 4,
+        burn_in_max_decisions: int = 8,
+        segment_stride: int = 7,
         metadata_config: dict = {
             "percentile_mixing_method": "min_max",
         },
@@ -1394,13 +1428,52 @@ class LeRobotMixtureDataset(Dataset):
             balance_trajectory_weights (bool): If True, sample trajectories within a dataset weighted by their length; otherwise, use equal weighting.
             seed (int): Random seed for sampling.
         """
+        if sample_mode not in SUPPORTED_SAMPLE_MODES:
+            raise ValueError(
+                f"Unsupported sample_mode {sample_mode!r}; expected one of "
+                f"{sorted(SUPPORTED_SAMPLE_MODES)}"
+            )
+        if int(segment_length) <= 0:
+            raise ValueError("segment_length must be positive")
+        if int(burn_in_max_decisions) < 0:
+            raise ValueError("burn_in_max_decisions must be non-negative")
+        if int(segment_stride) <= 0:
+            raise ValueError("segment_stride must be positive")
+
+        self.sample_mode = sample_mode
+        self.segment_length = int(segment_length)
+        self.burn_in_max_decisions = int(burn_in_max_decisions)
+        self.segment_stride = int(segment_stride)
+        self.balance_dataset_weights = balance_dataset_weights
+        self.balance_trajectory_weights = balance_trajectory_weights
+        self.seed = int(seed)
+        self.mode = mode
+        self.with_state = with_state
+        self.resolution_size = resolution_size
+        self.video_resolution_size = video_resolution_size
+
         datasets: list[LeRobotSingleDataset] = []
         dataset_sampling_weights: list[float] = []
+        segment_catalogs: list[dict] = []
         for dataset, weight in data_mixture:
-            # Check if dataset is valid and has data
-            if len(dataset) == 0:
-                print(f"Warning: Skipping empty dataset {dataset.dataset_name}")
-                continue
+            if self.sample_mode == SAMPLE_MODE_CONTIGUOUS_SEGMENT:
+                # Build this compact catalog exclusively from raw episode IDs,
+                # lengths, and modality deltas.  It intentionally never touches
+                # ``dataset.all_steps`` or its pause-filtered cache.
+                catalog = self._build_segment_catalog(dataset)
+                if catalog["total_starts"] == 0:
+                    print(
+                        f"Warning: Skipping dataset {dataset.dataset_name}; no fully "
+                        f"valid K={self.segment_length} segments at stride "
+                        f"{self.segment_stride}"
+                    )
+                    continue
+                segment_catalogs.append(catalog)
+            else:
+                # Preserve the original singleton path and its filtered length.
+                if len(dataset) == 0:
+                    print(f"Warning: Skipping empty dataset {dataset.dataset_name}")
+                    continue
             datasets.append(dataset)
             dataset_sampling_weights.append(weight)
         
@@ -1408,18 +1481,18 @@ class LeRobotMixtureDataset(Dataset):
             raise ValueError("No valid datasets found in the mixture. All datasets are empty.")
         
         self.datasets = datasets
-        self.balance_dataset_weights = balance_dataset_weights
-        self.balance_trajectory_weights = balance_trajectory_weights
-        self.seed = seed
-        self.mode = mode
-        self.with_state = with_state
-        self.resolution_size = resolution_size
-        self.video_resolution_size = video_resolution_size
+        self._segment_catalogs = segment_catalogs
 
         # Set properties for sampling
 
         # 1. Dataset lengths
-        self._dataset_lengths = np.array([len(dataset) for dataset in self.datasets])
+        if self.sample_mode == SAMPLE_MODE_CONTIGUOUS_SEGMENT:
+            self._dataset_lengths = np.asarray(
+                [catalog["total_starts"] for catalog in self._segment_catalogs],
+                dtype=np.int64,
+            )
+        else:
+            self._dataset_lengths = np.array([len(dataset) for dataset in self.datasets])
         print(f"Dataset lengths: {self._dataset_lengths}")
 
         # 2. Dataset sampling weights
@@ -1487,6 +1560,67 @@ class LeRobotMixtureDataset(Dataset):
 
         self.update_metadata(metadata_config)
 
+    def _build_segment_catalog(self, dataset: LeRobotSingleDataset) -> dict:
+        """Build a compact raw-trajectory catalog of fully valid segment starts.
+
+        A start belongs to the episode-anchored decision lattice
+        ``0, stride, 2 * stride, ...``.  Every modality delta must be valid at
+        every one of the K supervised decisions.  We store counts and a prefix
+        sum per trajectory instead of materializing millions of start tuples.
+        """
+
+        trajectory_ids = np.asarray(dataset.trajectory_ids)
+        trajectory_lengths = np.asarray(dataset.trajectory_lengths, dtype=np.int64)
+        if trajectory_ids.ndim != 1 or trajectory_lengths.ndim != 1:
+            raise ValueError(
+                f"{dataset.dataset_name}: trajectory_ids and trajectory_lengths "
+                "must be one-dimensional"
+            )
+        if len(trajectory_ids) != len(trajectory_lengths):
+            raise ValueError(
+                f"{dataset.dataset_name}: trajectory ID/length count mismatch "
+                f"({len(trajectory_ids)} != {len(trajectory_lengths)})"
+            )
+        if np.any(trajectory_lengths < 0):
+            raise ValueError(f"{dataset.dataset_name}: negative trajectory length")
+
+        delta_arrays = []
+        for delta_indices in dataset.delta_indices.values():
+            values = np.asarray(delta_indices, dtype=np.int64).reshape(-1)
+            if values.size:
+                delta_arrays.append(values)
+        if delta_arrays:
+            all_deltas = np.concatenate(delta_arrays)
+            min_delta = int(all_deltas.min())
+            max_delta = int(all_deltas.max())
+        else:
+            min_delta = 0
+            max_delta = 0
+
+        stride = self.segment_stride
+        minimum_valid_base = max(0, -min_delta)
+        first_base = ((minimum_valid_base + stride - 1) // stride) * stride
+        supervised_span = (self.segment_length - 1) * stride
+        last_start = trajectory_lengths - 1 - max_delta - supervised_span
+        valid_start_counts = np.where(
+            last_start >= first_base,
+            ((last_start - first_base) // stride) + 1,
+            0,
+        ).astype(np.int64)
+        cumulative_starts = np.cumsum(valid_start_counts, dtype=np.int64)
+        total_starts = int(cumulative_starts[-1]) if cumulative_starts.size else 0
+
+        return {
+            "trajectory_ids": trajectory_ids,
+            "trajectory_lengths": trajectory_lengths,
+            "valid_start_counts": valid_start_counts,
+            "cumulative_starts": cumulative_starts,
+            "total_starts": total_starts,
+            "first_base": first_base,
+            "min_delta": min_delta,
+            "max_delta": max_delta,
+        }
+
     @property
     def dataset_lengths(self) -> np.ndarray:
         """The lengths of each dataset."""
@@ -1525,6 +1659,124 @@ class LeRobotMixtureDataset(Dataset):
         """
         self.epoch = epoch
         # self.sampled_steps = self.sample_epoch()
+
+    def _segment_rng(self, index: int) -> np.random.Generator:
+        """Return the only RNG used by deterministic segment selection."""
+
+        effective_epoch = self.epoch if self.mode == "train" else 0
+        seed = safe_hash(("segment-v1", effective_epoch, int(index), self.seed))
+        return np.random.default_rng(seed)
+
+    def _sample_segment_location(
+        self, index: int
+    ) -> tuple[LeRobotSingleDataset, dict, int, int, int]:
+        """Choose dataset, trajectory, and fully valid supervised start."""
+
+        if self.sample_mode != SAMPLE_MODE_CONTIGUOUS_SEGMENT:
+            raise RuntimeError("sample_segment requires sample_mode='contiguous_segment'")
+
+        rng = self._segment_rng(index)
+        dataset_index = int(
+            rng.choice(len(self.datasets), p=self.dataset_sampling_weights)
+        )
+        dataset = self.datasets[dataset_index]
+        catalog = self._segment_catalogs[dataset_index]
+
+        flat_start = int(rng.integers(catalog["total_starts"]))
+        trajectory_index = int(
+            np.searchsorted(catalog["cumulative_starts"], flat_start, side="right")
+        )
+        previous_total = (
+            int(catalog["cumulative_starts"][trajectory_index - 1])
+            if trajectory_index > 0
+            else 0
+        )
+        start_within_trajectory = flat_start - previous_total
+        supervised_start = (
+            int(catalog["first_base"])
+            + start_within_trajectory * self.segment_stride
+        )
+        episode_id = int(catalog["trajectory_ids"][trajectory_index])
+        return dataset, catalog, trajectory_index, episode_id, supervised_start
+
+    def sample_segment(self, index: int) -> dict:
+        """Return one fixed-size burn-in + supervised segment.
+
+        The first J positions are a bounded burn-in prefix, left-padded with
+        ``None``.  The final K positions are always fully valid raw decisions.
+        No global RNG or filtered ``all_steps`` index participates in this path.
+        """
+
+        dataset, catalog, trajectory_index, episode_id, supervised_start = (
+            self._sample_segment_location(index)
+        )
+        stride = self.segment_stride
+        burn_in = self.burn_in_max_decisions
+        supervised = self.segment_length
+        first_base = int(catalog["first_base"])
+        trajectory_length = int(catalog["trajectory_lengths"][trajectory_index])
+
+        supervised_bases = supervised_start + np.arange(
+            supervised, dtype=np.int64
+        ) * stride
+        first_burn_base = max(first_base, supervised_start - burn_in * stride)
+        burn_bases = np.arange(
+            first_burn_base, supervised_start, stride, dtype=np.int64
+        )
+        if len(burn_bases) > burn_in:
+            raise AssertionError("internal error: burn-in exceeds configured bound")
+        pad_count = burn_in - len(burn_bases)
+
+        base_indices = np.concatenate(
+            (
+                np.full(pad_count, -1, dtype=np.int64),
+                burn_bases,
+                supervised_bases,
+            )
+        )
+        total_length = burn_in + supervised
+        if len(base_indices) != total_length:
+            raise AssertionError("internal error: segment metadata has wrong length")
+
+        min_delta = int(catalog["min_delta"])
+        max_delta = int(catalog["max_delta"])
+        if (
+            int(supervised_bases[0]) + min_delta < 0
+            or int(supervised_bases[-1]) + max_delta >= trajectory_length
+        ):
+            raise AssertionError("internal error: sampled supervised segment is invalid")
+
+        sequence_valid = base_indices >= 0
+        loss_mask = np.zeros(total_length, dtype=np.bool_)
+        loss_mask[burn_in:] = True
+        update_mask = sequence_valid.copy()
+        segment_start = np.zeros(total_length, dtype=np.bool_)
+        segment_start[burn_in] = True
+        is_first = sequence_valid & (base_indices == 0)
+        is_last = sequence_valid & (
+            base_indices + stride + max_delta >= trajectory_length
+        )
+
+        steps = [None] * pad_count
+        steps.extend(
+            self._format_step(dataset, episode_id, int(base_index))
+            for base_index in np.concatenate((burn_bases, supervised_bases))
+        )
+        if len(steps) != total_length:
+            raise AssertionError("internal error: segment payload has wrong length")
+
+        return {
+            "steps": steps,
+            "dataset_id": str(dataset.dataset_name),
+            "episode_id": episode_id,
+            "base_indices": base_indices,
+            "segment_start": segment_start,
+            "is_first": is_first,
+            "is_last": is_last,
+            "sequence_valid": sequence_valid,
+            "loss_mask": loss_mask,
+            "update_mask": update_mask,
+        }
 
     def sample_step(self, index: int) -> tuple[LeRobotSingleDataset, int, int]:
         """Sample a single step from the dataset."""
@@ -1575,6 +1827,51 @@ class LeRobotMixtureDataset(Dataset):
         
         return resized_video
 
+    def _format_step(
+        self,
+        dataset: LeRobotSingleDataset,
+        trajectory_id: int,
+        base_index: int,
+    ) -> dict:
+        """Load and format one raw decision for both sampling modes."""
+
+        data = dataset.transforms(dataset.get_step_data(trajectory_id, base_index))
+
+        videos, images = [], []
+        video_keys = dataset.modality_keys["video"]
+        for i, video_key in enumerate(video_keys):
+            video = self.resize_video_opencv(
+                data[video_key], self.video_resolution_size
+            )
+            if len(video_keys) > 2:
+                if i in [0, 2]:
+                    videos.append(video)
+            else:
+                videos.append(video)
+            images.append(
+                Image.fromarray(video[0]).resize(
+                    (self.resolution_size, self.resolution_size)
+                )
+            )
+        if len(video_keys) == 1:
+            videos = [videos[0], videos[0].copy()]
+        videos = np.stack(videos, axis=0)
+
+        language = data[dataset.modality_keys["language"][0]][0]
+        action = np.concatenate(
+            [data[action_key] for action_key in dataset.modality_keys["action"]],
+            axis=1,
+        ).astype(np.float16)
+
+        result = dict(action=action, image=images, lang=language, video=videos)
+        if self.with_state:
+            state = np.concatenate(
+                [data[state_key] for state_key in dataset.modality_keys["state"]],
+                axis=1,
+            ).astype(np.float16)
+            result["state"] = state[0:1]
+        return result
+
     def __getitem__(self, index: int) -> dict:
         """Get the data for a single trajectory and start index.
 
@@ -1584,52 +1881,18 @@ class LeRobotMixtureDataset(Dataset):
         Returns:
             dict: The data for the trajectory and start index.
         """
+        if self.sample_mode == SAMPLE_MODE_CONTIGUOUS_SEGMENT:
+            # Segment sampling is deterministic and fail-fast.  Substituting a
+            # global-random example after a decode error would break exact resume.
+            return self.sample_segment(index)
+
         max_retries = 10
         last_exception = None
         
         for attempt in range(max_retries):
             try:
                 dataset, trajectory_name, step = self.sample_step(index)
-                data = dataset.transforms(dataset.get_step_data(trajectory_name, step))    # video T = 1, action T = horizon
-                
-                # Process all video keys dynamically
-                videos, images = [], []
-                for i, video_key in enumerate(dataset.modality_keys["video"]):
-                    video = data[video_key] # Shape: (T, H, W, C)
-                    video = self.resize_video_opencv(video, self.video_resolution_size)
-                    if len(dataset.modality_keys["video"]) > 2:
-                        if i in [0, 2]:
-                            videos.append(video)
-                    else:
-                        videos.append(video)
-                    primary_image = Image.fromarray(video[0]).resize((self.resolution_size, self.resolution_size))
-                    images.append(primary_image)
-                if len(dataset.modality_keys["video"]) == 1:
-                    videos = [videos[0], videos[0].copy()]  # Duplicate if only one video
-                videos = np.stack(videos, axis=0)  # Shape: (V, T, H, W, C)        
-                    
-                # Get language and action data
-                language = data[dataset.modality_keys["language"][0]][0]
-                action = []
-                for action_key in dataset.modality_keys["action"]:
-                    action.append(data[action_key])
-                action = np.concatenate(action, axis=1).astype(np.float16)
-
-                return_dict = dict(action=action, image=images, lang=language, video=videos)
-                if self.with_state:
-                    state = []
-                    for state_key in dataset.modality_keys["state"]:
-                        state.append(data[state_key])
-                    state = np.concatenate(state, axis=1).astype(np.float16)
-                    return_dict["state"] = state[0:1]
-                #print(videos[0].shape) #[horizon, H, W, 3]
-                #print(action.shape) #[horizon, action_dim]
-                #print(images[0]) #PIL.Image
-                #print(len(images))# len(dataset.modality_keys["video"])
-                #print(language)
-                #exit()
-                
-                return return_dict
+                return self._format_step(dataset, trajectory_name, step)
                 
             except Exception as e:
                 last_exception = e
@@ -2127,4 +2390,3 @@ class LeRobotMixtureDataset(Dataset):
                 dataset.set_transforms_metadata(self.merged_metadata[dataset.tag])
         
         print(f"Applied cached statistics for {len(self.merged_metadata)} embodiment tags.")
-

@@ -17,7 +17,19 @@ set -uo pipefail
 REPO_ROOT="${SLURM_SUBMIT_DIR:-/lustre/fsw/portfolios/edgeai/projects/edgeai_tao-ptm_image-foundation-model-clip/users/chrislin/projects/VLA-JEPA}"
 cd "$REPO_ROOT"
 mkdir -p outputs/slurm
+if [[ -n "${EXPECTED_GIT_SHA:-}" && "$(git rev-parse HEAD)" != "$EXPECTED_GIT_SHA" ]]; then
+  echo "[fatal] repository HEAD changed after submission; expected $EXPECTED_GIT_SHA" >&2
+  exit 2
+fi
+if [[ -n "${EXPECTED_GIT_SHA:-}" && -n "$(git status --porcelain --untracked-files=normal)" ]]; then
+  echo "[fatal] repository became dirty after pipeline submission" >&2
+  exit 2
+fi
 CONFIG="${CONFIG:-./scripts/config/vlajepa_cotrain_cluster.yaml}"
+if [[ -n "${EXPECTED_CONFIG_SHA:-}" && "$(sha256sum "$CONFIG" | awk '{print $1}')" != "$EXPECTED_CONFIG_SHA" ]]; then
+  echo "[fatal] training config changed after submission: $CONFIG" >&2
+  exit 2
+fi
 TRAIN_SCRIPT="${TRAIN_SCRIPT:-./starVLA/training/train_vlajepa_cotrain.py}"
 EXP_ID="${EXP_ID:-E20260625-cotrain}"
 MICRO="${MICRO:-8}"
@@ -45,7 +57,7 @@ mkdir -p "$XDG_CACHE_HOME" "$MPLCONFIGDIR" "$TRITON_CACHE_DIR" "$TMPDIR"
 CA="$(python -c 'import certifi; print(certifi.where())' 2>/dev/null || true)"
 [[ -n "$CA" ]] && export REQUESTS_CA_BUNDLE="$CA" SSL_CERT_FILE="$CA" CURL_CA_BUNDLE="$CA"
 [[ -f "$HOME/.wandb_api_key" ]] && export WANDB_API_KEY="$(tr -d '[:space:]' < "$HOME/.wandb_api_key")"
-export WANDB_MODE=online
+export WANDB_MODE="${WANDB_MODE:-online}"
 export WANDB_ENTITY="${WANDB_ENTITY:-crlc112358}"
 export WANDB_PROJECT="${WANDB_PROJECT:-vla-jepa}"
 export WANDB_DIR="$OUTPUT_DIR/wandb"
@@ -78,6 +90,13 @@ SMI_PID=$!
 trap '[[ -n "${SMI_PID:-}" ]] && kill "$SMI_PID" 2>/dev/null || true' EXIT
 
 echo "[$(date -Is)] launching accelerate ($NPROC procs) :: $TRAIN_SCRIPT $CONFIG"
+EXTRA_OVERRIDES=()
+[[ -n "${PRETRAINED_CHECKPOINT:-}" ]] && EXTRA_OVERRIDES+=(--trainer.pretrained_checkpoint "$PRETRAINED_CHECKPOINT")
+[[ -n "${MAX_TRAIN_STEPS:-}" ]] && EXTRA_OVERRIDES+=(--trainer.max_train_steps "$MAX_TRAIN_STEPS")
+[[ -n "${CKPT_INTERVAL:-}" ]] && EXTRA_OVERRIDES+=(--trainer.ckpt_interval "$CKPT_INTERVAL" --trainer.save_interval "$CKPT_INTERVAL")
+[[ -n "${EVAL_INTERVAL:-}" ]] && EXTRA_OVERRIDES+=(--trainer.eval_interval "$EVAL_INTERVAL")
+[[ -n "${SEGMENT_LENGTH:-}" ]] && EXTRA_OVERRIDES+=(--datasets.vla_data.segment_length "$SEGMENT_LENGTH")
+[[ -n "${BURN_IN_MAX_DECISIONS:-}" ]] && EXTRA_OVERRIDES+=(--datasets.vla_data.burn_in_max_decisions "$BURN_IN_MAX_DECISIONS")
 accelerate launch \
   --config_file ./starVLA/config/accelerate/ddp_bf16.yaml \
   --num_processes "$NPROC" --num_machines 1 --main_process_port "$MASTER_PORT" \
@@ -87,9 +106,10 @@ accelerate launch \
   --experiment_id "$EXP_ID" \
   --trainer.resume_from_latest true \
   --trainer.grace_seconds "$GRACE" \
-  --wandb.mode online --wandb.entity "$WANDB_ENTITY" --wandb.project "$WANDB_PROJECT" \
+  --wandb.mode "$WANDB_MODE" --wandb.entity "$WANDB_ENTITY" --wandb.project "$WANDB_PROJECT" \
   --datasets.vla_data.per_device_batch_size "$MICRO" \
-  --datasets.video_data.per_device_batch_size "$MICRO" &
+  --datasets.video_data.per_device_batch_size "$MICRO" \
+  "${EXTRA_OVERRIDES[@]}" &
 PYPID=$!
 set +e
 wait "$PYPID"; EXIT=$?

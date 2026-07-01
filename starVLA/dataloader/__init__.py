@@ -44,7 +44,17 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe"): # TODO now here on
         vla_dataset = get_vla_dataset(
             data_cfg=vla_dataset_cfg,
             action_horizon=cfg.framework.action_model.action_horizon,
-            video_horizon=cfg.framework.vj2_model.num_frames)
+            video_horizon=cfg.framework.vj2_model.num_frames,
+            delete_pause_frame=vla_dataset_cfg.get("delete_pause_frame", True),
+            sample_mode=vla_dataset_cfg.get("sample_mode", "single_step"),
+            segment_length=vla_dataset_cfg.get("segment_length", 4),
+            burn_in_max_decisions=vla_dataset_cfg.get(
+                "burn_in_max_decisions", 8
+            ),
+            segment_stride=vla_dataset_cfg.get(
+                "segment_stride", cfg.framework.action_model.action_horizon
+            ),
+        )
         
         vla_train_dataloader = DataLoader(
             vla_dataset,

@@ -80,6 +80,19 @@ def _cfg_get(cfg, dotted, default=None):
     return cur
 
 
+def _migration_missing_prefixes(cfg):
+    migration = _cfg_get(cfg, "trainer.checkpoint_migration", None)
+    if not migration or not bool(migration.get("enabled", False)):
+        return ()
+    unexpected = list(migration.get("allow_unexpected_prefixes", []))
+    if unexpected:
+        raise ValueError(
+            "checkpoint migration does not permit unexpected keys; "
+            f"got allow_unexpected_prefixes={unexpected}"
+        )
+    return tuple(migration.get("allow_missing_prefixes", []))
+
+
 def setup_directories(cfg) -> Path:
     cfg.output_dir = os.path.join(cfg.run_root_dir, cfg.run_id)
     output_dir = Path(cfg.output_dir)
@@ -165,6 +178,7 @@ class VLATrainer(TrainerUtils):
                 self.model,
                 self.config.trainer.pretrained_checkpoint,
                 reload_modules=_cfg_get(self.config, "trainer.reload_modules", None),
+                allowed_missing_prefixes=_migration_missing_prefixes(self.config),
             )
 
         self.model = self.freeze_backbones(self.model, freeze_modules=_cfg_get(self.config, "trainer.freeze_modules", None))
@@ -234,6 +248,11 @@ class VLATrainer(TrainerUtils):
             extra={
                 "vla_epoch_count": self.vla_epoch_count,
                 "wandb_run_id": self._wandb_run_id(),
+                "memory_schema_version": int(
+                    _cfg_get(self.config, "framework.memory.schema_version", 0)
+                    if _cfg_get(self.config, "framework.memory.enabled", False)
+                    else 0
+                ),
             },
             keep_last=self.keep_last_ckpts,
             tag=tag,
@@ -244,16 +263,47 @@ class VLATrainer(TrainerUtils):
             self.accelerator.print(f"✅ full-state checkpoint @ step {self.completed_steps}")
 
     # ----------------------------------------------------------------- data iter
+    @staticmethod
+    def _set_dataloader_epoch(dataloader, epoch):
+        if callable(getattr(dataloader, "set_epoch", None)):
+            dataloader.set_epoch(epoch)
+        elif callable(getattr(getattr(dataloader, "sampler", None), "set_epoch", None)):
+            dataloader.sampler.set_epoch(epoch)
+        elif callable(getattr(getattr(dataloader, "dataset", None), "set_epoch", None)):
+            dataloader.dataset.set_epoch(epoch)
+
+    def _resume_data_iterator(self):
+        batches_per_epoch = len(self.vla_train_dataloader)
+        if batches_per_epoch <= 0:
+            raise RuntimeError("video dataloader is empty")
+        epoch, offset = divmod(self.completed_steps, batches_per_epoch)
+        self._set_dataloader_epoch(self.vla_train_dataloader, epoch)
+        iterable = (
+            self.accelerator.skip_first_batches(
+                self.vla_train_dataloader, num_batches=offset
+            )
+            if offset
+            else self.vla_train_dataloader
+        )
+        self._set_dataloader_epoch(iterable, epoch)
+        self.accelerator.print(
+            f"[data-resume] video: completed={self.completed_steps}, "
+            f"batches/epoch={batches_per_epoch}, epoch={epoch}, offset={offset}"
+        )
+        return iter(iterable), epoch
+
     def _create_data_iterators(self):
-        self.vla_iter = iter(self.vla_train_dataloader)
+        self.vla_iter, self.vla_epoch_count = self._resume_data_iterator()
 
     def _get_next_batch(self):
         try:
             return next(self.vla_iter)
         except StopIteration:
-            self.vla_iter, self.vla_epoch_count = TrainerUtils._reset_dataloader(
+            self.vla_epoch_count += 1
+            self._set_dataloader_epoch(
                 self.vla_train_dataloader, self.vla_epoch_count
             )
+            self.vla_iter = iter(self.vla_train_dataloader)
             return next(self.vla_iter)
 
     # ----------------------------------------------------------------- train

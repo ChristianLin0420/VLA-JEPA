@@ -3,6 +3,7 @@
 # Implemented by [Jinhui YE / HKUST University] in [2025].
 
 import logging, argparse
+import uuid
 import time, os
 from typing import Dict, Optional, Tuple
 
@@ -72,6 +73,7 @@ class WebsocketClientPolicy:
         query_info = {
             "payload": obs,
             "type": "infer",
+            "request_id": uuid.uuid4().hex,
         }
         data = self._packer.pack(query_info)
         self._ws.send(data)
@@ -81,11 +83,31 @@ class WebsocketClientPolicy:
         return msgpack_numpy.unpackb(response)
 
     @override
-    def reset(self, instruction) -> None:
-        payload = {"instruction": instruction, "reset": True}
-        self._ws.send(self._packer.pack(payload))
-        resp = self._ws.recv()
-        pass
+    def reset(
+        self,
+        instruction=None,
+        *,
+        episode_id: str | None = None,
+        episode_seed: int = 0,
+    ) -> Dict:
+        request_id = uuid.uuid4().hex
+        payload = {
+            "instruction": instruction,
+            "episode_id": episode_id or request_id,
+            "episode_seed": int(episode_seed),
+        }
+        self._ws.send(
+            self._packer.pack(
+                {"type": "reset", "request_id": request_id, "payload": payload}
+            )
+        )
+        response = self._ws.recv()
+        if isinstance(response, str):
+            raise RuntimeError(f"Server error (reset):\n{response}")
+        decoded = msgpack_numpy.unpackb(response)
+        if not decoded.get("ok", False) or decoded.get("type") != "reset_result":
+            raise RuntimeError(f"Reset rejected by server: {decoded}")
+        return decoded
 
     def close(self) -> None:
         try:

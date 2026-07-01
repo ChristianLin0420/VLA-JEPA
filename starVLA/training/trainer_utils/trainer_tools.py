@@ -92,15 +92,21 @@ def build_param_lr_groups(model, cfg):
             for attr in module_name.split("."):
                 module = getattr(module, attr)
             # filter out frozen parameters
-            params = [p for p in module.parameters() if id(p) not in frozen_params]
+            params = [
+                p for p in module.parameters()
+                if id(p) not in frozen_params and id(p) not in used_params
+            ]
             if params:  # only add param group if there are trainable parameters
                 param_groups.append({"params": params, "lr": lr, "name": module_name})
                 used_params.update(id(p) for p in params)
-        except AttributeError:
-            ReferenceError(f"⚠️ module path `{module_name}` not found in vla")
+        except AttributeError as exc:
+            raise ReferenceError(f"module path `{module_name}` not found in vla") from exc
 
     # assign base learning rate to the remaining unused parameters (exclude frozen ones)
-    other_params = [p for p in model.parameters() if id(p) not in used_params and id(p) not in frozen_params]
+    other_params = [
+        p for p in model.parameters()
+        if id(p) not in used_params and id(p) not in frozen_params
+    ]
     if other_params:
         param_groups.append({"params": other_params, "lr": base_lr, "name": "base"})
 
@@ -209,7 +215,12 @@ class TrainerUtils:
         return num_params, num_trainable_params
 
     @staticmethod
-    def load_pretrained_backbones(model, checkpoint_path=None, reload_modules=None):
+    def load_pretrained_backbones(
+        model,
+        checkpoint_path=None,
+        reload_modules=None,
+        allowed_missing_prefixes=None,
+    ):
         """
         load checkpoint:
         - if reload_modules is set, load by path part
@@ -220,7 +231,8 @@ class TrainerUtils:
         """
         if not checkpoint_path:
             return []
-        if dist.get_rank() == 0:
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        if rank == 0:
             print(f"📦 loading checkpoint: {checkpoint_path}")
         try:
             checkpoint = torch.load(checkpoint_path, map_location="cpu")
@@ -241,7 +253,7 @@ class TrainerUtils:
                     sub_state_dict = {k[len(prefix) :]: v for k, v in checkpoint.items() if k.startswith(prefix)}
                     if sub_state_dict:
                         module.load_state_dict(sub_state_dict, strict=True)
-                        if dist.get_rank() == 0:
+                        if rank == 0:
                             print(f"✅ parameters loaded to module '{path}'")
                         loaded_modules.append(path)
                     else:
@@ -249,13 +261,41 @@ class TrainerUtils:
                 except AttributeError:
                     print(f"❌ cannot find module path: {path}")
         else:  # full load
+            if isinstance(allowed_missing_prefixes, str):
+                allowed_missing_prefixes = tuple(
+                    prefix.strip()
+                    for prefix in allowed_missing_prefixes.split(",")
+                    if prefix.strip()
+                )
+            else:
+                allowed_missing_prefixes = tuple(allowed_missing_prefixes or ())
+
             try:
-                model.load_state_dict(checkpoint, strict=True)
-                if dist.get_rank() == 0:
-                    print("✅ loaded <full_model> model parameters")
+                if allowed_missing_prefixes:
+                    incompatible = model.load_state_dict(checkpoint, strict=False)
+                    disallowed_missing = [
+                        key
+                        for key in incompatible.missing_keys
+                        if not key.startswith(allowed_missing_prefixes)
+                    ]
+                    if incompatible.unexpected_keys or disallowed_missing:
+                        raise RuntimeError(
+                            "checkpoint migration mismatch: "
+                            f"disallowed missing={disallowed_missing}, "
+                            f"unexpected={list(incompatible.unexpected_keys)}"
+                        )
+                    if rank == 0:
+                        print(
+                            "✅ loaded <full_model> with allowlisted new keys: "
+                            f"{list(incompatible.missing_keys)}"
+                        )
+                else:
+                    model.load_state_dict(checkpoint, strict=True)
+                    if rank == 0:
+                        print("✅ loaded <full_model> model parameters")
                 loaded_modules = ["<full_model>"]
             except Exception as e:
-                raise RuntimeError(f"❌ loading full model failed: {e}")
+                raise RuntimeError(f"❌ loading full model failed: {e}") from e
         return model
 
     @staticmethod

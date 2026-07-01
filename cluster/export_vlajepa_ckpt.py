@@ -15,6 +15,7 @@ import os
 import sys
 from safetensors.torch import load_file
 import torch
+import yaml
 
 
 def main():
@@ -32,6 +33,29 @@ def main():
     print(f"[export] loading {src}")
     sd = load_file(src)
 
+    config_path = os.path.join(run_dir, "config.yaml")
+    with open(config_path) as config_file:
+        run_config = yaml.safe_load(config_file)
+    memory_cfg = run_config.get("framework", {}).get("memory", {}) or {}
+    memory_enabled = bool(memory_cfg.get("enabled", False))
+    memory_keys = [
+        key
+        for key in sd
+        if key.startswith("memory_module.") or key.startswith("policy_memory_fusion.")
+    ]
+    if memory_enabled and not memory_keys:
+        raise RuntimeError("memory-enabled run has no learned memory keys in its checkpoint")
+    if not memory_enabled and memory_keys:
+        raise RuntimeError("memory-disabled run unexpectedly contains learned memory keys")
+    runtime_keys = [key for key in sd if "memory_state" in key or "last_memory" in key]
+    if runtime_keys:
+        raise RuntimeError(f"runtime memory state leaked into checkpoint: {runtime_keys}")
+    if memory_enabled:
+        schema = int(memory_cfg.get("schema_version", 0))
+        if schema != 1:
+            raise RuntimeError(f"unsupported memory schema_version {schema}; expected 1")
+        print(f"[export] verified memory schema v{schema} ({len(memory_keys)} learned tensors)")
+
     # safetensors cannot store shared tensors, so accelerate's save_state drops the
     # tied lm_head (Qwen3-VL ties lm_head <- input embeddings). The freshly-built model
     # lists lm_head in its state_dict, so reconstruct the tie for a strict load.
@@ -46,7 +70,16 @@ def main():
             print(f"[export] WARNING: could not find embed_tokens to tie {LM_HEAD}")
 
     print(f"[export] {len(sd)} tensors -> {out}")
-    torch.save(sd, out)
+    temporary = out + f".tmp.{os.getpid()}"
+    try:
+        with open(temporary, "wb") as handle:
+            torch.save(sd, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, out)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
     print(f"[export] DONE: {out}  ({os.path.getsize(out)/1e9:.2f} GB)")
     print(f"[export] eval with:  --ckpt_path {out}")
 

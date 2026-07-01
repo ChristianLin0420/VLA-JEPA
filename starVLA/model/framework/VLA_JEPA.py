@@ -7,15 +7,15 @@ Qwen-GR00T Framework
 A lightweight implementation that Qwen-VL + Flow-matching head to directly predict continuous actions
 Flow-matching header is copyright from GR00T N1.5,
 """
-from typing import List
-from tqdm import tqdm
-from typing import List, Optional, Tuple
+from contextlib import nullcontext
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from PIL import Image
-from transformers import AutoVideoProcessor, AutoModel, AutoTokenizer, VJEPA2VideoProcessor
+from transformers import AutoVideoProcessor, AutoModel, AutoTokenizer
 
 from starVLA.training.trainer_utils import initialize_overwatch
 
@@ -28,8 +28,18 @@ from starVLA.model.framework.base_framework import baseframework
 from starVLA.model.modules.vlm import get_vlm_model
 from starVLA.model.modules.action_model.GR00T_ActionHeader import get_action_model, FlowmatchingActionHead
 from starVLA.model.modules.world_model.vj2_predictor import VisionTransformerPredictorAC
+from starVLA.model.modules.memory import MemoryState, RecurrentMemory, ResidualMemoryFusion
 from starVLA.training.trainer_utils.trainer_tools import resize_images
 from starVLA.model.tools import FRAMEWORK_REGISTRY
+
+
+@dataclass
+class QwenTokenBundle:
+    """Validated Qwen tensors shared by training and inference paths."""
+
+    last_hidden: torch.Tensor
+    action_tokens: torch.Tensor
+    embodied_action_tokens: Optional[torch.Tensor]
 
 @FRAMEWORK_REGISTRY.register("VLA_JEPA")
 class VLA_JEPA(baseframework):
@@ -109,6 +119,53 @@ class VLA_JEPA(baseframework):
         self.last_jepa_tensors = None
         self.jepa_num_views = 2
 
+        # Missing memory configuration remains exactly checkpoint-compatible with
+        # the legacy model: no learned memory module is constructed unless enabled.
+        memory_cfg = self.config.framework.get("memory", {})
+        self.memory_enabled = bool(memory_cfg.get("enabled", False))
+        self.memory_schema_version = int(memory_cfg.get("schema_version", 0)) if self.memory_enabled else 0
+        self.memory_module = None
+        self.policy_memory_fusion = None
+        self.last_memory_diagnostics = None
+        if self.memory_enabled:
+            short_cfg = memory_cfg.get("short_term", {})
+            action_cfg = memory_cfg.get("action_conditioning", {})
+            if not bool(short_cfg.get("enabled", True)):
+                raise ValueError("Phase-1 memory requires framework.memory.short_term.enabled=true")
+            if not bool(action_cfg.get("enabled", True)):
+                raise ValueError("Phase-1 memory requires framework.memory.action_conditioning.enabled=true")
+            if bool(memory_cfg.get("long_term", {}).get("enabled", False)):
+                raise NotImplementedError("long-term associative memory is a Phase-2 feature")
+            if bool(memory_cfg.get("world_model_conditioning", {}).get("enabled", False)):
+                raise NotImplementedError("world-model memory conditioning is a Phase-3 feature")
+
+            hidden_dim = int(self.qwen_vl_interface.model.config.hidden_size)
+            memory_dim = int(short_cfg.get("dim", 512))
+            self.memory_module = RecurrentMemory(
+                source_dim=hidden_dim,
+                num_slots=int(short_cfg.get("num_slots", 8)),
+                memory_dim=memory_dim,
+                num_heads=int(short_cfg.get("num_heads", 8)),
+                update_gate_init=float(short_cfg.get("update_gate_init", 0.1)),
+            )
+            zero_gate = bool(action_cfg.get("zero_init_gate", True))
+            gate_init = 0.0 if zero_gate else float(action_cfg.get("gate_init", 1.0e-3))
+            self.policy_memory_fusion = ResidualMemoryFusion(
+                consumer_dim=hidden_dim,
+                memory_dim=memory_dim,
+                bottleneck_dim=int(action_cfg.get("bottleneck_dim", memory_dim)),
+                num_heads=int(action_cfg.get("num_heads", short_cfg.get("num_heads", 8))),
+                dropout=float(action_cfg.get("dropout", 0.0)),
+                gate_init=gate_init,
+            )
+
+        self.expected_action_token_count = (
+            self.config.framework.vj2_model.num_frames // tubelet_size - 1
+        ) * self.config.framework.vj2_model.num_action_tokens_per_timestep
+        self.expected_embodied_token_count = int(
+            self.config.framework.vj2_model.num_embodied_action_tokens_per_instruction
+        )
+
     def _maybe_capture_jepa(self, predicted_states, gt_states, input_states, action_tokens):
         """Stash detached predictor tensors for representation analysis (logging steps only).
 
@@ -158,216 +215,388 @@ class VLA_JEPA(baseframework):
         logger.info(f"Model embedding size: {vla_embedding_size} ;tokenizer.vocab_size: {len(tokenizer)}")
         return action_tokens, action_token_ids, embodied_action_token_id
 
-    def forward(
+    @staticmethod
+    def _autocast_context(tensor: torch.Tensor, dtype: torch.dtype):
+        if tensor.is_cuda and dtype in (torch.float16, torch.bfloat16):
+            return torch.autocast("cuda", dtype=dtype)
+        return nullcontext()
+
+    @staticmethod
+    def _select_token_rows(
+        last_hidden: torch.Tensor,
+        input_ids: torch.Tensor,
+        token_ids: List[int],
+        expected_count: int,
+        label: str,
+    ) -> torch.Tensor:
+        token_id_tensor = torch.as_tensor(token_ids, device=input_ids.device, dtype=input_ids.dtype)
+        mask = torch.isin(input_ids, token_id_tensor)
+        counts = mask.sum(dim=1)
+        if not torch.all(counts == expected_count):
+            raise ValueError(
+                f"expected exactly {expected_count} {label} tokens per row; got {counts.tolist()}"
+            )
+        batch_size, _, hidden_dim = last_hidden.shape
+        return last_hidden[mask].reshape(batch_size, expected_count, hidden_dim)
+
+    def _encode_qwen_tokens(
         self,
-        examples: List[dict] = None,
-        **kwargs,
-    ) -> Tuple:
-        """
-
-        """
-        batch_images = [example["image"] for example in examples]  # [B, [PIL.Image]]
-        batch_videos = [example["video"] for example in examples]  #  [B, V, T, H, W, 3]
-        instructions = [example["lang"] for example in examples]  # [B, str]
-        actions = [example["action"]for example in examples] if "action" in examples[0] else None # label [B， len, 7]
-        
-        state = [example["state"] for example in examples] if "state" in examples[0] else None  # [B, 1, state_dim]
-
-        """
-        if self.action_model.device == torch.device("cuda:0") and "action" in examples[0]:
-            print(batch_videos[0].shape) #[V, T, H, W, 3]
-            print(instructions[0])
-            print(actions[0].shape) # [T-1, action_dim]
-            print(state[0].shape) if state is not None else print("No state") #[state_dim]
-            print(len(batch_videos), len(instructions), len(actions), len(state) if state is not None else "No state")
-            from diffusers.utils import export_to_video
-            export_to_video(batch_videos[0][0]/255.0, "data_view_0.mp4")
-            export_to_video(batch_videos[0][1]/255.0, "data_view_1.mp4")
-            batch_images[0][0].save("data_image_view_0.png")
-            batch_images[0][1].save("data_image_view_1.png")
-            #print(self.action_tokens)
-            print(self.replace_prompt)
-            print(self.action_token_ids)
-        elif self.action_model.device == torch.device("cuda:0") and "action" not in examples[0]:
-            print(batch_videos[0].shape) #[V, T, H, W, 3]
-            print(instructions[0])
-            print(len(batch_videos), len(instructions))
-            from diffusers.utils import export_to_video
-            export_to_video(batch_videos[0][0]/255.0, "video_view_0.mp4")
-            export_to_video(batch_videos[0][1]/255.0, "video_view_1.mp4")
-            batch_images[0][0].save("video_image_view_0.png")
-        exit()
-        """
-        
-        
-
-        #[print(each.shape, end=";") for each in batch_videos]
-        batch_videos = np.stack(batch_videos)  #  [B, V, T, H, W, 3]
-        batch_videos = batch_videos.transpose(0,1,2,5,3,4)  # [B, V, T, 3, H, W]
-
-        # Step 1: QWenVL input format
-        if actions is not None:
-            qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(
-                images=batch_images, 
-                instructions=instructions,
-                prompt_replace_dict={"{actions}":self.replace_prompt, "{e_actions}":self.embodied_replace_prompt},
-                prompt_template=self.config.datasets.vla_data.get("CoT_prompt", "")) 
-        else:
-            qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(
-                images=batch_images, 
-                instructions=instructions,
-                prompt_replace_dict={"{actions}":self.replace_prompt},
-                prompt_template=self.config.datasets.video_data.get("CoT_prompt", ""))
-        
-        action_indices = torch.isin(qwen_inputs['input_ids'], torch.tensor(self.action_token_ids, device=qwen_inputs['input_ids'].device))
-        action_indices = action_indices.nonzero(as_tuple=True)
-
-        # TODO action condition tokens
-        #embodied_action_indices = torch.isin(qwen_inputs['input_ids'], torch.tensor([self.embodied_action_token_id], device=qwen_inputs['input_ids'].device))
-        embodied_action_indices = torch.isin(qwen_inputs['input_ids'], torch.tensor([self.embodied_action_token_id], device=qwen_inputs['input_ids'].device))
-        embodied_action_indices = embodied_action_indices.nonzero(as_tuple=True)
-        
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            qwenvl_outputs = self.qwen_vl_interface(
+        images: List[List[Image.Image]],
+        instructions: List[str],
+        prompt_template: str,
+        require_embodied: bool,
+    ) -> QwenTokenBundle:
+        replacements = {"{actions}": self.replace_prompt}
+        if require_embodied:
+            replacements["{e_actions}"] = self.embodied_replace_prompt
+        qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(
+            images=images,
+            instructions=instructions,
+            prompt_replace_dict=replacements,
+            prompt_template=prompt_template,
+        )
+        with self._autocast_context(qwen_inputs["input_ids"], torch.bfloat16):
+            outputs = self.qwen_vl_interface(
                 **qwen_inputs,
                 output_attentions=False,
                 output_hidden_states=True,
                 return_dict=True,
             )
-            # last_hidden_state: [B, seq_len, H]
-            last_hidden = qwenvl_outputs.hidden_states[-1]   # [B, L, H]
-            B, _, H = last_hidden.shape
-            action_tokens = last_hidden[action_indices[0], action_indices[1], :].view(B, -1, H)  # [B, action_len, H]
-            embodied_action_tokens = last_hidden[embodied_action_indices[0], embodied_action_indices[1], :].view(B, -1, H)  # [B, action_len, H]
-            #print(action_tokens.shape, last_hidden.shape, embodied_action_tokens.shape)
-            #exit()
-        
-            # Step 2: JEPA Encoder
-            B, V, T, C, H, W = batch_videos.shape
-            batch_videos = batch_videos.reshape(B*V, T, C, H, W)  # [B*V, T, C, H, W]
-            input_videos = []
-            for i in range(B*V):
-                input_videos.append(self.vj_processor(
-                    videos=batch_videos[i], return_tensors="pt"
-                )["pixel_values_videos"].to(self.vj_encoder.device))
-            input_videos = torch.cat(input_videos, dim=0)  # [B*V, T, C, H, W]
+            last_hidden = outputs.hidden_states[-1]
+            action_tokens = self._select_token_rows(
+                last_hidden,
+                qwen_inputs["input_ids"],
+                self.action_token_ids,
+                self.expected_action_token_count,
+                "action-marker",
+            )
+            embodied = None
+            if require_embodied:
+                embodied = self._select_token_rows(
+                    last_hidden,
+                    qwen_inputs["input_ids"],
+                    [self.embodied_action_token_id],
+                    self.expected_embodied_token_count,
+                    "embodied-action",
+                )
+        return QwenTokenBundle(last_hidden, action_tokens, embodied)
+
+    def _compute_world_loss(
+        self,
+        batch_videos: List[np.ndarray],
+        action_tokens: torch.Tensor,
+    ) -> torch.Tensor:
+        videos = np.stack(batch_videos).transpose(0, 1, 2, 5, 3, 4)
+        batch_size, num_views, num_frames, channels, height, width = videos.shape
+        videos = videos.reshape(batch_size * num_views, num_frames, channels, height, width)
+        processed = [
+            self.vj_processor(videos=videos[i], return_tensors="pt")["pixel_values_videos"].to(
+                self.vj_encoder.device
+            )
+            for i in range(batch_size * num_views)
+        ]
+        input_videos = torch.cat(processed, dim=0)
+        with self._autocast_context(action_tokens, torch.bfloat16):
             with torch.no_grad():
                 video_embeddings = self.vj_encoder.get_vision_features(pixel_values_videos=input_videos)
-                video_embeddings = torch.cat(torch.chunk(video_embeddings, chunks=V, dim=0), dim=2)
-            #print(video_embeddings.shape) # [B, T//tubelet_size * dim_per_frame, V*embed_dim]
-        
-            # Step 3: VJ Predictor
-            T = T // self.vj_encoder.config.tubelet_size
-            input_states = video_embeddings[:, :video_embeddings.shape[1] // T * (T-1),:]  # [B, (T-1)*dim_per_frame, V*embed_dim]
-            gt_states = video_embeddings[:, video_embeddings.shape[1] // T:, :]
-            #print(input_states.shape, action_tokens.shape)
-            #exit()
-            predicted_states = self.vj_predictor(
-                input_states,
-                action_tokens
-            )
-
-            teacher_forcing_wm_loss = F.l1_loss(
-                predicted_states,
-                gt_states,
-                reduction="mean"
-            )
-
-        # JEPA representation-analysis side-channel (logging steps only; no grad impact).
+                video_embeddings = torch.cat(torch.chunk(video_embeddings, chunks=num_views, dim=0), dim=2)
+            latent_frames = num_frames // self.vj_encoder.config.tubelet_size
+            tokens_per_frame = video_embeddings.shape[1] // latent_frames
+            input_states = video_embeddings[:, : tokens_per_frame * (latent_frames - 1), :]
+            gt_states = video_embeddings[:, tokens_per_frame:, :]
+            predicted_states = self.vj_predictor(input_states, action_tokens)
+            world_loss = F.l1_loss(predicted_states, gt_states, reduction="mean")
         self._maybe_capture_jepa(predicted_states, gt_states, input_states, action_tokens)
+        return world_loss
 
-        if "action" not in examples[0]:
-            return {"wm_loss": teacher_forcing_wm_loss}
+    def _compute_action_loss(
+        self,
+        actions: List[np.ndarray],
+        proprio_state: Optional[List[np.ndarray]],
+        embodied_tokens: torch.Tensor,
+    ) -> torch.Tensor:
+        device = embodied_tokens.device
+        dtype = embodied_tokens.dtype
+        actions_tensor = torch.as_tensor(np.array(actions), device=device, dtype=dtype)
+        actions_target = actions_tensor[:, -(self.future_action_window_size + 1):, :]
+        # Preserve the legacy trainer-controlled repeat count for checkpoint and
+        # loss-scale parity.  Memory fusion happens once before this expansion.
+        repeated_steps = int(self.config.trainer.get("repeated_diffusion_steps", 4))
+        actions_repeated = actions_target.repeat(repeated_steps, 1, 1)
+        embodied_repeated = embodied_tokens.repeat(repeated_steps, 1, 1)
+        state_repeated = None
+        if proprio_state is not None:
+            state_tensor = torch.as_tensor(np.array(proprio_state), device=device, dtype=dtype)
+            state_repeated = state_tensor.repeat(repeated_steps, 1, 1)
+        # CUDA autocast supports FP16/BF16 only.  Requesting FP32 here disables
+        # the trainer's outer autocast and leaves BF16 activations facing FP32
+        # Linear weights.  Keep the action head under explicit BF16 autocast.
+        with self._autocast_context(embodied_tokens, torch.bfloat16):
+            return self.action_model(embodied_repeated, actions_repeated, state_repeated)
 
-        # Step 4: Action Expert Forward and Loss
-        with torch.autocast("cuda", dtype=torch.float32):
-            # 标签对齐：取最后 chunk_len 段
-            actions = torch.tensor(
-                np.array(actions), device=last_hidden.device, dtype=last_hidden.dtype
-            )  # [B, T_full, action_dim]
-            actions_target = actions[:, -(self.future_action_window_size+1):, :]  # (B, chunk_len, action_dim)
+    def _forward_one(
+        self,
+        examples: List[dict],
+        memory_state: Optional[MemoryState] = None,
+        reset_mask: Optional[torch.Tensor] = None,
+        active_mask: Optional[torch.Tensor] = None,
+        update_mask: Optional[torch.Tensor] = None,
+        include_action_loss: bool = True,
+        include_world_loss: bool = True,
+    ) -> Tuple[Dict[str, torch.Tensor], Optional[MemoryState], Dict[str, torch.Tensor]]:
+        if not examples:
+            raise ValueError("examples must contain at least one sample")
+        has_actions = "action" in examples[0]
+        if any(("action" in example) != has_actions for example in examples):
+            raise ValueError("a decision batch cannot mix robot and video-only samples")
 
-            repeated_diffusion_steps = (
-                self.config.trainer.get("repeated_diffusion_steps", 4) if self.config and self.config.trainer else 4
+        images = [example["image"] for example in examples]
+        instructions = [example["lang"] for example in examples]
+        prompt = (
+            self.config.datasets.vla_data.get("CoT_prompt", "")
+            if has_actions
+            else self.config.datasets.video_data.get("CoT_prompt", "")
+        )
+        qwen = self._encode_qwen_tokens(images, instructions, prompt, require_embodied=has_actions)
+        batch_size = qwen.last_hidden.shape[0]
+        device = qwen.last_hidden.device
+        active_mask = (
+            torch.ones(batch_size, dtype=torch.bool, device=device)
+            if active_mask is None
+            else torch.as_tensor(active_mask, dtype=torch.bool, device=device)
+        )
+        reset_mask = (
+            torch.zeros(batch_size, dtype=torch.bool, device=device)
+            if reset_mask is None
+            else torch.as_tensor(reset_mask, dtype=torch.bool, device=device)
+        )
+        update_mask = (
+            active_mask
+            if update_mask is None
+            else torch.as_tensor(update_mask, dtype=torch.bool, device=device) & active_mask
+        )
+
+        state_before = memory_state
+        policy_tokens = qwen.embodied_action_tokens
+        diagnostics: Dict[str, torch.Tensor] = {}
+        if self.memory_enabled and has_actions:
+            if self.memory_module is None or self.policy_memory_fusion is None:
+                raise RuntimeError("memory is enabled but its modules were not constructed")
+            if state_before is None:
+                state_before = self.memory_module.init_state(batch_size, device=device)
+            state_before = self.memory_module.reset_state(state_before, reset_mask)
+            memory_read = self.memory_module.read(qwen.action_tokens, state_before, read_mask=active_mask)
+            diagnostics.update(memory_read.diagnostics)
+            policy_tokens = self.policy_memory_fusion(policy_tokens, memory_read.tokens)
+            diagnostics["policy_gate"] = torch.tanh(self.policy_memory_fusion.gate).detach()
+
+        losses: Dict[str, torch.Tensor] = {}
+        scaled_world_loss = None
+        if include_world_loss:
+            world_loss = self._compute_world_loss(
+                [example["video"] for example in examples], qwen.action_tokens
             )
-            actions_target_repeated = actions_target.repeat(repeated_diffusion_steps, 1, 1)
-            embodied_action_repeated = embodied_action_tokens.repeat(repeated_diffusion_steps, 1, 1)
-            
-            state_repeated = None
-            if state is not None:
-                state = torch.tensor(
-                    np.array(state), device=last_hidden.device, dtype=last_hidden.dtype
+            scaled_world_loss = world_loss if not has_actions else world_loss * 0.1
+
+        if has_actions and include_action_loss:
+            if policy_tokens is None:
+                raise RuntimeError("robot samples require embodied-action tokens")
+            losses["action_loss"] = self._compute_action_loss(
+                [example["action"] for example in examples],
+                [example["state"] for example in examples] if "state" in examples[0] else None,
+                policy_tokens,
+            )
+        if scaled_world_loss is not None:
+            losses["wm_loss"] = scaled_world_loss
+
+        state_after = state_before
+        # The writer is deliberately invoked only after all requested prediction/loss
+        # tensors have been formed.  It consumes current Qwen markers, never targets.
+        if self.memory_enabled and has_actions:
+            state_after = self.memory_module.write(qwen.action_tokens, state_before, update_mask=update_mask)
+        return losses, state_after, diagnostics
+
+    def forward(self, examples: List[dict] = None, **kwargs) -> Dict[str, torch.Tensor]:
+        if examples and isinstance(examples[0], dict) and "steps" in examples[0]:
+            return self.forward_sequence(examples)
+        losses, _, diagnostics = self._forward_one(examples)
+        self.last_memory_diagnostics = {
+            key: value.detach() for key, value in diagnostics.items()
+        } if diagnostics else None
+        return losses
+
+    def forward_sequence(self, segments: List[dict]) -> Dict[str, torch.Tensor]:
+        """Unroll one fully-valid supervised robot segment per batch row."""
+        if not self.memory_enabled or self.memory_module is None:
+            raise RuntimeError("forward_sequence requires framework.memory.enabled=true")
+        if not segments:
+            raise ValueError("segments must be non-empty")
+        sequence_length = len(segments[0]["steps"])
+        if any(len(segment["steps"]) != sequence_length for segment in segments):
+            raise ValueError("all segments in a batch must have the same padded length")
+
+        batch_size = len(segments)
+        memory_device = next(self.memory_module.parameters()).device
+        memory_state = self.memory_module.init_state(batch_size, device=memory_device)
+        action_losses: List[torch.Tensor] = []
+        world_losses: List[torch.Tensor] = []
+        last_diagnostics: Dict[str, torch.Tensor] = {}
+        include_robot_world = bool(self.config.trainer.get("robot_world_model_loss", True))
+        bptt_steps = max(1, int(self.config.trainer.get("memory_bptt_steps", 4)))
+        detach_burn_in = bool(self.config.trainer.get("memory_detach_burn_in", True))
+        supervised_in_window = 0
+        entered_supervised = False
+        had_burn_in_update = False
+
+        carriers = []
+        for segment in segments:
+            carrier = next((step for step in segment["steps"] if step is not None), None)
+            if carrier is None:
+                raise ValueError("segment contains no real decisions")
+            carriers.append(carrier)
+
+        for time_index in range(sequence_length):
+            active = torch.as_tensor(
+                [segment["sequence_valid"][time_index] for segment in segments],
+                dtype=torch.bool,
+                device=memory_device,
+            )
+            if not bool(active.any()):
+                continue
+            loss_mask = torch.as_tensor(
+                [segment["loss_mask"][time_index] for segment in segments],
+                dtype=torch.bool,
+                device=memory_device,
+            )
+            update_mask = torch.as_tensor(
+                [segment["update_mask"][time_index] for segment in segments],
+                dtype=torch.bool,
+                device=memory_device,
+            )
+            reset_mask = torch.as_tensor(
+                [segment["is_first"][time_index] for segment in segments],
+                dtype=torch.bool,
+                device=memory_device,
+            ) & active
+            step_examples = [
+                segment["steps"][time_index]
+                if segment["steps"][time_index] is not None
+                else carriers[row]
+                for row, segment in enumerate(segments)
+            ]
+            supervised = bool(loss_mask.any())
+            if supervised and not bool(torch.all(loss_mask & active)):
+                raise ValueError(
+                    "Phase-1 action loss is scalar; every row must be valid at supervised timesteps"
                 )
-                #print(state.shape)
-                state_repeated = state.repeat(repeated_diffusion_steps, 1, 1)
+            if supervised:
+                if not entered_supervised and detach_burn_in and had_burn_in_update:
+                    memory_state = memory_state.detach()
+                elif supervised_in_window >= bptt_steps:
+                    memory_state = memory_state.detach()
+                    supervised_in_window = 0
+                entered_supervised = True
+            losses, memory_state, last_diagnostics = self._forward_one(
+                step_examples,
+                memory_state=memory_state,
+                reset_mask=reset_mask,
+                active_mask=active,
+                update_mask=update_mask,
+                include_action_loss=supervised,
+                include_world_loss=supervised and include_robot_world,
+            )
+            if supervised:
+                supervised_in_window += 1
+                action_losses.append(losses["action_loss"])
+                if "wm_loss" in losses:
+                    world_losses.append(losses["wm_loss"])
+            elif bool(update_mask.any()):
+                had_burn_in_update = True
 
-            #print(embodied_action_repeated.shape, actions_target_repeated.shape, state_repeated.shape) if state_repeated is not None else print("No state for action model")
-            #exit()
-            action_loss = self.action_model(embodied_action_repeated, actions_target_repeated, state_repeated)  # (B, chunk_len, action_dim)
-
-        return {"action_loss": action_loss, "wm_loss": teacher_forcing_wm_loss * 0.1}
+        if not action_losses:
+            raise ValueError("segment batch has no supervised decisions")
+        output = {"action_loss": torch.stack(action_losses).mean()}
+        if world_losses:
+            output["wm_loss"] = torch.stack(world_losses).mean()
+        self.last_memory_diagnostics = {
+            key: value.detach() for key, value in last_diagnostics.items()
+        } if last_diagnostics else None
+        return output
 
     @torch.inference_mode()
     def predict_action(
         self,
-        batch_images: List[List[Image.Image]],  # Batch of PIL Image list as [view1, view2]
+        batch_images: List[List[Image.Image]],
         instructions: List[str],
         state: Optional[np.ndarray] = None,
-        **kwargs: str,
-    ) -> np.ndarray:
-        """
-        推理：单次前向直接回归未来动作（无扩散采样）。
-
-        Steps:
-          1. Resize images to training resolution (if specified)
-          2. Encode with QwenVL (hidden states retained)
-          6. Return normalized action trajectory
-
-        Args:
-            batch_images: List of samples; each sample is List[PIL.Image] (multi-view).
-            instructions: List[str] natural language task instructions.
-            cfg_scale: >1 enables classifier-free guidance (scales conditional vs unconditional).
-            use_ddim: Whether to use DDIM deterministic sampling.
-            num_ddim_steps: Number of DDIM steps if enabled.
-            **kwargs: Reserved.
-
-        Returns:
-            dict:
-                normalized_actions (np.ndarray): Shape [B, T, action_dim], diffusion-sampled normalized actions.
-        """
+        memory_state: Optional[MemoryState] = None,
+        reset_mask=None,
+        return_memory_state: bool = False,
+        generator: Optional[torch.Generator] = None,
+        initial_noise: Optional[torch.Tensor] = None,
+        update_memory: bool = True,
+        **kwargs,
+    ):
         train_obs_image_size = getattr(self.config.datasets.vla_data, "image_size", None)
         if train_obs_image_size:
             batch_images = resize_images(batch_images, target_size=train_obs_image_size)
-    
-        # Step 1: QWenVL input format
-        qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(
-            images=batch_images, 
-            instructions=instructions,
-            prompt_replace_dict={"{actions}":self.replace_prompt, "{e_actions}":self.embodied_replace_prompt})
-        
-        embodied_action_indices = torch.isin(qwen_inputs['input_ids'], torch.tensor([self.embodied_action_token_id], device=qwen_inputs['input_ids'].device))
-        #embodied_action_indices = ~torch.isin(qwen_inputs['input_ids'], torch.tensor(self.action_token_ids, device=qwen_inputs['input_ids'].device))
-        embodied_action_indices = embodied_action_indices.nonzero(as_tuple=True)
 
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            qwenvl_outputs = self.qwen_vl_interface(
-                **qwen_inputs,
-                output_attentions=False,
-                output_hidden_states=True,
-                return_dict=True,
+        qwen = self._encode_qwen_tokens(
+            batch_images,
+            instructions,
+            self.config.datasets.vla_data.get("CoT_prompt", ""),
+            require_embodied=True,
+        )
+        embodied = qwen.embodied_action_tokens
+        if embodied is None:
+            raise RuntimeError("inference prompt did not produce embodied-action tokens")
+        state_before = memory_state
+        diagnostics: Dict[str, torch.Tensor] = {}
+        if self.memory_enabled:
+            batch_size = embodied.shape[0]
+            device = embodied.device
+            if state_before is None:
+                state_before = self.memory_module.init_state(batch_size, device=device)
+            reset = (
+                torch.zeros(batch_size, dtype=torch.bool, device=device)
+                if reset_mask is None
+                else torch.as_tensor(reset_mask, dtype=torch.bool, device=device)
             )
-            # last_hidden_state: [B, seq_len, H]
-            last_hidden = qwenvl_outputs.hidden_states[-1]   # [B, L, H]
-            B, _, H = last_hidden.shape
-            embodied_action_tokens = last_hidden[embodied_action_indices[0], embodied_action_indices[1], :].view(B, -1, H)
+            state_before = self.memory_module.reset_state(state_before, reset)
+            memory_read = self.memory_module.read(qwen.action_tokens, state_before)
+            diagnostics.update(memory_read.diagnostics)
+            embodied = self.policy_memory_fusion(embodied, memory_read.tokens)
 
-        state = torch.from_numpy(np.array(state)).to(last_hidden.device, dtype=last_hidden.dtype) if state is not None else None
-        # Step 4: Action Expert Forward and Loss
-        with torch.autocast("cuda", dtype=torch.float32):
-            pred_actions = self.action_model.predict_action(embodied_action_tokens, state)  # (B, chunk_len, action_dim)
+        proprio = (
+            torch.as_tensor(np.array(state), device=embodied.device, dtype=embodied.dtype)
+            if state is not None
+            else None
+        )
+        with self._autocast_context(embodied, torch.bfloat16):
+            pred_actions = self.action_model.predict_action(
+                embodied,
+                proprio,
+                generator=generator,
+                initial_noise=initial_noise,
+            )
 
-        normalized_actions = pred_actions.detach().cpu().numpy()
-        return {"normalized_actions": normalized_actions, "embodied_action_tokens": embodied_action_tokens.to(dtype=torch.float32).detach().cpu().numpy()}
+        state_after = state_before
+        if self.memory_enabled and update_memory:
+            state_after = self.memory_module.write(qwen.action_tokens, state_before)
+        if state_after is not None:
+            state_after = state_after.detach()
+        self.last_memory_diagnostics = {
+            key: value.detach() for key, value in diagnostics.items()
+        } if diagnostics else None
+        public_output = {
+            "normalized_actions": pred_actions.detach().cpu().numpy(),
+            "embodied_action_tokens": qwen.embodied_action_tokens.to(
+                dtype=torch.float32
+            ).detach().cpu().numpy(),
+        }
+        if return_memory_state:
+            return public_output, state_after
+        return public_output
 
 
 

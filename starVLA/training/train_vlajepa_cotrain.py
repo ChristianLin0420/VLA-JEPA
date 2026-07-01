@@ -76,6 +76,19 @@ def _cfg_get(cfg, dotted, default=None):
     return cur
 
 
+def _migration_missing_prefixes(cfg):
+    migration = _cfg_get(cfg, "trainer.checkpoint_migration", None)
+    if not migration or not bool(migration.get("enabled", False)):
+        return ()
+    unexpected = list(migration.get("allow_unexpected_prefixes", []))
+    if unexpected:
+        raise ValueError(
+            "checkpoint migration does not permit unexpected keys; "
+            f"got allow_unexpected_prefixes={unexpected}"
+        )
+    return tuple(migration.get("allow_missing_prefixes", []))
+
+
 def setup_directories(cfg) -> Path:
     cfg.output_dir = os.path.join(cfg.run_root_dir, cfg.run_id)
     output_dir = Path(cfg.output_dir)
@@ -92,7 +105,10 @@ def setup_directories(cfg) -> Path:
 def prepare_data(cfg, accelerator, output_dir):
     logger.info(f"Creating VLA Dataset with Mixture `{cfg.datasets.vla_data.data_mix}`")
     vla_train_dataloader = build_dataloader(cfg=cfg, dataset_py=cfg.datasets.vla_data.dataset_py)
-    video_train_dataloader = build_dataloader(cfg=cfg, dataset_py=cfg.datasets.video_data.dataset_py)
+    robot_only = bool(_cfg_get(cfg, "trainer.robot_only", False))
+    video_train_dataloader = None
+    if not robot_only:
+        video_train_dataloader = build_dataloader(cfg=cfg, dataset_py=cfg.datasets.video_data.dataset_py)
     accelerator.dataloader_config.dispatch_batches = False
     dist.barrier()
     return vla_train_dataloader, video_train_dataloader
@@ -145,6 +161,13 @@ class VLAMTrainer(TrainerUtils):
         self.vla_epoch_count = 0
         self.vlm_epoch_count = 0
         self.total_batch_size = self._calculate_total_batch_size()
+        segment_length = int(_cfg_get(cfg, "datasets.vla_data.segment_length", 1))
+        self.decisions_per_step = self.total_batch_size * (
+            segment_length
+            if _cfg_get(cfg, "datasets.vla_data.sample_mode", "single_step") == "contiguous_segment"
+            else 1
+        )
+        self.processed_decisions = 0
 
         self.jepa_log_interval = int(_cfg_get(cfg, "trainer.jepa_log_interval", 25))
         self.jepa_figure_interval = int(_cfg_get(cfg, "trainer.jepa_figure_interval", 250))
@@ -175,15 +198,25 @@ class VLAMTrainer(TrainerUtils):
                 self.model,
                 self.config.trainer.pretrained_checkpoint,
                 reload_modules=_cfg_get(self.config, "trainer.reload_modules", None),
+                allowed_missing_prefixes=_migration_missing_prefixes(self.config),
             )
         self.model = self.freeze_backbones(self.model, freeze_modules=_cfg_get(self.config, "trainer.freeze_modules", None))
         self.print_trainable_parameters(self.model)
 
-        self.model, self.optimizer, self.vla_train_dataloader, self.video_train_dataloader = (
-            self.setup_distributed_training(
-                self.accelerator, self.model, self.optimizer, self.vla_train_dataloader, self.video_train_dataloader
+        if self.video_train_dataloader is None:
+            self.model, self.optimizer, self.vla_train_dataloader = self.setup_distributed_training(
+                self.accelerator, self.model, self.optimizer, self.vla_train_dataloader
             )
-        )
+        else:
+            self.model, self.optimizer, self.vla_train_dataloader, self.video_train_dataloader = (
+                self.setup_distributed_training(
+                    self.accelerator,
+                    self.model,
+                    self.optimizer,
+                    self.vla_train_dataloader,
+                    self.video_train_dataloader,
+                )
+            )
         self.accelerator.register_for_checkpointing(self.lr_scheduler)
 
         self.checkpoint_dir = os.path.join(self.config.output_dir, "checkpoints")
@@ -231,6 +264,9 @@ class VLAMTrainer(TrainerUtils):
         self.completed_steps = int(state.get("completed_steps", 0))
         self.vla_epoch_count = int(state.get("vla_epoch_count", 0))
         self.vlm_epoch_count = int(state.get("vlm_epoch_count", 0))
+        self.processed_decisions = int(
+            state.get("processed_decisions", self.completed_steps * self.decisions_per_step)
+        )
         self.accelerator.print(f"[resume] resumed at step {self.completed_steps}")
         self.accelerator.wait_for_everyone()
 
@@ -243,6 +279,12 @@ class VLAMTrainer(TrainerUtils):
                 "vla_epoch_count": self.vla_epoch_count,
                 "vlm_epoch_count": self.vlm_epoch_count,
                 "wandb_run_id": self._wandb_run_id(),
+                "memory_schema_version": int(
+                    _cfg_get(self.config, "framework.memory.schema_version", 0)
+                    if _cfg_get(self.config, "framework.memory.enabled", False)
+                    else 0
+                ),
+                "processed_decisions": self.processed_decisions,
             },
             keep_last=self.keep_last_ckpts,
             tag=tag,
@@ -292,9 +334,11 @@ class VLAMTrainer(TrainerUtils):
         self.vla_iter, self.vla_epoch_count = self._resume_data_iterator(
             self.vla_train_dataloader, "vla"
         )
-        self.vlm_iter, self.vlm_epoch_count = self._resume_data_iterator(
-            self.video_train_dataloader, "video"
-        )
+        self.vlm_iter = None
+        if self.video_train_dataloader is not None:
+            self.vlm_iter, self.vlm_epoch_count = self._resume_data_iterator(
+                self.video_train_dataloader, "video"
+            )
 
     def _get_next_batch(self):
         try:
@@ -304,13 +348,15 @@ class VLAMTrainer(TrainerUtils):
                 self.vla_train_dataloader, self.vla_epoch_count
             )
             batch_vla = next(self.vla_iter)
-        try:
-            batch_vlm = next(self.vlm_iter)
-        except StopIteration:
-            self.vlm_iter, self.vlm_epoch_count = self._next_epoch_iterator(
-                self.video_train_dataloader, self.vlm_epoch_count
-            )
-            batch_vlm = next(self.vlm_iter)
+        batch_vlm = None
+        if self.video_train_dataloader is not None:
+            try:
+                batch_vlm = next(self.vlm_iter)
+            except StopIteration:
+                self.vlm_iter, self.vlm_epoch_count = self._next_epoch_iterator(
+                    self.video_train_dataloader, self.vlm_epoch_count
+                )
+                batch_vlm = next(self.vlm_iter)
         return batch_vla, batch_vlm
 
     # ----------------------------------------------------------------- train
@@ -341,6 +387,7 @@ class VLAMTrainer(TrainerUtils):
             if self.accelerator.sync_gradients:
                 progress_bar.update(1)
                 self.completed_steps += 1
+                self.processed_decisions += self.decisions_per_step
 
             step_metrics["time/data"] = t1 - t0
             step_metrics["time/model"] = t2 - t1
@@ -390,23 +437,35 @@ class VLAMTrainer(TrainerUtils):
             self.optimizer.step()
             self.lr_scheduler.step()
 
-            # --- human-video pass (world-model only) ---
-            self.optimizer.zero_grad()
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                vlm_output = self.model(batch_vlm)  # __call__ -> DDP grad sync hooks
-                vlm_loss = sum(vlm_output.values())
-            self.accelerator.backward(vlm_loss)
-            if self.config.trainer.gradient_clipping is not None:
-                self.accelerator.clip_grad_norm_(self.model.parameters(), self.config.trainer.gradient_clipping)
-            self.optimizer.step()
-            self.lr_scheduler.step()
+            vlm_output = None
+            vlm_loss = None
+            if batch_vlm is not None:
+                # --- human-video pass (world-model only, independent state) ---
+                self.optimizer.zero_grad()
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    vlm_output = self.model(batch_vlm)  # __call__ -> DDP grad sync hooks
+                    vlm_loss = sum(vlm_output.values())
+                self.accelerator.backward(vlm_loss)
+                if self.config.trainer.gradient_clipping is not None:
+                    self.accelerator.clip_grad_norm_(self.model.parameters(), self.config.trainer.gradient_clipping)
+                self.optimizer.step()
+                self.lr_scheduler.step()
 
         for k, v in output_dict.items():
             log_dict[f"loss/vla_{k}"] = v.item()
-        for k, v in vlm_output.items():
-            log_dict[f"loss/vlm_{k}"] = v.item()
+        if vlm_output is not None:
+            for k, v in vlm_output.items():
+                log_dict[f"loss/vlm_{k}"] = v.item()
         log_dict["loss/vla_total"] = float(total_loss.item())
-        log_dict["loss/vlm_total"] = float(vlm_loss.item())
+        if vlm_loss is not None:
+            log_dict["loss/vlm_total"] = float(vlm_loss.item())
+        diagnostics = getattr(self._unwrapped, "last_memory_diagnostics", None)
+        if diagnostics:
+            for key, value in diagnostics.items():
+                try:
+                    log_dict[f"memory/{key}"] = float(value.float().mean().item())
+                except Exception:
+                    pass
         return log_dict
 
     def _log_metrics(self, metrics):
@@ -417,6 +476,7 @@ class VLAMTrainer(TrainerUtils):
         metrics["opt/learning_rate"] = self.lr_scheduler.get_last_lr()[0]
         denom = max(1, len(self.vla_train_dataloader))
         metrics["opt/epoch"] = round(self.completed_steps / denom, 4)
+        metrics["data/processed_decisions"] = self.processed_decisions
         if self.stopper is not None and self.stopper.seconds_left() is not None:
             metrics["time/seconds_to_deadline"] = self.stopper.seconds_left()
         for k, v in metrics.items():
@@ -483,6 +543,7 @@ class VLAMTrainer(TrainerUtils):
             )
             logger.info(f"  Per device batch size (vla) = {self.config.datasets.vla_data.per_device_batch_size}")
             logger.info(f"  Total batch size = {self.total_batch_size}")
+            logger.info(f"  Supervised robot decisions per outer step = {self.decisions_per_step}")
             logger.info(f"  Resume-from-latest = {self.resume_from_latest}; start step = {self.completed_steps}")
             if self.stopper and self.stopper.deadline:
                 logger.info(f"  Deadline in {self.stopper.seconds_left():.0f}s (grace {self.grace_seconds}s)")
