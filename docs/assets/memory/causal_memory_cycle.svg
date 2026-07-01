@@ -1,0 +1,81 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="260" viewBox="0 0 1400 260" role="img" aria-labelledby="title desc">
+  <title id="title">Causal memory cycle for decision t</title>
+  <desc id="desc">Selected episode rows reset, the policy reads the previous memory state, forms predictions, writes current causal evidence only after the decision, and returns the next state.</desc>
+  <defs>
+    <marker id="cycle-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#16324F"/>
+    </marker>
+    <style>
+      text { font-family: Helvetica, Arial, sans-serif; fill: #16324F; }
+      .title { font-size: 25px; font-weight: 700; }
+      .subtitle { font-size: 13px; fill: #5B6573; }
+      .step { font-size: 12px; font-weight: 700; fill: #FFFFFF; text-anchor: middle; dominant-baseline: middle; }
+      .box-title { font-size: 16px; font-weight: 700; text-anchor: middle; }
+      .box-sub { font-size: 12.5px; fill: #5B6573; text-anchor: middle; }
+      .math { font-size: 13px; font-weight: 700; fill: #2F6690; text-anchor: middle; }
+      .arrow { fill: none; stroke: #16324F; stroke-width: 2; marker-end: url(#cycle-arrow); }
+      .edge-label { font-size: 11.5px; fill: #5B6573; text-anchor: middle; }
+    </style>
+  </defs>
+
+  <rect x="0" y="0" width="1400" height="260" fill="#FFFFFF"/>
+  <text x="35" y="35" class="title">Causal memory cycle at decision t</text>
+  <text x="35" y="57" class="subtitle">Read-before-write preserves causality: the current decision can consume M_(t-1), but never its own write.</text>
+
+  <!-- Step 1 -->
+  <rect x="35" y="86" width="205" height="105" rx="8" fill="#F2F4F6" stroke="#5B6573" stroke-width="1.6"/>
+  <circle cx="57" cy="105" r="13" fill="#5B6573"/>
+  <text x="57" y="105" class="step">1</text>
+  <text x="137.5" y="123" class="box-title">Reset selected rows</text>
+  <text x="137.5" y="148" class="math">reset(M, mask)</text>
+  <text x="137.5" y="172" class="box-sub">episode boundary only</text>
+
+  <path d="M 240 138.5 H 295" class="arrow"/>
+  <text x="267.5" y="126" class="edge-label">state</text>
+
+  <!-- Step 2 -->
+  <rect x="295" y="86" width="205" height="105" rx="8" fill="#EDF4FA" stroke="#2F6690" stroke-width="1.8"/>
+  <circle cx="317" cy="105" r="13" fill="#2F6690"/>
+  <text x="317" y="105" class="step">2</text>
+  <text x="397.5" y="123" class="box-title">Read previous state</text>
+  <text x="397.5" y="148" class="math">R_t = read(M_(t-1))</text>
+  <text x="397.5" y="172" class="box-sub">working / episodic bank</text>
+
+  <path d="M 500 138.5 H 555" class="arrow"/>
+  <text x="527.5" y="126" class="edge-label">R_t</text>
+
+  <!-- Step 3 -->
+  <rect x="555" y="86" width="255" height="105" rx="8" fill="#EDF8F6" stroke="#3A7D78" stroke-width="1.8"/>
+  <circle cx="577" cy="105" r="13" fill="#3A7D78"/>
+  <text x="577" y="105" class="step">3</text>
+  <text x="682.5" y="123" class="box-title">Form prediction tensors</text>
+  <text x="682.5" y="148" class="math">action_t + world_prediction_t</text>
+  <text x="682.5" y="172" class="box-sub">decision is fixed before any write</text>
+
+  <path d="M 810 138.5 H 875" class="arrow"/>
+  <line x1="842.5" y1="74" x2="842.5" y2="202" stroke="#C98B2E" stroke-width="1.4" stroke-dasharray="5 5"/>
+  <rect x="778" y="64" width="129" height="20" rx="4" fill="#FFF7E8"/>
+  <text x="842.5" y="78" class="edge-label" style="fill:#C98B2E; font-weight:700;">CAUSAL BARRIER</text>
+
+  <!-- Step 4 -->
+  <rect x="875" y="86" width="265" height="105" rx="8" fill="#FFF7E8" stroke="#C98B2E" stroke-width="1.8"/>
+  <circle cx="897" cy="105" r="13" fill="#C98B2E"/>
+  <text x="897" y="105" class="step">4</text>
+  <text x="1007.5" y="123" class="box-title">Post-decision write</text>
+  <text x="1007.5" y="148" class="math">M_t = write(M_(t-1), q_t)</text>
+  <text x="1007.5" y="172" class="box-sub">current causal Qwen evidence only</text>
+
+  <path d="M 1140 138.5 H 1195" class="arrow"/>
+  <text x="1167.5" y="126" class="edge-label">M_t</text>
+
+  <!-- Step 5 -->
+  <rect x="1195" y="86" width="170" height="105" rx="8" fill="#FFFFFF" stroke="#16324F" stroke-width="1.8"/>
+  <circle cx="1217" cy="105" r="13" fill="#16324F"/>
+  <text x="1217" y="105" class="step">5</text>
+  <text x="1280" y="123" class="box-title">Next state</text>
+  <text x="1280" y="148" class="math">return M_t</text>
+  <text x="1280" y="172" class="box-sub">used at decision t + 1</text>
+
+  <rect x="35" y="215" width="1330" height="28" rx="5" fill="#F8FAFC" stroke="#D5DDE3" stroke-width="1"/>
+  <text x="700" y="234" class="subtitle" text-anchor="middle">INVARIANT — no future observation, target action, reward, target latent, or predicted future latent may enter the writer.</text>
+</svg>

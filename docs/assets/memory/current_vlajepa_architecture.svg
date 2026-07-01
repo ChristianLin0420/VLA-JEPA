@@ -1,0 +1,141 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="700" viewBox="0 0 1400 700" role="img" aria-labelledby="title desc">
+  <title id="title">Current VLA-JEPA architecture</title>
+  <desc id="desc">The deployed Qwen-to-DiT action path runs in parallel with the V-JEPA world-model path. The action-conditioned JEPA predictor has no edge to the DiT action head.</desc>
+  <defs>
+    <marker id="arrow-navy" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#16324F"/>
+    </marker>
+    <marker id="arrow-gray" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#5B6573"/>
+    </marker>
+    <style>
+      text { font-family: Helvetica, Arial, sans-serif; fill: #16324F; }
+      .title { font-size: 28px; font-weight: 700; letter-spacing: 0.2px; }
+      .subtitle { font-size: 14px; fill: #5B6573; }
+      .lane-title { font-size: 16px; font-weight: 700; letter-spacing: 0.4px; }
+      .lane-note { font-size: 12px; fill: #5B6573; }
+      .module-title { font-size: 16px; font-weight: 700; text-anchor: middle; }
+      .module-sub { font-size: 13px; fill: #5B6573; text-anchor: middle; }
+      .shape { font-size: 13px; font-weight: 700; fill: #2F6690; text-anchor: middle; }
+      .edge-label { font-size: 12px; fill: #5B6573; text-anchor: middle; }
+      .input { fill: #FFFFFF; stroke: #5B6573; stroke-width: 1.6; }
+      .backbone { fill: #EDF4FA; stroke: #2F6690; stroke-width: 1.8; }
+      .representation { fill: #EDF8F6; stroke: #3A7D78; stroke-width: 1.8; }
+      .head { fill: #FFF7E8; stroke: #C98B2E; stroke-width: 1.8; }
+      .output { fill: #FFFFFF; stroke: #16324F; stroke-width: 1.8; }
+      .loss { fill: #F2F4F6; stroke: #5B6573; stroke-width: 1.8; }
+      .arrow { fill: none; stroke: #16324F; stroke-width: 2; marker-end: url(#arrow-navy); }
+      .target-arrow { fill: none; stroke: #5B6573; stroke-width: 1.8; marker-end: url(#arrow-gray); }
+    </style>
+  </defs>
+
+  <rect x="0" y="0" width="1400" height="700" fill="#FFFFFF"/>
+  <text x="40" y="40" class="title">Current VLA-JEPA architecture</text>
+  <text x="40" y="63" class="subtitle">Control and world-model objectives share Qwen conditioning, but remain parallel computational paths.</text>
+
+  <!-- Deployed control path -->
+  <rect x="35" y="88" width="1330" height="225" rx="10" fill="#F8FAFC" stroke="#B8C5CF" stroke-width="1.2"/>
+  <rect x="35" y="88" width="8" height="225" rx="4" fill="#2F6690"/>
+  <text x="58" y="115" class="lane-title">DEPLOYED CONTROL PATH</text>
+  <text x="310" y="115" class="lane-note">executed by forward() and predict_action()</text>
+
+  <rect x="70" y="153" width="190" height="96" rx="7" class="input"/>
+  <text x="165" y="184" class="module-title">Current observations</text>
+  <text x="165" y="207" class="module-sub">camera images</text>
+  <text x="165" y="226" class="module-sub">+ task instruction</text>
+
+  <path d="M 260 201 H 320" class="arrow"/>
+
+  <rect x="320" y="143" width="190" height="116" rx="7" class="backbone"/>
+  <text x="415" y="181" class="module-title">Qwen3-VL</text>
+  <text x="415" y="205" class="module-sub">multimodal backbone</text>
+  <text x="415" y="231" class="shape">hidden: [B, L, 2048]</text>
+
+  <path d="M 510 201 H 570" class="arrow"/>
+
+  <rect x="570" y="143" width="225" height="116" rx="7" class="representation"/>
+  <text x="682.5" y="179" class="module-title">Embodied-action tokens</text>
+  <text x="682.5" y="204" class="module-sub">selected Qwen states</text>
+  <text x="682.5" y="232" class="shape">[B, 32, 2048]</text>
+
+  <path d="M 795 201 H 855" class="arrow"/>
+
+  <rect x="855" y="143" width="230" height="116" rx="7" class="head"/>
+  <text x="970" y="179" class="module-title">DiT action head</text>
+  <text x="970" y="204" class="module-sub">flow-matching policy</text>
+  <text x="970" y="232" class="shape">cross-attention context</text>
+
+  <path d="M 1085 201 H 1150" class="arrow"/>
+
+  <rect x="1150" y="153" width="180" height="96" rx="7" class="output"/>
+  <text x="1240" y="184" class="module-title">Action chunk</text>
+  <text x="1240" y="209" class="shape">[B, 7, 7]</text>
+  <text x="1240" y="230" class="module-sub">deployed output</text>
+
+  <!-- World-model path -->
+  <rect x="35" y="338" width="1330" height="326" rx="10" fill="#FBFCFD" stroke="#B8C5CF" stroke-width="1.2"/>
+  <rect x="35" y="338" width="8" height="326" rx="4" fill="#3A7D78"/>
+  <text x="58" y="365" class="lane-title">WORLD-MODEL TRAINING PATH</text>
+  <text x="330" y="365" class="lane-note">auxiliary latent prediction objective; not invoked by predict_action()</text>
+
+  <rect x="65" y="449" width="175" height="92" rx="7" class="input"/>
+  <text x="152.5" y="478" class="module-title">Video window</text>
+  <text x="152.5" y="501" class="module-sub">eight frames</text>
+  <text x="152.5" y="521" class="module-sub">two camera views</text>
+
+  <path d="M 240 495 H 285" class="arrow"/>
+
+  <rect x="285" y="437" width="190" height="116" rx="7" class="backbone"/>
+  <text x="380" y="473" class="module-title">V-JEPA encoder</text>
+  <text x="380" y="497" class="module-sub">frozen / no_grad</text>
+  <text x="380" y="525" class="shape">[B, 1024, 2048]</text>
+
+  <path d="M 475 495 H 515" class="arrow"/>
+
+  <rect x="515" y="437" width="170" height="116" rx="7" class="representation"/>
+  <text x="600" y="473" class="module-title">Latent split</text>
+  <text x="600" y="497" class="module-sub">context / target</text>
+  <text x="600" y="525" class="module-sub">three latent bins each</text>
+
+  <path d="M 685 476 H 724" class="arrow"/>
+  <path d="M 685 515 H 708 V 592 H 724" class="target-arrow"/>
+
+  <rect x="724" y="405" width="194" height="84" rx="7" class="representation"/>
+  <text x="821" y="435" class="module-title">Context latents</text>
+  <text x="821" y="463" class="shape">[B, 768, 2048]</text>
+
+  <rect x="724" y="550" width="194" height="84" rx="7" class="representation"/>
+  <text x="821" y="580" class="module-title">Target latents</text>
+  <text x="821" y="608" class="shape">[B, 768, 2048]</text>
+
+  <!-- Qwen conditioning branch into the world-model predictor -->
+  <rect x="724" y="500" width="194" height="42" rx="7" class="representation"/>
+  <text x="821" y="518" class="module-sub">action-marker tokens</text>
+  <text x="821" y="536" class="shape">[B, 24, 2048]</text>
+  <path d="M 415 259 V 401 H 695 V 521 H 724" class="arrow"/>
+  <text x="550" y="392" class="edge-label">Qwen action conditioning</text>
+
+  <path d="M 918 447 H 970" class="arrow"/>
+  <path d="M 918 521 H 944 V 500 H 970" class="arrow"/>
+
+  <rect x="970" y="420" width="210" height="116" rx="7" class="head"/>
+  <text x="1075" y="456" class="module-title">Action-conditioned</text>
+  <text x="1075" y="477" class="module-title">JEPA predictor</text>
+  <text x="1075" y="505" class="shape">Z_pred: [B, 768, 2048]</text>
+
+  <path d="M 1180 478 H 1220" class="arrow"/>
+  <text x="1200" y="465" class="edge-label">Z_pred</text>
+
+  <rect x="1220" y="431" width="120" height="94" rx="7" class="loss"/>
+  <text x="1280" y="466" class="module-title">L1 loss</text>
+  <text x="1280" y="490" class="module-sub">prediction</text>
+  <text x="1280" y="510" class="module-sub">vs. target</text>
+
+  <path d="M 918 592 H 946 V 548 H 1280 V 525" class="target-arrow"/>
+
+  <!-- Explicit architectural invariant -->
+  <rect x="970" y="561" width="370" height="73" rx="7" fill="#FFFFFF" stroke="#C98B2E" stroke-width="1.5"/>
+  <text x="1155" y="586" class="module-title" style="font-size:14px; fill:#C98B2E;">PARALLEL-PATH INVARIANT</text>
+  <text x="1155" y="608" class="module-sub">The predictor has no edge to the DiT head.</text>
+  <text x="1155" y="626" class="module-sub">Predictor outputs are absent from deployed inference.</text>
+</svg>

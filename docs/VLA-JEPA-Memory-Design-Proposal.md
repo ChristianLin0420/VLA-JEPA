@@ -64,23 +64,9 @@ Eight raw frames become four V-JEPA latent time bins because the encoder tubelet
 
 The control path and world-model path are parallel, not serial:
 
-```mermaid
-flowchart LR
-    OBS["Current images + task"] --> QWEN["Qwen3-VL"]
-    QWEN --> EMB["Embodied-action tokens<br/>B × 32 × 2048"]
-    EMB --> DIT["DiT action head"]
-    DIT --> ACTIONS["Action chunk<br/>B × 7 × 7"]
+![Current VLA-JEPA architecture, with parallel deployed control and training-only world-model paths](assets/memory/current_vlajepa_architecture.svg)
 
-    QWEN --> ATOK["Action-marker tokens<br/>B × 24 × 2048"]
-    VIDEO["Eight-frame, two-view video"] --> VJEPA["V-JEPA encoder<br/>no_grad"]
-    VJEPA --> SPLIT["Context / target split"]
-    SPLIT --> CONTEXT["Context latents<br/>B × 768 × 2048"]
-    SPLIT --> TARGET["Target latents<br/>B × 768 × 2048"]
-    CONTEXT --> PREDICTOR["Action-conditioned predictor"]
-    ATOK --> PREDICTOR
-    PREDICTOR --> WMLOSS["L1 world-model loss"]
-    TARGET --> WMLOSS
-```
+*Figure 1. Current VLA-JEPA computation graph. Qwen embodied-action tokens drive the deployed DiT control path, while action-marker tokens condition the parallel V-JEPA world-model path during training; predictor outputs do not feed the action head.*
 
 Memory must be inserted at the fork after Qwen so it can affect the deployed control path and, optionally, the world-model path.
 
@@ -100,36 +86,9 @@ The implementation must preserve these invariants:
 
 ## 5. Recommended placement: post-Qwen memory bridge
 
-```mermaid
-flowchart TD
-    OBS["Current images + task"] --> QWEN["Qwen3-VL"]
-    QWEN --> Z["Action-marker tokens Zₜ<br/>B × 24 × 2048"]
-    QWEN --> E["Embodied-action tokens Eₜ<br/>B × 32 × 2048"]
+![Proposed post-Qwen memory bridge, showing read-before-write policy and optional world-model fusion](assets/memory/memory_augmented_architecture.svg)
 
-    PREV["Previous MemoryState Mₜ₋₁"] --> BANK["Previous working-slot read bank"]
-    PREV --> ASSOC["Optional associative state"]
-    Z --> QUERY["Pool and form associative query"]
-    QUERY --> ASSOC
-    ASSOC --> LONG["Projected long read<br/>B × 1 × 512"]
-    BANK --> READ["MemoryRead Rₜ"]
-    LONG --> READ
-
-    E --> PFUSE["Policy bottleneck residual fusion"]
-    READ --> PFUSE
-    PFUSE --> DIT["DiT action head"]
-    DIT --> ACTION["Action prediction / loss"]
-
-    Z --> WFUSE["World-model bottleneck residual fusion"]
-    READ --> WFUSE
-    WFUSE --> PREDICTOR["Action-conditioned predictor"]
-    PREDICTOR --> WORLD["World-model prediction / loss"]
-
-    Z --> WRITE["Post-decision memory write"]
-    PREV --> WRITE
-    ACTION -. prediction formed .-> WRITE
-    WORLD -. prediction formed .-> WRITE
-    WRITE --> NEXT["Next MemoryState Mₜ"]
-```
+*Figure 2. Proposed memory bridge at policy decision \(t\). The policy and optional world-model adapters read \(M_{t-1}\); causal current evidence is written to \(M_t\) only after prediction tensors are formed. The associative tier is a deferred Stage-2 component.*
 
 The Qwen action-marker states are the canonical memory write source because the configured prompts contain them in robot, SSV2, training, and inference. They depend on the current images and task but not on future labels. `predict_action()` currently extracts only embodied tokens; extracting action-marker tokens there is a required code change.
 
@@ -274,13 +233,9 @@ If associative memory does not beat a second set of slowly updated recurrent slo
 
 The correct order at decision `t` is:
 
-```mermaid
-flowchart LR
-    RESET["Reset selected rows"] --> READ["Read Mₜ₋₁"]
-    READ --> PREDICT["Predict action and world tensors"]
-    PREDICT --> WRITE["Write current causal evidence"]
-    WRITE --> NEXT["Return Mₜ"]
-```
+![Causal per-decision memory transaction from selected-row reset through state commit](assets/memory/causal_memory_cycle.svg)
+
+*Figure 3. Per-decision memory transaction. Selected rows reset before reading \(M_{t-1}\); action and world tensors are formed before current causal evidence is committed to \(M_t\).*
 
 A future-perturbation test must prove that changing observations or labels after time `t` does not change the Qwen memory source, memory write, DiT conditioning, or action at `t` under fixed flow noise. World predictions/loss may legitimately change when their explicit video context or target changes; they are not the invariant under this test.
 

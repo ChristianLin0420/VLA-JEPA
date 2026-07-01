@@ -1,0 +1,166 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="820" viewBox="0 0 1800 820" role="img" aria-labelledby="title desc">
+  <title id="title">Contiguous segment data pipeline for recurrent memory training</title>
+  <desc id="desc">A deterministic global sample selects a weighted dataset, trajectory, valid start, and raw indices. The indices branch into a burn-in prefix and supervised decisions, which are collated, vectorized through Qwen and V-JEPA encoders, sequentially unrolled through memory, masked, normalized, and optimized with one backward step.</desc>
+
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8.5" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#16324F"/>
+    </marker>
+    <marker id="arrowTeal" markerWidth="10" markerHeight="10" refX="8.5" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#3A7D78"/>
+    </marker>
+    <style>
+      .title { font: 700 28px Helvetica, Arial, sans-serif; fill: #16324F; letter-spacing: .2px; }
+      .panel-title { font: 700 19px Helvetica, Arial, sans-serif; fill: #16324F; }
+      .panel-subtitle { font: 400 13px Helvetica, Arial, sans-serif; fill: #5B6573; }
+      .box-title { font: 700 16px Helvetica, Arial, sans-serif; fill: #16324F; }
+      .box-body { font: 400 14px Helvetica, Arial, sans-serif; fill: #5B6573; }
+      .box-body-white { font: 400 14px Helvetica, Arial, sans-serif; fill: #FFFFFF; }
+      .box-title-white { font: 700 16px Helvetica, Arial, sans-serif; fill: #FFFFFF; }
+      .edge-label { font: 600 12px Helvetica, Arial, sans-serif; fill: #5B6573; letter-spacing: .15px; }
+      .note-title { font: 700 13px Helvetica, Arial, sans-serif; fill: #16324F; }
+      .note-body { font: 400 13px Helvetica, Arial, sans-serif; fill: #5B6573; }
+      .panel { fill: #FBFCFD; stroke: #C7CED6; stroke-width: 1.4; }
+      .node { fill: #FFFFFF; stroke: #2F6690; stroke-width: 1.8; }
+      .node-teal { fill: #F1F8F7; stroke: #3A7D78; stroke-width: 1.8; }
+      .node-amber { fill: #FFF8EC; stroke: #C98B2E; stroke-width: 1.8; }
+      .node-navy { fill: #16324F; stroke: #16324F; stroke-width: 1.8; }
+      .flow { fill: none; stroke: #16324F; stroke-width: 1.8; marker-end: url(#arrow); }
+      .merge-flow { fill: none; stroke: #16324F; stroke-width: 1.8; }
+      .flow-teal { fill: none; stroke: #3A7D78; stroke-width: 1.8; marker-end: url(#arrowTeal); }
+      .guide { fill: none; stroke: #AAB4BF; stroke-width: 1.2; stroke-dasharray: 5 5; }
+    </style>
+  </defs>
+
+  <rect width="1800" height="820" fill="#FFFFFF"/>
+  <text x="900" y="45" text-anchor="middle" class="title">Contiguous segment pipeline for recurrent memory training</text>
+  <line x1="660" y1="61" x2="1140" y2="61" stroke="#C98B2E" stroke-width="2"/>
+
+  <!-- Panel A: deterministic segment construction -->
+  <rect x="30" y="88" width="870" height="682" rx="12" class="panel"/>
+  <circle cx="61" cy="120" r="17" fill="#16324F"/>
+  <text x="61" y="126" text-anchor="middle" class="box-title-white">A</text>
+  <text x="89" y="119" class="panel-title">Deterministic segment construction</text>
+  <text x="89" y="140" class="panel-subtitle">Preserve mixture weights, trajectory identity, and raw temporal continuity</text>
+
+  <rect x="60" y="181" width="165" height="92" rx="8" class="node"/>
+  <text x="142.5" y="217" text-anchor="middle" class="box-title">Global sample</text>
+  <text x="142.5" y="240" text-anchor="middle" class="box-body">index g</text>
+  <text x="142.5" y="259" text-anchor="middle" class="box-body">epoch · seed</text>
+
+  <rect x="270" y="181" width="175" height="92" rx="8" class="node"/>
+  <text x="357.5" y="213" text-anchor="middle" class="box-title">Weighted dataset</text>
+  <text x="357.5" y="237" text-anchor="middle" class="box-body">sample from configured</text>
+  <text x="357.5" y="256" text-anchor="middle" class="box-body">mixture probabilities</text>
+
+  <rect x="490" y="181" width="185" height="92" rx="8" class="node-teal"/>
+  <text x="582.5" y="213" text-anchor="middle" class="box-title">Trajectory + start</text>
+  <text x="582.5" y="237" text-anchor="middle" class="box-body">same episode</text>
+  <text x="582.5" y="256" text-anchor="middle" class="box-body">valid segment origin</text>
+
+  <rect x="720" y="181" width="150" height="92" rx="8" class="node-amber"/>
+  <text x="795" y="213" text-anchor="middle" class="box-title">Raw indices</text>
+  <text x="795" y="237" text-anchor="middle" class="box-body">monotonic</text>
+  <text x="795" y="256" text-anchor="middle" class="box-body">stride-aware</text>
+
+  <path d="M 225 227 L 270 227" class="flow"/>
+  <path d="M 445 227 L 490 227" class="flow"/>
+  <path d="M 675 227 L 720 227" class="flow"/>
+  <text x="247" y="215" text-anchor="middle" class="edge-label">select</text>
+  <text x="467" y="215" text-anchor="middle" class="edge-label">then</text>
+  <text x="697" y="215" text-anchor="middle" class="edge-label">resolve</text>
+
+  <!-- Raw-index branch -->
+  <circle cx="795" cy="321" r="4" fill="#16324F"/>
+  <path d="M 795 273 L 795 321 L 547.5 321 L 547.5 376" class="flow"/>
+  <path d="M 795 321 L 772.5 321 L 772.5 376" class="flow"/>
+  <text x="643" y="311" text-anchor="middle" class="edge-label">same-episode history</text>
+  <text x="812" y="349" class="edge-label">ordered targets</text>
+
+  <rect x="445" y="376" width="205" height="116" rx="8" class="node-amber"/>
+  <rect x="460" y="390" width="28" height="24" rx="12" fill="#C98B2E"/>
+  <text x="474" y="407" text-anchor="middle" class="box-title-white">J</text>
+  <text x="547.5" y="430" text-anchor="middle" class="box-title">Burn-in prefix</text>
+  <text x="547.5" y="454" text-anchor="middle" class="box-body">reconstruct memory state</text>
+  <text x="547.5" y="475" text-anchor="middle" class="box-body">update; no supervised loss</text>
+
+  <rect x="670" y="376" width="205" height="116" rx="8" class="node"/>
+  <rect x="685" y="390" width="28" height="24" rx="12" fill="#2F6690"/>
+  <text x="699" y="407" text-anchor="middle" class="box-title-white">K</text>
+  <text x="772.5" y="430" text-anchor="middle" class="box-title">Supervised decisions</text>
+  <text x="772.5" y="454" text-anchor="middle" class="box-body">ordered action targets</text>
+  <text x="772.5" y="475" text-anchor="middle" class="box-body">loss-bearing time steps</text>
+
+  <rect x="61" y="558" width="814" height="156" rx="8" fill="#FFFFFF" stroke="#D9DEE4" stroke-width="1.2"/>
+  <text x="84" y="587" class="note-title">Sampling invariants</text>
+  <line x1="84" y1="598" x2="852" y2="598" stroke="#D9DEE4" stroke-width="1"/>
+  <circle cx="91" cy="626" r="4" fill="#2F6690"/>
+  <text x="105" y="631" class="note-body">Deterministic key: (epoch, global sample index, seed)</text>
+  <circle cx="91" cy="658" r="4" fill="#3A7D78"/>
+  <text x="105" y="663" class="note-body">Every index remains inside one dataset trajectory</text>
+  <circle cx="91" cy="690" r="4" fill="#C98B2E"/>
+  <text x="105" y="695" class="note-body">Padding never advances memory or contributes to loss</text>
+
+  <!-- Panel B: encode, unroll, optimize -->
+  <rect x="930" y="88" width="840" height="682" rx="12" class="panel"/>
+  <circle cx="961" cy="120" r="17" fill="#16324F"/>
+  <text x="961" y="126" text-anchor="middle" class="box-title-white">B</text>
+  <text x="989" y="119" class="panel-title">Encoding, recurrence, and optimization</text>
+  <text x="989" y="140" class="panel-subtitle">Vectorize the heavy path; preserve causal time order inside memory</text>
+
+  <rect x="966" y="343" width="194" height="130" rx="8" class="node"/>
+  <text x="1063" y="379" text-anchor="middle" class="box-title">Batch collation</text>
+  <text x="1063" y="404" text-anchor="middle" class="box-body">batch-major sequence</text>
+  <text x="1063" y="427" text-anchor="middle" class="box-body">B × (J + K)</text>
+  <text x="1063" y="450" text-anchor="middle" class="box-body">metadata + masks</text>
+
+  <rect x="1200" y="343" width="205" height="130" rx="8" class="node"/>
+  <text x="1302.5" y="378" text-anchor="middle" class="box-title">Vectorized encoders</text>
+  <text x="1302.5" y="403" text-anchor="middle" class="box-body">Qwen + V-JEPA</text>
+  <text x="1302.5" y="426" text-anchor="middle" class="box-body">flatten B × (J + K)</text>
+  <text x="1302.5" y="449" text-anchor="middle" class="box-body">then restore time axis</text>
+
+  <rect x="1445" y="343" width="285" height="130" rx="8" class="node-teal"/>
+  <text x="1587.5" y="377" text-anchor="middle" class="box-title">Sequential memory unroll</text>
+  <text x="1587.5" y="402" text-anchor="middle" class="box-body">causal read → predict → write</text>
+  <text x="1587.5" y="425" text-anchor="middle" class="box-body">burn-in J, then supervised K</text>
+  <text x="1587.5" y="448" text-anchor="middle" class="box-body">one state per segment</text>
+
+  <!-- Cross-panel merge into collation -->
+  <path d="M 547.5 492 V 520 H 908" class="merge-flow"/>
+  <path d="M 772.5 492 V 502 H 918 V 510" class="merge-flow"/>
+  <path d="M 928 520 H 946 V 408 H 966" class="flow"/>
+  <path d="M 918 510 L 928 520 L 918 530 L 908 520 Z" fill="#FFFFFF" stroke="#16324F" stroke-width="1.8"/>
+  <text x="874" y="545" text-anchor="middle" class="edge-label">J + K</text>
+
+  <path d="M 1160 408 L 1200 408" class="flow"/>
+  <path d="M 1405 408 L 1445 408" class="flow"/>
+  <text x="1180" y="395" text-anchor="middle" class="edge-label">flatten</text>
+  <text x="1425" y="395" text-anchor="middle" class="edge-label">reshape</text>
+
+  <rect x="1445" y="548" width="285" height="122" rx="8" class="node-amber"/>
+  <text x="1587.5" y="582" text-anchor="middle" class="box-title">Apply temporal masks</text>
+  <text x="1587.5" y="607" text-anchor="middle" class="box-body">sequence_valid · loss_mask</text>
+  <text x="1587.5" y="630" text-anchor="middle" class="box-body">update_mask</text>
+  <text x="1587.5" y="651" text-anchor="middle" class="box-body">padded rows are inert</text>
+
+  <rect x="1200" y="548" width="205" height="122" rx="8" class="node"/>
+  <text x="1302.5" y="585" text-anchor="middle" class="box-title">Normalized loss</text>
+  <text x="1302.5" y="612" text-anchor="middle" class="box-body">Σ masked losses</text>
+  <text x="1302.5" y="636" text-anchor="middle" class="box-body">÷ valid K decisions</text>
+
+  <rect x="966" y="548" width="194" height="122" rx="8" class="node-navy"/>
+  <text x="1063" y="586" text-anchor="middle" class="box-title-white">Backward</text>
+  <text x="1063" y="613" text-anchor="middle" class="box-body-white">one complete-segment</text>
+  <text x="1063" y="636" text-anchor="middle" class="box-body-white">optimizer step</text>
+
+  <path d="M 1587.5 473 L 1587.5 548" class="flow-teal"/>
+  <text x="1601" y="516" class="edge-label">time outputs</text>
+  <path d="M 1445 609 L 1405 609" class="flow"/>
+  <path d="M 1200 609 L 1160 609" class="flow"/>
+  <text x="1425" y="596" text-anchor="middle" class="edge-label">reduce</text>
+  <text x="1180" y="596" text-anchor="middle" class="edge-label">optimize</text>
+
+  <text x="1350" y="735" text-anchor="middle" class="panel-subtitle">No recurrent graph crosses the optimizer boundary.</text>
+</svg>
