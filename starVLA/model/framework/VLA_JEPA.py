@@ -99,6 +99,36 @@ class VLA_JEPA(baseframework):
 
         self.embodied_replace_prompt = "".join([embodied_action_token * self.config.framework.vj2_model.num_embodied_action_tokens_per_instruction])
 
+        # --- JEPA representation-analysis side-channel -------------------------------
+        # The trainer flips `capture_jepa` on logging steps; forward() then stashes the
+        # (detached) predictor tensors here so the trainer can compute representation
+        # metrics WITHOUT polluting the loss dict (which the trainer sums over). Off
+        # logging steps this is a no-op (zero overhead). `num_views` lets the analysis
+        # split the multi-view-concatenated latent dim per camera.
+        self.capture_jepa = False
+        self.last_jepa_tensors = None
+        self.jepa_num_views = 2
+
+    def _maybe_capture_jepa(self, predicted_states, gt_states, input_states, action_tokens):
+        """Stash detached predictor tensors for representation analysis (logging steps only).
+
+        When capture is off we MUST NOT clear last_jepa_tensors: the cotrain runs two
+        forwards per step (VLA then video) and toggles capture off before the video
+        forward, so clobbering here would wipe the VLA-pass capture before the trainer
+        reads it. The trainer clears last_jepa_tensors after logging instead.
+        """
+        if not getattr(self, "capture_jepa", False):
+            return
+        try:
+            self.last_jepa_tensors = {
+                "predicted": predicted_states.detach(),
+                "gt": gt_states.detach(),
+                "input": input_states.detach(),
+                "action_tokens": action_tokens.detach() if action_tokens is not None else None,
+            }
+        except Exception:
+            self.last_jepa_tensors = None
+
     def expand_tokenizer(self, 
                          tokenizer: AutoTokenizer,
                          special_action_token: str = "<|action_{}|>",
@@ -242,7 +272,10 @@ class VLA_JEPA(baseframework):
                 gt_states,
                 reduction="mean"
             )
-        
+
+        # JEPA representation-analysis side-channel (logging steps only; no grad impact).
+        self._maybe_capture_jepa(predicted_states, gt_states, input_states, action_tokens)
+
         if "action" not in examples[0]:
             return {"wm_loss": teacher_forcing_wm_loss}
 

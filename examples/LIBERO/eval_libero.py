@@ -14,6 +14,17 @@ import imageio
 import numpy as np
 import tqdm
 import tyro
+
+# Compat shim: torch>=2.6 defaults torch.load(weights_only=True), which rejects
+# LIBERO's numpy-pickled init-state files (get_task_init_states). Restore the
+# pre-2.6 behavior for the trusted local LIBERO assets.
+import torch as _torch
+_orig_torch_load = _torch.load
+def _compat_torch_load(*args, **kwargs):
+    kwargs.setdefault("weights_only", False)
+    return _orig_torch_load(*args, **kwargs)
+_torch.load = _compat_torch_load
+
 from libero.libero import benchmark, get_libero_path
 from libero.libero.envs import OffScreenRenderEnv
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -69,6 +80,10 @@ class Args:
 
     with_state: str = "true"
 
+    # Multi-embodiment checkpoints contain one statistics block per robot tag.
+    # LIBERO evaluation must explicitly select the Franka block.
+    unnorm_key: str = "franka"
+
     job_name: str = "test"
 
 
@@ -109,6 +124,7 @@ def eval_libero(args: Args) -> None:
         host=args.host,
         port=args.port,
         image_size=args.resize_size,
+        unnorm_key=args.unnorm_key,
     )
 
 

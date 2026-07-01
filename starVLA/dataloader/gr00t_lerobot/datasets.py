@@ -1864,10 +1864,12 @@ class LeRobotMixtureDataset(Dataset):
                 modality_configs[modality].add(json.dumps(configs))
         merged_metadata["modalities"] = {}
         for modality, configs in modality_configs.items():
-            # Check that all modality configs correspond to the same tag matches
-            assert (
-                len(configs) == 1
-            ), f"Multiple modality configs for modality {modality}: {list(configs)}"
+            # Metadata is merged only within a single embodiment tag.  Different
+            # configs under that same tag would make the shared normalization and
+            # export metadata ambiguous, so fail loudly instead of choosing one.
+            assert len(configs) == 1, (
+                f"Multiple modality configs for modality {modality}: {list(configs)}"
+            )
             merged_metadata["modalities"][modality] = json.loads(configs.pop())
 
         return DatasetMetadata.model_validate(merged_metadata)
@@ -1896,14 +1898,17 @@ class LeRobotMixtureDataset(Dataset):
         self.merged_metadata: dict[str, DatasetMetadata] = {}
         # Group metadata by tag
         all_metadatas: dict[str, list[DatasetMetadata]] = {}
-        for dataset in self.datasets:
+        all_metadata_weights: dict[str, list[float]] = {}
+        for dataset, weight in zip(self.datasets, self.dataset_sampling_weights):
             if dataset.tag not in all_metadatas:
                 all_metadatas[dataset.tag] = []
+                all_metadata_weights[dataset.tag] = []
             all_metadatas[dataset.tag].append(dataset.metadata)
+            all_metadata_weights[dataset.tag].append(float(weight))
         for tag, metadatas in all_metadatas.items():
             self.merged_metadata[tag] = self.merge_metadata(
                 metadatas=metadatas,
-                dataset_sampling_weights=self.dataset_sampling_weights.tolist(),
+                dataset_sampling_weights=all_metadata_weights[tag],
                 percentile_mixing_method=metadata_config["percentile_mixing_method"],
             )
         for dataset in self.datasets:
@@ -2122,6 +2127,4 @@ class LeRobotMixtureDataset(Dataset):
                 dataset.set_transforms_metadata(self.merged_metadata[dataset.tag])
         
         print(f"Applied cached statistics for {len(self.merged_metadata)} embodiment tags.")
-
-
 

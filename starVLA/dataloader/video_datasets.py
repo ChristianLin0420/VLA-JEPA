@@ -85,6 +85,8 @@ class VideoFolderDataset(Dataset):
         crop_h_size=420,
         crop_w_size=240,
         max_retry: int = 10,
+        expected_video_count: int | None = None,
+        expected_label_count: int | None = None,
     ):
         self.video_dir = video_dir
         self.n_frames = n_frames
@@ -93,12 +95,37 @@ class VideoFolderDataset(Dataset):
         self.crop_w_size = crop_w_size
 
         # 只扫描文件名
-        self.video_files = [
+        self.video_files = sorted([
             f for f in os.listdir(video_dir)
             if f.lower().endswith(extensions)
-        ]
-        df = pd.read_csv(text_file, sep=";")
-        self.id2text = dict(zip(df.iloc[:, 0], df.iloc[:, 1]))
+        ])
+        if expected_video_count is not None and len(self.video_files) != expected_video_count:
+            raise ValueError(
+                f"video count mismatch for {video_dir}: found {len(self.video_files)}, "
+                f"expected {expected_video_count}"
+            )
+        # SSV2 label files are headerless ``id;text`` records.  Letting pandas
+        # infer a header silently drops the first labeled example.
+        labels = pd.read_csv(
+            text_file,
+            sep=";",
+            header=None,
+            names=["id", "text"],
+            dtype={"id": "int64", "text": "string"},
+        )
+        if labels[["id", "text"]].isnull().any().any():
+            raise ValueError(f"SSV2 labels contain missing id/text values: {text_file}")
+        if labels["id"].duplicated().any():
+            duplicate_ids = labels.loc[labels["id"].duplicated(), "id"].head(5).tolist()
+            raise ValueError(f"SSV2 labels contain duplicate ids {duplicate_ids}: {text_file}")
+
+        self.label_count = len(labels)
+        if expected_label_count is not None and self.label_count != expected_label_count:
+            raise ValueError(
+                f"SSV2 label count mismatch for {text_file}: "
+                f"found {self.label_count}, expected {expected_label_count}"
+            )
+        self.id2text = dict(zip(labels["id"], labels["text"]))
         
         for each in self.video_files:
             file_idx = int(each.split(".")[0])

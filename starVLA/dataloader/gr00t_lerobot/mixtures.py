@@ -45,6 +45,24 @@ DATASET_NAMED_MIXTURES = {
         # ("libero_90_no_noops_lerobot", 1.0, "libero_ur5"),
     ],
 
+    # Full cross-embodiment robot mixture: LIBERO x4 (libero_franka) + Droid
+    # (droid_libero schema, oxe_droid tag) + Bridge (oxe_bridge) + Fractal (oxe_rt1).
+    # All video payloads
+    # are resumed in full from IPEC-COMMUNITY/{droid,bridge_orig,fractal20220817_data}
+    # _lerobot. Droid uses the LIBERO-compatible config (action-7 / state-8, same
+    # video.primary_image/video.wrist_image keys) but keeps its own normalization tag.
+    # Use with_state=false so the shared
+    # 7-dim EEF-delta action space works across heterogeneous embodiments.
+    "all_robot": [
+        ("libero_object_no_noops_1.0.0_lerobot", 1.0, "libero_franka"),
+        ("libero_goal_no_noops_1.0.0_lerobot", 1.0, "libero_franka"),
+        ("libero_spatial_no_noops_1.0.0_lerobot", 1.0, "libero_franka"),
+        ("libero_10_no_noops_1.0.0_lerobot", 1.0, "libero_franka"),
+        ("droid_lerobot", 1.0, "droid_libero"),
+        ("bridge_orig_1.0.0_lerobot", 1.0, "oxe_bridge"),
+        ("fractal20220817_data_0.1.0_lerobot", 1.0, "oxe_rt1"),
+    ],
+
     "bridge": [
         ("bridge_orig_1.0.0_lerobot", 1.0, "oxe_bridge"),
     ],

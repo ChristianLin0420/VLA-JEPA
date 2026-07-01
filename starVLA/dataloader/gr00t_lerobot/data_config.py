@@ -785,6 +785,9 @@ class SingleFrankaRobotiqDeltaJointsDataConfig:
 
 ROBOT_TYPE_CONFIG_MAP = {
     "libero_franka": Libero4in1DataConfig,
+    # DROID's local modality.json uses the same 7-D action / 8-D state schema as
+    # LIBERO, while its embodiment tag remains distinct for normalization/export.
+    "droid_libero": Libero4in1DataConfig,
     "droid_franka": LeRobotDroidDataConfig,
     "fr3_real_world": FR3RealWorldConfig,
     #"oxe_droid": OxeDroidDataConfig(),

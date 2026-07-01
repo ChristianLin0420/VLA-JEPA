@@ -54,12 +54,16 @@ class _QWen3_VL_Interface(nn.Module):
 
         qwenvl_config = config.framework.get("qwenvl", {})
         model_id = qwenvl_config.get("base_vlm", "Qwen/Qwen3-VL-4B-Instruct")
+        # Honor the configured attention backend; default to SDPA so we do not require
+        # a flash-attn build. IMPORTANT: do NOT pass device_map here -- under
+        # accelerate/DeepSpeed multi-GPU launch every rank would map to cuda:0 and OOM.
+        # Load on CPU and let accelerator.prepare() place the module on the rank's GPU.
+        attn_impl = qwenvl_config.get("attn_implementation", "sdpa")
 
         model = Qwen3VLForConditionalGeneration.from_pretrained(
             model_id,
-            attn_implementation="flash_attention_2",
+            attn_implementation=attn_impl,
             dtype=torch.bfloat16,
-            device_map="cuda",
         )
         processor = AutoProcessor.from_pretrained(model_id)
         processor.tokenizer.padding_side = "left"

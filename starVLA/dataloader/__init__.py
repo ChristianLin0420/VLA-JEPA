@@ -107,6 +107,8 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe"): # TODO now here on
             crop_h_size=video_dataset_cfg.video_resolution_size,
             crop_w_size=video_dataset_cfg.video_resolution_size,
             max_retry=10,
+            expected_video_count=video_dataset_cfg.get("expected_video_count", None),
+            expected_label_count=video_dataset_cfg.get("expected_label_count", None),
         )
 
         video_collate_fn = partial(collate_fn, 
