@@ -64,18 +64,22 @@ Eight raw frames become four V-JEPA latent time bins because the encoder tubelet
 
 The control path and world-model path are parallel, not serial:
 
-```text
-current images + task
-          |
-          v
-       Qwen3-VL
-          |
-          +---------------- embodied tokens ----------------> DiT action head -> actions
-          |
-          +---------------- action-marker tokens ---+
-                                                    |
-video window -> frozen V-JEPA -> context latents -> AC predictor -> wm_loss
-                                      target latents ----------------^
+```mermaid
+flowchart LR
+    OBS["Current images + task"] --> QWEN["Qwen3-VL"]
+    QWEN --> EMB["Embodied-action tokens<br/>B × 32 × 2048"]
+    EMB --> DIT["DiT action head"]
+    DIT --> ACTIONS["Action chunk<br/>B × 7 × 7"]
+
+    QWEN --> ATOK["Action-marker tokens<br/>B × 24 × 2048"]
+    VIDEO["Eight-frame, two-view video"] --> VJEPA["V-JEPA encoder<br/>no_grad"]
+    VJEPA --> SPLIT["Context / target split"]
+    SPLIT --> CONTEXT["Context latents<br/>B × 768 × 2048"]
+    SPLIT --> TARGET["Target latents<br/>B × 768 × 2048"]
+    CONTEXT --> PREDICTOR["Action-conditioned predictor"]
+    ATOK --> PREDICTOR
+    PREDICTOR --> WMLOSS["L1 world-model loss"]
+    TARGET --> WMLOSS
 ```
 
 Memory must be inserted at the fork after Qwen so it can affect the deployed control path and, optionally, the world-model path.
@@ -96,32 +100,35 @@ The implementation must preserve these invariants:
 
 ## 5. Recommended placement: post-Qwen memory bridge
 
-```text
-                                    previous MemoryState
-                                             |
-                                             v
-current images + task -> Qwen -> action-marker tokens Z_t [B,24,2048]
-                                  |          |
-                                  |          +---- pool/query optional associative state
-                                  |                         |
-previous working slots --------------------- read bank -----+
-                                  |                         v
-                                  |             MemoryRead R_t [B,8 or 9,512]
-                                  |                         |
-                                  |       +-----------------+------------------+
-                                  |       |                                    |
-                                  v       v                                    v
-                         embodied tokens E_t                         JEPA action tokens A_t
-                                  |                                    |
-                       bottleneck residual fusion           bottleneck residual fusion
-                                  |                                    |
-                                  v                                    v
-                           DiT action head                         AC predictor
-                                  |                                    |
-                                  +--------------- losses -------------+
-                                                       |
-                                                       v
-                                  post-decision write(Z_t, old state) -> next state
+```mermaid
+flowchart TD
+    OBS["Current images + task"] --> QWEN["Qwen3-VL"]
+    QWEN --> Z["Action-marker tokens Zₜ<br/>B × 24 × 2048"]
+    QWEN --> E["Embodied-action tokens Eₜ<br/>B × 32 × 2048"]
+
+    PREV["Previous MemoryState Mₜ₋₁"] --> BANK["Previous working-slot read bank"]
+    PREV --> ASSOC["Optional associative state"]
+    Z --> QUERY["Pool and form associative query"]
+    QUERY --> ASSOC
+    ASSOC --> LONG["Projected long read<br/>B × 1 × 512"]
+    BANK --> READ["MemoryRead Rₜ"]
+    LONG --> READ
+
+    E --> PFUSE["Policy bottleneck residual fusion"]
+    READ --> PFUSE
+    PFUSE --> DIT["DiT action head"]
+    DIT --> ACTION["Action prediction / loss"]
+
+    Z --> WFUSE["World-model bottleneck residual fusion"]
+    READ --> WFUSE
+    WFUSE --> PREDICTOR["Action-conditioned predictor"]
+    PREDICTOR --> WORLD["World-model prediction / loss"]
+
+    Z --> WRITE["Post-decision memory write"]
+    PREV --> WRITE
+    ACTION -. prediction formed .-> WRITE
+    WORLD -. prediction formed .-> WRITE
+    WRITE --> NEXT["Next MemoryState Mₜ"]
 ```
 
 The Qwen action-marker states are the canonical memory write source because the configured prompts contain them in robot, SSV2, training, and inference. They depend on the current images and task but not on future labels. `predict_action()` currently extracts only embodied tokens; extracting action-marker tokens there is a required code change.
@@ -267,8 +274,12 @@ If associative memory does not beat a second set of slowly updated recurrent slo
 
 The correct order at decision `t` is:
 
-```text
-reset selected rows -> read M_(t-1) -> predict action/world tensors -> write current evidence -> M_t
+```mermaid
+flowchart LR
+    RESET["Reset selected rows"] --> READ["Read Mₜ₋₁"]
+    READ --> PREDICT["Predict action and world tensors"]
+    PREDICT --> WRITE["Write current causal evidence"]
+    WRITE --> NEXT["Return Mₜ"]
 ```
 
 A future-perturbation test must prove that changing observations or labels after time `t` does not change the Qwen memory source, memory write, DiT conditioning, or action at `t` under fixed flow noise. World predictions/loss may legitimately change when their explicit video context or target changes; they are not the invariant under this test.

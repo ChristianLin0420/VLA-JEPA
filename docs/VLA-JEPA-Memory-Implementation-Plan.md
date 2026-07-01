@@ -267,6 +267,22 @@ The composite `(dataset_id, episode_id)` is required because episode indices rep
 
 Collate burn-in plus supervised decisions into batch-major sequences. The model may flatten `B × (J+K)` for frozen/heavy encoders, then reshape outputs and recurrently process time. Do not maintain a rank-local dictionary of episode states across batches. Test actual Accelerate sharding and exact resume, not only raw DataLoader determinism.
 
+```mermaid
+flowchart LR
+    SAMPLE["Global sample index"] --> DATASET["Choose dataset by mixture weight"]
+    DATASET --> TRAJ["Choose trajectory and valid start"]
+    TRAJ --> RAW["Resolve raw base indices"]
+    RAW --> BURN["Same-episode burn-in prefix J"]
+    RAW --> SUP["Supervised decisions K"]
+    BURN --> COLLATE["Batch-major sequence collation"]
+    SUP --> COLLATE
+    COLLATE --> ENCODE["Vectorized Qwen / V-JEPA encoding<br/>B × (J + K)"]
+    ENCODE --> UNROLL["Sequential memory unroll"]
+    UNROLL --> MASK["Apply valid / loss / update masks"]
+    MASK --> LOSS["Normalize by valid decision count"]
+    LOSS --> BACKWARD["One backward + optimizer step"]
+```
+
 ## 7. Training-loop integration
 
 ### Robot pass
@@ -328,13 +344,17 @@ The MVP allows one active `B=1` episode per connection and rejects live-memory r
 
 Preferred ownership is per WebSocket handler:
 
-```text
-connection opens -> state = None
-reset(seed)       -> state = None; generator = Generator(seed)
-infer             -> public_output, candidate_state = policy.predict_action(...)
-success           -> atomically commit candidate_state and RNG advancement
-failure           -> keep state/RNG unchanged or invalidate the connection
-disconnect        -> delete state and generator
+```mermaid
+stateDiagram-v2
+    [*] --> Connected: connection opens
+    Connected --> Ready: reset(episode_seed) / initialize memory and generator
+    Ready --> Candidate: infer / compute public output and candidate state
+    Candidate --> Ready: success / atomically commit state and RNG
+    Candidate --> Ready: failure / restore prior state and RNG
+    Candidate --> Invalid: unrecoverable failure
+    Invalid --> Ready: explicit reset
+    Ready --> [*]: disconnect / delete state and generator
+    Invalid --> [*]: disconnect / delete state and generator
 ```
 
 `MemoryState` is never inserted into the public output dictionary or msgpacked. Pass a per-connection `torch.Generator` or pre-sampled initial flow noise through `VLA_JEPA.predict_action()` into `FlowmatchingActionHead.predict_action()`; global `torch.manual_seed` is not client-isolated.
