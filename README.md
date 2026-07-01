@@ -42,6 +42,7 @@
   - [LIBERO](#libero)
   - [LIBERO-Plus](#libero-plus)
   - [SimplerEnv](#simplerenv)
+- [🧠 Memory Architecture](#memory-architecture)
 - [🤝 Acknowledgement](#acknowledgement)
 - [📝 Citation](#citation)
   
@@ -193,6 +194,18 @@ bash ./examples/SimplerEnv/eval_files/auto_eval_scripts/calc_success_rate.sh <ta
 ```
 
 **Notes:** Ensure each process has access to a GPU and verify that all checkpoint paths in the configuration files are correct before running the evaluation. For LIBERO, we evaluate the 4 task suites in parallel on 4 GPUs. For LIBERO-Plus and SimplerEnv, we run evaluations in parallel on 8 GPUs. If you have fewer GPUs available, modify the parallelization logic in the launch scripts accordingly.
+
+
+<a id="memory-architecture"></a>
+## 🧠 Memory Architecture
+
+The proposed stateful VLA-JEPA extension is documented separately:
+
+- [Memory architecture](docs/VLA-JEPA-Memory-Design-Proposal.md)
+- [Implementation plan](docs/VLA-JEPA-Memory-Implementation-Plan.md)
+- [Evaluation plan](docs/VLA-JEPA-Memory-Evaluation-Plan.md)
+
+These documents describe a proposal and roadmap; the memory module is not implemented yet.
 
 
 <a id="acknowledgement"></a>

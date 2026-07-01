@@ -1,414 +1,378 @@
-# VLA-JEPA · Elegant Short- and Long-Term Memory
-### A Design Proposal
+# VLA-JEPA Memory Architecture
 
-> **Status:** proposal only — no code, configs, or training runs are changed by this document.
-> **Goal:** give VLA-JEPA short- and long-term memory with the *smallest, cleanest* mechanism that works — **in-model, fully differentiable, fixed-size, reset-aware** — and explicitly **not** an agentic stack of external vector databases, write/eviction controllers, and paging logic.
-> **Grounding:** every integration point cites a real `file:line` in this repo (re-verified). Every paper in §10 was web-verified (real arXiv id / venue).
+> Status: architecture proposal; no memory implementation is present yet.
+>
+> Decision: build memory as an explicit, state-passing bridge after Qwen and before the action and world-model consumers. Ship short-term recurrent slots first. Add bounded associative long-term memory only after the short-term path shows a causal gain.
+>
+> Companion documents: [implementation plan](VLA-JEPA-Memory-Implementation-Plan.md) and [evaluation plan](VLA-JEPA-Memory-Evaluation-Plan.md).
 
----
+## 1. Executive decision
 
-## What changed from the previous draft
+The first memory implementation should be a small recurrent module over causally safe Qwen tokens:
 
-The earlier draft proposed a **three-tier agentic memory**: an external FAISS kNN bank, a hand-coded write controller, an eviction policy, a MemGPT-style paging controller, and periodic consolidation passes, plus a 14-column multi-timescale Parquet schema. That is a *second stateful system* bolted onto the model — heavy, brittle, non-differentiable at the retrieval step, and a poor fit for a real-time robot control loop.
+1. Qwen encodes the current camera observations and task text.
+2. The previous working slots form the read bank; a pooled current Qwen action-marker representation queries the optional associative tier.
+3. A normally initialized bottleneck adapter behind a zero-initialized scalar gate injects the read into the embodied tokens used by the DiT action head. This action-path connection is mandatory.
+4. The same read can later condition the existing JEPA action tokens without changing the predictor's token layout.
+5. Only after predictions are formed does the module write the current Qwen tokens into the next memory state.
+6. Runtime state is passed explicitly. It is never stored as a batch-shaped model buffer.
 
-This rewrite replaces it with **two tiers of in-model memory, each governed by a single closed-form update rule**:
+The target design has two bounded tiers:
 
-| | **Agentic (rejected)** | **Elegant (this proposal)** |
+| Tier | State | Update cadence | Purpose |
+|---|---|---:|---|
+| Working memory | 8 recurrent slots, `[B, 8, 512]` | every policy decision | recent observations, task phase, local temporal evidence |
+| Episodic memory | gated-delta state, `[B, 128, 128]` in FP32 | every policy decision, with learned retention | longer-delay key/value associations |
+
+The episodic tier is a later stage, not an MVP prerequisite. A working-memory-only model is the first credible experiment.
+
+## 2. Why the previous proposal is replaced
+
+The previous document put recurrent tokens primarily inside the JEPA predictor and treated action-head conditioning as optional. Code inspection shows that this cannot improve deployed actions in the current architecture:
+
+- `VLA_JEPA.forward()` trains both the JEPA predictor and the action head.
+- `VLA_JEPA.predict_action()` runs Qwen and the DiT action head only. It never calls the V-JEPA encoder or JEPA predictor.
+- `predicted_states` are not consumed by the action head in training either.
+
+Therefore, predictor-only memory can change `wm_loss` while leaving LIBERO actions unchanged. Memory must condition the DiT path in both training and inference.
+
+The previous proposal also contained several correctness problems that this design explicitly fixes:
+
+- Qwen is not inherently frozen. The current all-data configuration freezes only `vj_encoder` and assigns Qwen a learning rate; the V-JEPA encoder forward is also unconditionally wrapped in `torch.no_grad()`.
+- The current robot dataset samples unrelated random steps. Carrying state across batches would mix episodes and datasets.
+- `input_states` are not a safe memory-write source for policy memory. They are produced from an eight-frame video window and can contain information after the action decision time.
+- Arbitrary global prefix tokens do not fit the current predictor. `ACRoPEAttention` reshapes every token as a per-timestep action-or-spatial token.
+- A mutable model buffer would leak across the VLA and SSV2 passes, DDP ranks, episodes, and WebSocket clients.
+- The current evaluation client clears only client-local history. The server has no working reset route.
+- A recurrent graph cannot be carried through an optimizer step. Differentiable memory training requires multiple ordered decisions inside one forward/backward unroll.
+
+## 3. Current architecture, as implemented
+
+The relevant default dimensions in `scripts/config/vlajepa_cotrain_all.yaml` are:
+
+| Signal | Shape under the current all-data config | Consumer |
 |---|---|---|
-| Where memory lives | external FAISS / vector DB | two small tensors on the model |
-| Size | grows with episodes; needs eviction | **fixed** (chosen once) |
-| Read | approximate kNN (cost grows with bank) | one attention / one matvec, **O(1)** |
-| Write | controller + threshold heuristics | **one closed-form rule** per tier |
-| Forgetting | eviction policy + consolidation job | a **learned decay gate** |
-| Reset | purge/session management | **one tensor assignment** |
-| Differentiable? | no (argmax/top-k ≈ zero gradient) | **yes, end-to-end** |
-| Train/deploy | two systems, skew | **same code** at train and deploy |
+| Qwen hidden states | `[B, L, 2048]` | token extraction |
+| Qwen action-marker states | `[B, 24, 2048]` | JEPA action conditioning |
+| Qwen embodied-action states | `[B, 32, 2048]` | DiT cross-attention |
+| Two-view V-JEPA features | `[B, 1024, 2048]` | context/target split |
+| JEPA predictor input states | `[B, 768, 2048]` | AC predictor |
+| JEPA target states | `[B, 768, 2048]` | L1 target |
+| Action target | `[B, 7, 7]` | flow-matching loss |
 
-Everything below follows from one principle: **memory should be a part of the network, trained by the losses already in the model — not a database the network queries.**
+Eight raw frames become four V-JEPA latent time bins because the encoder tubelet size is two. The predictor receives three latent context bins. Each bin contains eight Qwen action tokens and 256 spatial tokens, so its internal sequence has `3 × (8 + 256) = 792` tokens.
 
----
-
-## Table of contents
-1. [Executive summary](#1-executive-summary)
-2. [Background: the current pipeline](#2-background-the-current-pipeline)
-3. [The memory gap](#3-the-memory-gap)
-4. [Design principles](#4-design-principles)
-5. [The architecture — two tiers, two timescales](#5-the-architecture--two-tiers-two-timescales)
-6. [Training](#6-training)
-7. [Instrumentation (lightweight)](#7-instrumentation-lightweight)
-8. [Evaluation](#8-evaluation)
-9. [Roadmap, risks & honest tradeoffs](#9-roadmap-risks--honest-tradeoffs)
-10. [References (verified)](#10-references-verified)
-
----
-
-## 1. Executive summary
-
-VLA-JEPA follows the **V-JEPA 2 → robot-cotrain** recipe [V-JEPA 2, arXiv:2506.09985; VLA-JEPA, arXiv:2602.10098]: a **frozen** V-JEPA2 encoder produces per-frame latents, an **action-conditioned latent predictor** forecasts the next-frame latent under **frame-causal attention** over a short clip (`T = num_frames // tubelet_size`, ≈8 frames), and a **flow-matching DiT** head emits continuous actions. The model is therefore **Markovian beyond the loaded clip**: no state persists across clips or episodes.
-
-We add memory with **two in-model tiers**:
-
-- **Short-term (working) memory** — a small set of **recurrent `[mem]` tokens** prepended to the predictor and carried across clips, with the backbone otherwise unchanged [RMT, arXiv:2207.06881; Block-Recurrent Transformers, arXiv:2203.07852]. This is a rolling, attention-readable summary of recent history.
-- **Long-term memory** — a single **fixed-size associative fast-weight matrix** `W`, written by the **(gated) delta rule** and read by **linear attention** [Fast Weights, Schmidhuber 1992; Linear Transformers are Fast-Weight Programmers, arXiv:2102.11174; Gated DeltaNet, arXiv:2412.06464]. One outer-product write and one matvec read per step — slowly-decaying episodic/task context at **O(1) per step**.
-
-Both tiers are **fixed-size, fully differentiable, and reset at episode boundaries by a single assignment**. They are supervised **for free** by the model's existing world-model loss and action loss — no new loss machinery, no external store, no controller. The **encoder and Qwen LLM stay frozen** throughout.
-
-We also give a **design dial** (§5.6): the long-term tier can be made even more minimal (a second, slow-clocked `[mem]` state — pure two-timescale recurrence) or more powerful (a deep test-time-trained memory, Titans). The recommended default is the fast-weight matrix: it is the cheapest option that still gives a genuine associative long-term store.
-
----
-
-## 2. Background: the current pipeline
-
-**Re-verified integration anchors** (read directly from the repo):
-
-| Component | File | Lines | Role for memory |
-|---|---|---|---|
-| AC predictor `forward` | `starVLA/model/modules/world_model/vj2_predictor.py` | class 17–50; `forward` 138–196; action/frame interleave 150–160; mask slice 162; block loop 165–187; output split 189–191 | **Where `[mem]` tokens are prepended and read back** |
-| Frame-causal mask | `vj2_modules.py` | `build_action_block_causal_attention_mask` 12–23 | **Mask to extend for memory rows/cols** |
-| RoPE attention | `vj2_modules.py` | `ACRoPEAttention` 114–263; SDPA 248–252; action-token handling | **Memory tokens must be RoPE-exempt here (the one subtle bug)** |
-| Cross-attention primitive | `vj2_modules.py` | `CrossAttention` 571–599; `CrossAttentionBlock` 602–615 | Reusable compressor (slow tier, optional) |
-| Framework orchestration | `starVLA/model/framework/VLA_JEPA.py` | encoder frozen `no_grad` 254–256; latent split 261–262; predictor call 265–268; `wm_loss` 270–274; capture 112–130, 277; action head 306; loss returns 280, 308 | **Where memory is carried, written, reset; anti-leakage lives here** |
-| DiT action head | `model/modules/action_model/GR00T_ActionHeader.py` | head call 306; conditioning `sa_embs`/`vl_embs` 270–317 | **Optional memory-conditioned decisions** |
-| Qwen action tokens | `VLA_JEPA.py` | `action_tokens` 240; `embodied_action_tokens` 241 | Token streams memory can fuse into |
-| JEPA analysis | `starVLA/training/trainer_utils/jepa_analysis.py` | `compute_jepa_scalar_stats` 78–172; `make_jepa_figures` 176–278 | **Extend with memory scalars** |
-| Trainers | `train_vlajepa_cotrain.py` 322–361, `_log_jepa` 381–399; `train_vlajepa_video.py` 272–295 | `capture_jepa` toggle; W&B logging; **2-pass step** | Where state is carried/detached/reset |
-| Dataloader | `dataloader/gr00t_lerobot/datasets.py` 105–112, 236–239, 637–643 | `ModalityConfig.delta_indices`, windowing | **Where `episode_index`/`done` must be surfaced** |
-
-**Current data flow:**
+The control path and world-model path are parallel, not serial:
 
 ```text
-CURRENT VLA-JEPA  (Markovian beyond the ~8-frame clip)
-================================================================================
- frames [B,V,T,H,W,3]                 instruction text
-        │                                    │
-        ▼                                    ▼
- ┌──────────────────────┐           ┌──────────────────────┐
- │ V-JEPA2 ENCODER      │           │ Qwen3-VL             │
- │ FROZEN (no_grad)     │           │ FROZEN               │
- │ VLA_JEPA.py:254-256  │           │ VLA_JEPA.py:240-241  │
- └──────────┬───────────┘           └──────────┬───────────┘
-   per-frame latents                    action_tokens / embodied_action_tokens
-            │                                   │
-   input_states (current obs) :261             │
-   gt_states  (future target) :262 ──(stop-grad supervision)
-            ▼                                   │
- ┌──────────────────────────────┐              │
- │ AC PREDICTOR                 │              │  objective 1: next-frame latent
- │ frame-causal, window T       │              │  wm_loss = L1(pred[0:T-1], sg gt[1:T])
- │ vj2_predictor.py:138-196     │              │  VLA_JEPA.py:270-274  (×0.1 joint)
- └──────────┬───────────────────┘              │
-   predicted latents                           ▼
-            │                       ┌──────────────────────────────┐
-            └─────────────────────► │ DiT FLOW-MATCH HEAD          │ objective 2:
-                                    │ VLA_JEPA.py:306              │ action chunk
-                                    └──────────────┬───────────────┘
-                                                   ▼
-                                            OUTPUT: action chunk
-================================================================================
+current images + task
+          |
+          v
+       Qwen3-VL
+          |
+          +---------------- embodied tokens ----------------> DiT action head -> actions
+          |
+          +---------------- action-marker tokens ---+
+                                                    |
+video window -> frozen V-JEPA -> context latents -> AC predictor -> wm_loss
+                                      target latents ----------------^
 ```
 
-Constraints the design must respect: the encoder is **frozen** under `no_grad` (`:254–256`); supervision is **leakage-free** — the predictor sees only current-frame latents while future latents are stop-gradient targets (`gt_states`, `:262`); the action head reads `embodied_action_tokens` (`:306`); `wm_loss` is downweighted ×0.1 in the joint path (`:308`).
+Memory must be inserted at the fork after Qwen so it can affect the deployed control path and, optionally, the world-model path.
 
----
+## 4. Architectural invariants
 
-## 3. The memory gap
+The implementation must preserve these invariants:
+
+1. **Train/deploy parity.** A memory feature that cannot affect `predict_action()` is not policy memory.
+2. **Causal writes.** Policy memory may consume only current observations, current task text, current proprioception, and already-executed actions. It must never consume future video frames, target actions, rewards, `gt_states`, or predicted future latents.
+3. **Read before write.** Decision `t` reads state `M_(t-1)`. Current evidence is written into `M_t` only after the decision tensors have been produced.
+4. **Explicit state.** Runtime state is an input/output activation, not a registered buffer or singleton cache on the model.
+5. **Per-sample reset.** A reset mask can clear one batch row without affecting another.
+6. **No cross-stream carry.** Robot and SSV2 batches never share memory state.
+7. **Bounded cost.** State size and per-decision work do not grow with episode length.
+8. **Disabled means baseline.** With `framework.memory.enabled: false`, module construction, checkpoint keys, and outputs remain unchanged.
+9. **Side-effect-free forward.** Activation checkpointing or recomputation must not perform a second hidden write.
+
+## 5. Recommended placement: post-Qwen memory bridge
 
 ```text
-THE GAP — three things are missing, nothing more
-================================================================================
- [A] HARD HORIZON CEILING  — context = frame-causal window T (~8 frames)
-     local_window_time = T                              (vj2_modules.py:17-21)
- [B] NO PERSISTENT STATE    — predictor latents discarded each forward;
-     nothing carried across clips or across the 2 cotrain passes
- [C] NO LONG-TERM RECALL    — no store keyed by latents; once a clip leaves
-     the window, its information is gone
-================================================================================
- close [A]+[B] with short-term recurrence; close [C] with an associative store.
-================================================================================
+                                    previous MemoryState
+                                             |
+                                             v
+current images + task -> Qwen -> action-marker tokens Z_t [B,24,2048]
+                                  |          |
+                                  |          +---- pool/query optional associative state
+                                  |                         |
+previous working slots --------------------- read bank -----+
+                                  |                         v
+                                  |             MemoryRead R_t [B,8 or 9,512]
+                                  |                         |
+                                  |       +-----------------+------------------+
+                                  |       |                                    |
+                                  v       v                                    v
+                         embodied tokens E_t                         JEPA action tokens A_t
+                                  |                                    |
+                       bottleneck residual fusion           bottleneck residual fusion
+                                  |                                    |
+                                  v                                    v
+                           DiT action head                         AC predictor
+                                  |                                    |
+                                  +--------------- losses -------------+
+                                                       |
+                                                       v
+                                  post-decision write(Z_t, old state) -> next state
 ```
 
-That is the whole problem. We do **not** need cross-episode session management, a knowledge base, or a planner-with-memory. We need (i) state that survives between clips and (ii) a bounded associative memory that survives across a long episode. Two tiers, two mechanisms.
+The Qwen action-marker states are the canonical memory write source because the configured prompts contain them in robot, SSV2, training, and inference. They depend on the current images and task but not on future labels. `predict_action()` currently extracts only embodied tokens; extracting action-marker tokens there is a required code change.
 
----
+### 5.1 Why residual cross-attention is the default fusion
 
-## 4. Design principles
+The action head already accepts variable-length cross-attention context, so concatenating memory tokens would work. A residual adapter is safer for warm-starting, however:
 
-Five rules; everything in §5 is a consequence of them.
-
-1. **Fixed size.** Memory is a tensor of chosen shape, independent of episode length or number of episodes seen. No growth, therefore no eviction policy.
-2. **One closed-form update rule per tier.** "What to write" and "what to forget" are learned gates, not hand-tuned thresholds or controllers.
-3. **Fully differentiable.** Reads are forward passes (attention / matvec), never argmax/top-k. Gradients flow into the read/write projections from the *existing* losses — the model **learns what to remember**. (Contrast Memorizing Transformers [arXiv:2203.08913], which must *stop-grad* around its kNN bank.)
-4. **Reset-aware by construction.** Episode boundaries clear memory with a single per-sample assignment — no cross-episode leakage unless explicitly wanted.
-5. **Real-time and surgical.** O(1)-ish per step, identical code at train and deploy, and it **reuses existing machinery** (the predictor's add-token concat, the causal-mask builder, the action head's cross-attention). Target diff ≈ 200–300 lines; the frozen encoder and Qwen are untouched.
-
-These are exactly the properties differentiable-memory work was built for [Neural Turing Machines, arXiv:1410.5401; DNC, Nature 2016] — minus the addressing complexity, because a fixed slate plus a delta rule already gives content-based write and forget.
-
----
-
-## 5. The architecture — two tiers, two timescales
+Define `R_t` as the eight previous working slots `[B,8,512]`. When the associative tier is enabled, project its `[B,128]` read to one 512-wide token and append it, producing `[B,9,512]`. Policy and world adapters attend in the 512-dimensional bottleneck:
 
 ```text
-ELEGANT MEMORY — two in-model tiers   (encoder + Qwen FROZEN)
-================================================================================
-                              ┌─────────────────────────────────────┐
-   carried across clips ─────►│ AC PREDICTOR  (vj2_predictor.py)     │
-   (detached, reset @episode) │                                     │
-                              │  [ mem(M) | act,frame tokens ... ]  │  ← READ
-   ┌──────────────────────┐   │   ▲ prepend          ▲ linear-attn  │
-   │ SHORT-TERM           │   │   │ recurrent tokens  │ read m=Wᵀq   │
-   │ M recurrent [mem]    │◄──┼───┘                   │             │
-   │ tokens  (RMT/BRT)    │   │                       │             │
-   │ h ∈ [B, M, D]        │   └───────────┬───────────┼─────────────┘
-   └──────────────────────┘    predicted latents      │
-                                          │            │ write (delta rule,
-                                          ▼            │  current-obs only)
-                                    wm_loss            │
-   ┌──────────────────────┐                           ▼
-   │ LONG-TERM            │   W ← α·W·(I − β k kᵀ) + β v kᵀ
-   │ fast-weight matrix   │◄──────────────────────────────────────────
-   │ W ∈ [B, d_k, d_v]    │   read m = Wᵀq  (→ predictor + optional action head)
-   └──────────────────────┘
-================================================================================
- short-term  = precise, small, rewritten every clip   (working memory)
- long-term   = associative, slowly-decaying, O(1)/step (episodic/task memory)
-================================================================================
+Qp = Wq_policy LN(E_t)                         # [B,32,512]
+Yp = Attention(Q=Qp, K=LN(R_t), V=LN(R_t))    # [B,32,512]
+E'_t = E_t + tanh(gamma_policy) * Wo_policy(Yp)  # [B,32,2048]
+
+Qw = Wq_world LN(A_t)                          # [B,24,512]
+Yw = Attention(Q=Qw, K=LN(R_t), V=LN(R_t))    # [B,24,512]
+A'_t = A_t + tanh(gamma_world) * Wo_world(Yw)  # [B,24,2048]
 ```
 
-### 5.1 Short-term (working) memory — recurrent `[mem]` tokens
+The adapter weights use normal initialization and only `gamma_policy`/`gamma_world` start at zero. This is an exact functional no-op at initialization without permanently killing the branch. On the first backward at exact zero, only the scalar gate receives gradient; memory and adapter gradients begin after the gate moves. A Phase-1 run may warm the gate briefly or initialize it to a documented small nonzero value after the parity test. The sequence shapes and existing DiT/predictor APIs do not change.
 
-A fixed set of `M` learnable memory tokens (start `M = 8`, matching the per-step action-token count so it reuses the existing add-token path). The **predictor itself is the recurrent cell** — no new attention stack.
+Appending projected slots to the DiT context is a valid ablation. It should not be the only implementation because zero-valued appended tokens can still change the attention softmax denominator and therefore are not an exact baseline initialization.
 
-- **State:** a learned init `mem_init ∈ [M, D]` (`nn.Parameter`) and a detached per-sample carried buffer `h ∈ [B, M, D]`.
-- **Read-in:** prepend `h` as `M` leading tokens right after the action/frame interleave (`vj2_predictor.py:160`). Every frame token attends to them.
-- **Write-out:** after the predictor blocks, take the output states at the `M` mem positions, `h̃ = x[:, :M, :]` (before the cond-token strip at `:189–191`). The network learns through attention+MLP what to overwrite — RMT's "input mem tokens / output mem tokens are the same positions."
-- **Gated update (one rule):** `h ← (1−g)⊙h + g⊙tanh(h̃)`, `g = σ(W_g[h; h̃])`. `g→0` keeps, `g→1` overwrites (Block-Recurrent gate; initialize the gate bias to "remember"). The plain RMT copy `h ← h̃` is the gate-free special case.
-- **Carry / reset:** `h` is stored on the module and **detached** except over the last `k_bptt` clips (truncated BPTT, `k=2–4`). At an episode boundary, `h ← mem_init`.
+### 5.2 Why memory is not inserted into Qwen first
 
-This makes the policy non-Markovian *across clips within an episode* at near-zero cost (`M` extra rows), fully differentiable, fixed-size, no store.
+Qwen-prefix or Qwen-KV memory would offer deep fusion, but it also changes multimodal positions, chat-template construction, tokenization assumptions, and the 2B-parameter backbone's compute path. It is a useful later experiment only after the bridge demonstrates value.
 
-### 5.2 Long-term memory — associative fast-weight matrix
+### 5.3 Why memory is not prepended to the predictor first
 
-A single fixed-size matrix `W ∈ [B, d_k, d_v]` (e.g. `d_k = d_v = 128` ⇒ 16K floats/sample — trivial), the **fast weights** that *are* the long-term memory [Schmidhuber 1992; arXiv:2102.11174]. One write and one read per clip (per clip, not per spatial token, for the control-loop budget).
+The predictor and `ACRoPEAttention` assume all non-spatial tokens repeat inside every time bin. A global prefix breaks the `view(B, T, action_tokens + H*W, C)` contract and needs a new mask and a separate NoPE/temporal-only QKV path. More importantly, that state is absent from deployed inference. The bridge obtains world-model conditioning by preserving the predictor's existing 24-token action interface.
 
-From a current-observation summary `s` (mean-pool of the newest observed frame's tokens), small linear heads produce `k = ℓ2(W_K s)`, `v = W_V s`, query `q = ℓ2(W_Q s)`, write strength `β = σ(w_β·s) ∈ (0,1)`, decay gate `α = σ(w_α·s) ∈ (0,1)`:
+## 6. Runtime state and module contract
 
-- **Read (before write):** `m = Wᵀ q` — one matvec, linear attention [arXiv:2006.16236]. Project `m` to `D` and inject (§5.3).
-- **Write (Gated DeltaNet [arXiv:2412.06464]):** `W ← α·W·(I − β k kᵀ) + β v kᵀ`. The Householder term `(I − β k kᵀ)` **erases the old value at key `k` before writing the new one** (targeted overwrite, no controller); `α` is uniform decay.
-- **Forgetting = the gates.** `α→1` long retention, `α→0` rapid wipe; the delta term edits a single association. No eviction, no capacity check.
-- **Carry / reset:** `W` is a detached runtime buffer (truncated BPTT over `k_bptt` clips); at an episode boundary, `W ← 0`.
+Runtime state should be represented by a typed, non-persistent object:
 
-Read = one matvec, write = one outer-product + one rank-1 projection — **O(d_k·d_v), independent of how long the episode has run.** This is the cheapest possible genuine associative memory, and it is the right fit for a robot loop where you cannot grow a KV cache or run kNN every step.
+```python
+@dataclass
+class MemoryState:
+    working: Tensor          # [B, 8, 512], always FP32
+    episodic: Tensor | None  # [B, 128, 128], FP32; disabled in Stage 1
+    steps: Tensor            # [B], int64; completed policy decisions
+    valid: Tensor            # [B], bool; active, non-padding episode rows
 
-### 5.3 How memory reaches decisions
+@dataclass
+class MemoryRead:
+    tokens: Tensor           # [B, 8 or 9, 512]
+    diagnostics: dict[str, Tensor]
+```
 
-- **Predictor (primary):** the `M` short-term tokens are read natively (they are in the sequence); the long-term read is projected up (`Linear(d_v→D)`) and prepended as **one extra leading "memory-read" token**. Total leading block = `M + 1` tokens, sliced off downstream. Both then condition every next-latent prediction.
-- **Action head (optional, recommended for manipulation):** concatenate the projected long-term read as one extra conditioning token in `sa_embs`/`vl_embs` (`GR00T_ActionHeader.py:302–308`), behind a config flag. This lets the policy act on episode-level context ("I already grasped object A") even when the current 8-frame clip is ambiguous — the world-model-only video pass is unaffected.
+The proposed module surface is:
 
-### 5.4 The anti-leakage invariant (non-negotiable)
+```python
+init_state(batch_size, device) -> MemoryState
+reset_state(state, reset_mask) -> MemoryState
+read(context_tokens, state) -> MemoryRead
+write(context_tokens, state, update_mask) -> MemoryState
+diagnostics(state, read) -> dict[str, Tensor]
+```
 
-The predictor is trained to forecast `gt_states` (future targets, `:262`) from `input_states` (current obs, `:261`). **Memory is written *only* from `input_states`** — never from `gt_states` and never from `predicted_states` (which contain the answer). Combined with **read-before-write ordering** within a clip, this guarantees the current prediction is supervised against `gt` without the model ever reading the future out of memory. (`input_states` already carries no encoder gradient — the encoder runs under `no_grad` at `:254` — so the write heads train via the read path on later clips.)
+`read()` and `write()` are pure tensor functions. Learned initial slots, projections, attention layers, and gates are module parameters; episode content is not.
 
-### 5.5 Reset and the one subtle bug
+`state=None` or a reset row expands the learned working initialization, zeros the episodic matrix, sets `steps=0`, and marks a real row valid. Padded rows remain invalid: they contribute no loss, read, write, or step increment. Reset happens before read; a terminal row is invalidated after its final decision. Batch size, row identity, device, or shape changes without an explicit reset are errors. Reset is out of place so rows not selected by the mask cannot alias modified storage.
 
-**Two correctness items dominate the implementation:**
+Only `forward_sequence()` may return graph-bearing state. Stepwise training state is detached before it can cross an optimizer update; inference state is always detached under inference mode.
 
-1. **RoPE / reshape collision (the load-bearing detail).** Prepended memory tokens have **no grid position**, and the predictor's per-frame `x.view(B, T, cond+H*W, D)` reshapes (`:154`, `:190`) assume `seq_len = T*(cond+H*W)`. So memory tokens must (a) stay a **leading block sliced off before those reshapes**, and (b) be **exempted from spatial RoPE** in `ACRoPEAttention` — route them through the existing action-token (temporal-only / NoPE) path (`vj2_modules.py:184–206`), the template the code already uses for non-grid tokens. Get this wrong and `rotate_queries_or_keys` silently corrupts the memory.
-2. **Per-sample reset.** At an episode boundary, `h ← mem_init`, `W ← 0` — applied with a per-sample `done` mask (`W ← W·(1−done)[:,None,None]`) so finishing one env in a batch does not reset the others. Inference already calls `model.reset(...)` per episode (`examples/LIBERO/eval_libero.py:144` → `model2libero_interface.py:69`); add one `reset_memory()` call alongside the existing `image_history.clear()`.
+The framework API becomes:
 
-The **mask extension** is small: grow `build_action_block_causal_attention_mask` to `[(M+1)+N, (M+1)+N]`; the `M+1` leading rows/cols are `True` against the current clip (frames read memory; memory summarizes the clip), the existing frame-causal sub-block is preserved, and per-clip reset (not the mask) carries cross-clip information.
+```python
+forward(examples, memory_state=None, reset_mask=None, return_memory_state=False)
+predict_action(..., memory_state=None, reset_mask=None, return_memory_state=False)
+```
 
-### 5.6 The design dial (pick your point on the elegance ↔ capacity curve)
+Backward compatibility is preserved when memory is disabled. Sequence training can use a dedicated `forward_sequence()` output object so the existing trainer never accidentally sums state or diagnostics as losses.
 
-The short-term tier is the same in all three. Only the **long-term** tier changes:
+## 7. Short-term working memory
 
-| Variant | Long-term mechanism | Cost / step | Recall quality | When to pick |
-|---|---|---|---|---|
-| **Minimal — Two-Timescale Recurrence** | a *second* `[mem]` state on a slow clock (ticks every `P` clips), consolidated from the fast state by one cross-attention + gate | cheapest; no associative store | lossy summary | maximum simplicity; "one mechanism, two clocks" [Clockwork RNN, arXiv:1402.3511; MTS3, arXiv:2310.18534; Compressive Transformer, arXiv:1911.05507] |
-| **Recommended — Fast-weight matrix** | associative `W` + (gated) delta rule, read by linear attention | O(d_k·d_v), one matvec | genuine key→value recall, bounded | **default**: associative memory at trivial cost [arXiv:2412.06464; arXiv:2406.06484] |
-| **Heavy — Titans neural memory** | a small deep MLP whose weights are updated online by a surprise (inner-gradient) step + momentum + adaptive decay | inner backward/step | strongest; learns-to-memorize | only if the matrix saturates [Titans, arXiv:2501.00663; TTT, arXiv:2407.04620; Miras, arXiv:2504.13173] |
-
-All three are in-model, fixed-size, differentiable, reset by assignment. The recommended fast-weight matrix is the sweet spot: a true associative store with no inner-loop optimizer and no extra forward/backward, so it stays inside the robot control budget. (The optional working-state alternative for the short-term tier — a resettable SSM/Mamba recurrent state [S5-for-RL, arXiv:2303.03982; Mamba, arXiv:2312.00752] — is noted for completeness but the `[mem]`-token form reuses more existing code.)
-
-**Honest scope note.** A fixed `W` (or fixed `[mem]` state) is genuine working / episodic-summary memory, **not** verbatim retrieval of an arbitrary observation many episodes back — that exact recall is the one thing the rejected kNN bank bought, at the price of being agentic and non-differentiable. If a task provably needs lossless long-horizon lookup, the Titans MLP (or a small NTM/DNC slot memory) is the heavier, still-differentiable fallback.
-
----
-
-## 6. Training
-
-**Frozen throughout:** V-JEPA2 encoder (`VLA_JEPA.py:254`, `no_grad`) and Qwen3-VL. **Trainable (new):** `mem_init`, the gate/projection heads (`W_g`, `W_K/W_V/W_Q`, `w_α/w_β`, the read projections) — all small. `h` and `W` are **runtime state, not parameters**; their *content* is produced online, their *generating heads* are trained by backprop. **No new loss is required**: the existing `teacher_forcing_wm_loss` (`:270`) and `action_loss` (`:306`) flow through the carried memory and supervise it for free — a frame the world model predicts poorly produces a large gradient through the read, the in-model analogue of "surprise."
-
-**Prerequisite (the main pipeline lift, stated honestly).** Today the dataloader returns *shuffled, independent single clips* with no `episode_index`/`done` in the example dict (`datasets.py:723–753`), so consecutive batches are not consecutive clips. Cross-clip memory therefore needs: (a) an optional **contiguous-segment sampler** over `all_steps` grouped by trajectory, and (b) `episode_index` + a `done`/`first` flag plumbed through collate. Keep the shuffled sampler as the default fallback — under it, memory cleanly degenerates to **in-clip register tokens** (a valid Stage 0). This is the bulk of the implementation effort; the model change is small.
+Start with eight 512-dimensional slots:
 
 ```text
-TRAINING CURRICULUM  (each stage adds one thing; encoder + Qwen frozen)
-================================================================================
- STAGE 0  sanity / no recurrence
-   mem tokens + mask + RoPE-exempt path + (optional) action-head hook,
-   reset-every-forward on the current shuffled loader.
-   ▸ proves the memory path does not regress the Markovian baseline. (safe first PR)
-        │
-        ▼  enable segment sampler + episode_index/done
- STAGE 1  short-term recurrence  (video pretrain, train_vlajepa_video.py)
-   carry h across clips, truncated BPTT (k=2-4), per-episode reset.
-   loss = existing wm_loss, now backprop through carried h.
-   ▸ working memory learned from latent surprise, action head untouched.
-        │
-        ▼
- STAGE 2  long-term + cotrain  (train_vlajepa_cotrain.py, 2 passes/step)
-   turn on W (delta rule) in BOTH passes; writes from input_states only.
-   VLA pass: action_loss + 0.1·wm_loss (unchanged) + optional action-head read.
-   video pass: wm_loss. Both carry/detach/reset; per-sample done mask.
-   ▸ associative episodic memory; memory-conditioned decisions.
-        │
-        ▼
- STAGE 3  robot finetune / eval
-   stateful single-clip rollout; cache h, W on the robot; reset on env reset.
-   O(1) state, O(1) per-step read — real-time. No encoder/Qwen retraining.
-================================================================================
+H_(t-1) in R^[B x 8 x 512]
+Z_t      in R^[B x 24 x 2048]
+X_t = W_in Z_t
+
+C_t = CrossAttention(Q=LN(H_(t-1) + slot_id), K=LN(X_t), V=LN(X_t))
+g_t = sigmoid(W_g [LN(H_(t-1)); LN(C_t)] + b_g)
+H_t = (1 - g_t) * H_(t-1) + g_t * tanh(W_c C_t)
 ```
 
-**Stability:** L2-normalize keys/queries (bounds `W`'s spectral radius), let `α` be the learned decay, gate-bias-init to "remember," and rely on the grad clipping already in the trainer (`train_vlajepa_cotrain.py:335`). No new optimizer.
+Layer normalization is applied when slots are queried or read, not to the stored convex update; therefore `g_t=0` is an exact keep operation. The gate bias should begin near a modest update probability, such as `sigmoid(b_g) ≈ 0.1`, rather than forcing permanent retention. Slot identity embeddings discourage all slots from collapsing to the same summary.
 
----
+The policy read uses `H_(t-1)`, never `H_t`. Gradients from decision `t` reach the write at `t-1` when multiple decisions are unrolled inside the same backward pass.
 
-## 7. Instrumentation (lightweight)
+## 8. Long-term episodic memory
 
-Memory health is cheap to watch and reuses the existing side-channel — **no new analysis subsystem.** Extend `last_jepa_tensors` (`VLA_JEPA.py:112–130`) with memory norms/gates and add a small `compute_memory_stats` alongside `compute_jepa_scalar_stats` (`jepa_analysis.py:78`); the trainers already route these to W&B (`_log_jepa`, `train_vlajepa_cotrain.py:381–399`).
+Add the long-term tier only after working memory passes the causal-use gate in the evaluation plan. The recommended bounded associative state is a gated delta memory:
 
-Log, per logging step:
+```text
+S_(t-1) in R^[B x Dv x Dk]      Dk = Dv = 128
+z_t = AttentionPool(W_z Z_t)     z_t in R^[B x 512]
+q_t, k_t in R^[B x Dk]          normalized
+v_t      in R^[B x Dv]
+beta_t   in [0,1]
+lambda_t in [0,1]
 
-- `jepa/mem_gate_g`, `jepa/mem_decay_alpha`, `jepa/mem_write_beta` — are the gates alive, or collapsed to "ignore memory"?
-- `jepa/mem_state_norm`, `jepa/W_fro_norm`, `jepa/mem_state_effective_rank` — drift / collapse detection.
-- `jepa/mem_read_contribution_cosine` — how much the memory read moves the predicted latent.
-- **Memory-ablation Δ** (the one causal probe): at a logging step, zero `h` and `W` and re-run; log the change in predicted-latent cosine and (in eval) task success. If Δ ≈ 0, memory is dead weight — surface it early.
+q_t = normalize(W_q z_t)
+k_t = normalize(W_k z_t)
+v_t = W_v z_t
+beta_t = sigmoid(w_beta^T z_t + b_beta)
+lambda_t = 2^(-delta_steps / half_life_t)
+half_life_t = half_life_min + softplus(w_h^T z_t + b_h)
 
-That is the whole tooling story. The elaborate probe/counterfactual/imagined-rollout suite from the previous draft is **dropped** — it was scope creep, not part of an elegant memory design.
+read:       r_t = S_(t-1) q_t
+decay:      S_bar = lambda_t S_(t-1)
+residual:   e_t = v_t - S_bar k_t
+write:      S_t = S_bar + beta_t e_t k_t^T
+```
 
----
+This orientation is deliberate: `S` has shape `[Dv, Dk]`, so both `S q` and `(v - S k) k^T` are dimensionally valid. The state and update should remain FP32; the projected read can be cast to the model dtype.
 
-## 8. Evaluation
+`delta_steps` is the number of policy decisions represented by this update and is one under the initial fixed-cadence setup. Project `r_t [B,128]` to one `[B,1,512]` token and append it to the working read bank. Parameterize retention using a positive half-life, not a raw sigmoid initialized near 0.5. An initial half-life of roughly 128-512 policy decisions is a later sweep range, but training cannot claim that horizon unless its unroll/burn-in or auxiliary retrieval objective supplies credit at comparable delays. Log the Frobenius norm, effective rank, write residual, and retention gate to detect saturation.
 
-**Ablation ladder** (control = current Markovian VLA-JEPA):
+All recurrence, pooling, q/k/v projection, and gated-delta operations run in an explicit FP32/autocast-disabled island. Cast Qwen source tokens to FP32 on entry and cast only the final residual back to the consumer dtype. This rule still applies when serving calls `model.to(torch.bfloat16)`: the memory module must be restored or kept in FP32 after the global cast.
 
-| # | Configuration |
-|---|---|
-| 1 | No memory (current) |
-| 2 | + short-term `[mem]` recurrence |
-| 3 | + long-term fast-weight `W` |
-| 4 | + action-head conditioned on the long-term read |
-| 5 | long-term variant: fast-weight `W` **vs** two-timescale `[mem]` **vs** Titans MLP (§5.6) |
+If associative memory does not beat a second set of slowly updated recurrent slots, keep the simpler two-timescale slot design. Titans-style test-time parameter updates are explicitly out of scope until fixed-state capacity is proven to be the bottleneck.
 
-**Is memory actually used? (the gold standard):** the **memory-ablation Δ** of §7 at inference — zero / shuffle `h` and `W`, measure Δ task success and Δ predicted-latent cosine. A real memory effect must show a measurable drop; a flat curve means the gates collapsed.
+## 9. Causality and leakage rules
 
-**Where memory should help:** long-horizon / partial-observability manipulation, where information leaves the 8-frame window before it is needed. Use the existing **LIBERO / LIBERO-Plus / SimplerEnv** harness in this repo, biased toward long-horizon and multi-stage tasks; cross-check against the only *in-model* VLA memory with direct manipulation evidence, VQ-Memory [arXiv:2603.09513]. On short, fully-observable clips memory may be underused — that is expected and is itself a reported result.
+### Safe write sources
 
-| Metric | Captures | Where |
+- Qwen action-marker states derived from the current images and instruction.
+- Current proprioception, when present.
+- Previously issued action chunks, but only after they have been issued.
+- Explicit time delta or decision index.
+
+### Forbidden write sources
+
+- `gt_states` or any future target representation.
+- The full V-JEPA `input_states` from the current eight-frame robot window.
+- Future action labels from the sampled action chunk.
+- Predicted future states committed as factual memory.
+- Reward, success labels, or terminal outcomes unavailable at deployment time.
+
+The correct order at decision `t` is:
+
+```text
+reset selected rows -> read M_(t-1) -> predict action/world tensors -> write current evidence -> M_t
+```
+
+A future-perturbation test must prove that changing observations or labels after time `t` does not change the Qwen memory source, memory write, DiT conditioning, or action at `t` under fixed flow noise. World predictions/loss may legitimately change when their explicit video context or target changes; they are not the invariant under this test.
+
+## 10. Training semantics
+
+The existing random-step mixture cannot train recurrence. Each training item must instead be a contiguous segment from one composite episode identity:
+
+```text
+(dataset_id, episode_id, base_step_0 ... base_step_K-1)
+```
+
+Recommended first settings:
+
+| Setting | Initial value | Reason |
+|---|---:|---|
+| supervised segment | 4 decisions | enough delayed gradient with manageable activation cost |
+| burn-in prefix | same-episode, variable up to a configured maximum | reconstructs state for mid-episode starts |
+| segment stride | derived from dataset cadence; 7 transitions for current LIBERO | matches deployment decisions without assuming all robot datasets share FPS |
+| TBPTT length | 4 | one complete initial segment |
+| working slots | 8 × 512 | small fixed state |
+| memory state dtype | FP32 | recurrent numerical stability |
+| direct-context dropout | 0.0 initially, then 0.1 sweep | discourages memory collapse only if needed |
+
+Do not reset an arbitrary mid-episode segment and treat it as deployed state. Either sample from the true episode start or prepend earlier same-episode decisions as burn-in. Burn-in updates state without supervised loss and may be detached before the supervised segment. Return distinct `segment_start`, actual `is_first`, `is_last`, `sequence_valid`, `loss_mask`, and `update_mask` fields.
+
+Sequence indices must come from raw trajectory base indices, not positions in a pause-filtered `all_steps` list. Disable pause deletion initially or prove the retained indices preserve time. Derive stride from action-chunk/replanning configuration and dataset-specific time units; assert the train/eval cadence for each embodiment rather than hard-coding seven globally.
+
+Qwen and V-JEPA encodings can be vectorized over `B × K`; the cheap memory recurrence remains sequential over `K`. Sum losses over valid supervised decisions and divide by their count so padding and segment length do not change gradient scale. Perform one optimizer update after the full segment. Never retain a recurrent graph across `optimizer.step()`.
+
+The VLA and SSV2 passes in co-training use independent state objects. Stage 1 is a robot-only trainer: freeze `qwen_vl_interface`, `vj_encoder`, and `vj_predictor`, train the action head plus memory/fusion modules, and skip the SSV2 optimizer pass and world-model loss entirely. A frozen predictor leaves no trainable SSV2 path, so merely resetting SSV2 memory is insufficient. A later ordered SSV2 segment loader can train world-model memory separately after the predictor is unfrozen.
+
+This robot-only warm start is a deliberate new experiment setting; it is not a description of the current allv2 run, where Qwen and the predictor were trainable.
+
+## 11. Inference and session lifecycle
+
+The server, not the model singleton, should own episode state. The MVP supports exactly one batch row (`B=1`) per WebSocket connection:
+
+- One `MemoryState` and one private `torch.Generator` per connection.
+- A real `type: reset` protocol message that clears the selected session.
+- Reset seeds both memory and the per-session generator from an explicit episode seed.
+- State and RNG deletion on reset, disconnect, timeout, and server shutdown.
+- No memory tensor serialized to the client on every action request.
+- No shared batch-shaped buffer on the policy object.
+- Reject live-memory requests whose batch size or row identity changes. Batched/multiplexed serving is a later design requiring `session_ids[B]` and one state per stable row.
+
+Required current-stack fixes:
+
+1. Add a reset route to `deployment/model_server/tools/websocket_policy_server.py`.
+2. Make `WebsocketClientPolicy.reset()` send an explicit typed reset request.
+3. Make `M1Inference.reset()` call the client's reset method.
+4. Pass the connection-local state and generator into `predict_action()` and the action head without adding them to the public response dictionary.
+5. Commit `state_after` and RNG advancement only after successful inference; a failure leaves `state_before` intact or explicitly invalidates the session.
+6. Add a two-client memory-and-RNG isolation test.
+
+LIBERO currently invokes the policy only once per seven-action chunk. Memory therefore advances once per chunk, not once per simulator step. Training stride must match this unless evaluation is changed to replan more frequently.
+
+## 12. Checkpoint and distributed-training behavior
+
+Learned memory parameters belong in the normal model `state_dict`; runtime episode state does not.
+
+- With memory disabled, do not instantiate memory modules. Existing 100K checkpoints continue to strict-load exactly.
+- Upgrading the 100K checkpoint to an enabled memory config requires an allowlisted migration. Put all recurrent and fusion parameters under `memory_module.*`, or explicitly allowlist every new prefix; any other mismatch remains fatal. Both `TrainerUtils.load_pretrained_backbones` and `baseframework.from_pretrained` currently strict-load and need a defined migration/config-override path.
+- Accelerate full-state checkpoints automatically include memory parameters and optimizer state once the module exists.
+- Exported inference checkpoints include learned memory parameters but start with no episode state.
+- DDP ranks own only the activation state for their local sequence batch.
+- Requeue/resume begins with new sampled segments; no mid-episode activation state is restored.
+
+## 13. Considered alternatives
+
+| Option | Decision | Reason |
 |---|---|---|
-| Task success / success-by-stage | end-to-end policy quality | LIBERO / SimplerEnv |
-| Success vs episode length | long-horizon memory benefit | long-horizon suites |
-| Predicted–GT latent cosine | world-model fidelity | `jepa_analysis.py` (exists) |
-| `eval/action_mae`, `eval/action_mse` | action quality | already wired (cotrain) |
-| **Memory-ablation Δ** | **is memory causally used** | new (§7) |
-| Gate / norm statistics | memory alive vs collapsed | new (§7) |
-| Per-step latency; state size | real-time cost (constant by design) | deploy |
+| Longer image history only | keep as required baseline | simple, but fixed horizon and growing visual compute |
+| Predictor prefix tokens | postpone | no direct deployment effect; mask/RoPE/reshape surgery |
+| Qwen prefix/KV memory | postpone | invasive multimodal position and checkpoint changes |
+| DiT-internal mutable state | reject | could update once per denoising iteration and lacks world supervision |
+| Global model buffer | reject | episode/client/DDP/cotrain leakage |
+| External vector database | reject for first version | unbounded systems complexity and weak end-to-end training |
+| Working recurrent slots | implement first | smallest credible train/deploy-aligned memory |
+| Gated-delta associative state | implement only after Stage 1 | bounded long-delay recall with modest cost |
+| Titans/test-time training | research fallback | inner optimization is unjustified before capacity evidence |
 
----
+## 14. Success criteria for the architecture
 
-## 9. Roadmap, risks & honest tradeoffs
+The design is accepted only if all of the following hold:
 
-```text
-ROADMAP (relative weeks) — small, sequential, each independently shippable
-================================================================================
- wk 0-1  PHASE 0  mem tokens + mask + RoPE-exempt path + memory-ablation scalar,
-                  reset-every-forward.  ▸ no regression vs baseline (Stage 0).
- wk 1-3  PHASE 1  segment sampler + episode_index/done; short-term recurrence,
-                  truncated BPTT, per-episode reset.  ▸ ablation rows 1-2.
- wk 3-5  PHASE 2  long-term fast-weight W (gated delta rule); read into predictor.
-                  ▸ ablation row 3 + memory-ablation causal test.
- wk 5-7  PHASE 3  action-head conditioning; long-horizon eval; variant sweep.
-                  ▸ ablation rows 4-5; LIBERO long-horizon + SimplerEnv.
-================================================================================
-```
+- Memory-disabled outputs match the existing model.
+- Reset makes episode-B outputs independent of episode-A history.
+- Two simultaneous clients cannot observe each other's state.
+- Perturbing future frames or targets cannot affect an earlier decision.
+- Live memory beats zeroed or shuffled memory on a memory-dependent benchmark.
+- Standard LIBERO performance remains non-inferior.
+- Raw runtime state remains below 1 MB per session, excluding shared learned parameters and temporary attention activations, and p95 policy latency grows by no more than 10%.
 
-| Risk | Mitigation |
-|---|---|
-| **RoPE / reshape corruption** (subtlest bug) | route memory tokens through the action-token NoPE path; keep them a leading block sliced before the per-frame `view()` (§5.5). De-risk in Phase 0. |
-| **Future-latent leakage** | write from `input_states` only, read-before-write; audit with the memory-ablation test (§5.4). |
-| **Dataloader lift** (no `episode_index`, shuffled clips) | add a contiguous-segment sampler + `done` flag; fall back to in-clip registers until then (§6). |
-| **Gate collapse** (memory ignored) | gate-bias-init to remember; monitor gate/contribution scalars; validate on tasks where memory demonstrably helps. |
-| **BPTT instability / drift** | short `k_bptt` (2–4), L2-normalized keys/queries, learned `α`, existing grad clipping; per-episode reset. |
-| **Fixed capacity is lossy** | accepted trade for elegance/real-time; escalate to Titans MLP only if `W` provably saturates (§5.6). |
-| **Robotics fit is a proposal, not a reproduction** | RMT / DeltaNet / Titans are validated on language/long-context, not inside a frozen-V-JEPA2 VLA; every claim is gated behind the §8 ablation ladder against the Markovian baseline. |
+The detailed statistical gates and ablation matrix are in the evaluation plan.
 
-**The single most important de-risk (Phase 0/1):** confirm that (a) adding `[mem]` tokens with the correct RoPE-exempt path does **not** regress the baseline, and (b) cheap short-term recurrence already lifts long-horizon latent cosine and success rate. If yes, the long-term fast-weight tier is justified; if not, fix the short-term tier before adding the associative store.
+## 15. Primary references
 
----
+- [VLA-JEPA: Enhancing Vision-Language-Action Model with Latent World Model](https://arxiv.org/abs/2602.10098)
+- [Recurrent Memory Transformer](https://arxiv.org/abs/2207.06881)
+- [MemoryVLA: Perceptual-Cognitive Memory in Vision-Language-Action Models](https://arxiv.org/abs/2508.19236)
+- [ReMem-VLA: Dual-Level Recurrent Queries](https://arxiv.org/abs/2603.12942)
+- [Gated Delta Networks](https://arxiv.org/abs/2412.06464)
+- [VQ-Memory for Long-Horizon Manipulation](https://arxiv.org/abs/2603.09513)
+- [Titans: Learning to Memorize at Test Time](https://arxiv.org/abs/2501.00663)
 
-## 10. References (verified)
-
-> All entries below were web-verified (real arXiv id / venue). Grouped by role in this design.
-
-### 10.A — Short-term: recurrent memory in transformers
-1. Bulatov, Kuratov, Burtsev. **Recurrent Memory Transformer (RMT).** NeurIPS 2022. arXiv:2207.06881. — Learnable memory tokens carried across segments; backbone unchanged. *(the short-term tier)*
-2. Bulatov, Kuratov, Burtsev. **Scaling Transformer to 1M tokens and beyond with RMT.** arXiv:2304.11062.
-3. Hutchins, Schlag, Wu, Dyer, Neyshabur. **Block-Recurrent Transformers.** NeurIPS 2022. arXiv:2203.07852. — LSTM-style gate on the carried state *(the gated update rule)*.
-4. Dai et al. **Transformer-XL.** ACL 2019. arXiv:1901.02860. — Segment-level recurrence.
-5. Wu, Lan, Qian, Gu, Geramifard, Yu. **Memformer.** Findings of AACL-IJCNLP 2022. arXiv:2010.06891.
-
-### 10.B — Long-term: associative fast-weight memory (recommended tier)
-6. Schmidhuber. **Learning to Control Fast-Weight Memories.** Neural Computation 4(1):131–139, 1992. *(origin of fast weights; not on arXiv)*.
-7. Schlag, Irie, Schmidhuber. **Linear Transformers Are Secretly Fast Weight Programmers.** ICML 2021. arXiv:2102.11174.
-8. Katharopoulos, Vyas, Pappas, Fleuret. **Transformers are RNNs: Linear Attention.** ICML 2020. arXiv:2006.16236. — The linear-attention read `m = Wᵀq`.
-9. Yang, Wang, Shen, Panda, Kim. **Parallelizing Linear Transformers with the Delta Rule (DeltaNet).** NeurIPS 2024. arXiv:2406.06484. — Targeted overwrite write.
-10. Yang, Kautz, Hatamizadeh. **Gated Delta Networks: Improving Mamba2 with the Delta Rule (Gated DeltaNet).** ICLR 2025. arXiv:2412.06464. — `W ← α·W·(I − β k kᵀ) + β v kᵀ` *(the long-term write rule)*.
-11. Yang, Zhang, Hua, et al. **Gated Linear Attention (GLA).** ICML 2024. arXiv:2312.06635.
-12. Ramsauer et al. **Hopfield Networks is All You Need.** ICLR 2021. arXiv:2008.02217. — Attention as associative memory.
-13. Wang, Shi, Fox. **Test-time Regression: a Unifying Framework for Sequence Models.** arXiv:2501.12352. — Associative-memory view of modern recurrences.
-
-### 10.C — The minimal variant: two-timescale / hierarchical recurrence
-14. Koutník, Greff, Gomez, Schmidhuber. **A Clockwork RNN.** ICML 2014. arXiv:1402.3511.
-15. Chung, Ahn, Bengio. **Hierarchical Multiscale RNN.** ICLR 2017. arXiv:1609.01704.
-16. Rae, Potapenko, Jayakumar, Lillicrap. **Compressive Transformers.** ICLR 2020. arXiv:1911.05507. — Consolidation by compression.
-17. Shaj et al. **Multi Time Scale World Models (MTS3).** NeurIPS 2023 (Spotlight). arXiv:2310.18534.
-18. Hwang, Wang, Gu. **Dynamic Chunking for Hierarchical Sequence Modeling (H-Net).** arXiv:2507.07955. — Optional learned boundary clock.
-
-### 10.D — The heavy variant: test-time-trained neural memory
-19. Sun et al. **Learning to (Learn at Test Time): RNNs with Expressive Hidden States (TTT).** ICML 2025. arXiv:2407.04620.
-20. Behrouz, Zhong, Mirrokni. **Titans: Learning to Memorize at Test Time.** arXiv:2501.00663. — Deep memory + surprise + momentum + adaptive decay.
-21. Behrouz et al. **It's All Connected (Miras).** arXiv:2504.13173. — The 4-knob generalization.
-22. Behrouz et al. **ATLAS: Learning to Optimally Memorize the Context at Test Time.** arXiv:2505.23735.
-
-### 10.E — Recurrent-state / SSM working memory (alternative short-term carrier)
-23. Gu, Goel, Ré. **Structured State Spaces (S4).** ICLR 2022. arXiv:2111.00396.
-24. Smith, Warrington, Linderman. **Simplified State Space Layers (S5).** ICLR 2023. arXiv:2208.04933.
-25. Lu et al. **Structured State Space Models for In-Context RL (S5-for-RL).** NeurIPS 2023. arXiv:2303.03982. — The `(1 − done)` resettable-state trick.
-26. Gu, Dao. **Mamba.** COLM 2024. arXiv:2312.00752.
-27. Dao, Gu. **Transformers are SSMs (Mamba-2).** ICML 2024. arXiv:2405.21060.
-28. Ota. **Decision Mamba.** arXiv:2403.19925.
-
-### 10.F — Differentiable-memory ancestry & the agentic baseline we reject
-29. Graves, Wayne, Danihelka. **Neural Turing Machines.** arXiv:1410.5401.
-30. Graves et al. **Hybrid computing with dynamic external memory (DNC).** Nature 538:471–476, 2016.
-31. Wu, Rabe, Hutchins, Szegedy. **Memorizing Transformers.** ICLR 2022. arXiv:2203.08913. — kNN memory with a *stop-grad* gate (the non-differentiability we avoid).
-32. Packer et al. **MemGPT: LLMs as Operating Systems.** arXiv:2310.08560. *(agentic paging — rejected)*.
-33. Lewis et al. **Retrieval-Augmented Generation (RAG).** NeurIPS 2020. arXiv:2005.11401. *(external retrieval — rejected)*.
-34. Paischer et al. **History Compression via Language Models in RL (HELM).** ICML 2022. arXiv:2205.12258.
-
-### 10.G — Memory in VLA / robot world models (context & cross-checks)
-35. Shi et al. **MemoryVLA.** arXiv:2508.19236. *(perceptual-cognitive memory bank — agentic camp)*.
-36. **VQ-Memory: Robust Long-Horizon Manipulation in Non-Markovian Benchmarks.** arXiv:2603.09513. — In-model VQ memory; the elegant-camp manipulation cross-check.
-37. **EchoVLA: Synergistic Declarative Memory for VLA Mobile Manipulation.** arXiv:2511.18112.
-38. Li, Guo, Wu, et al. **MAP-VLA: Memory-Augmented Prompting for VLA.** arXiv:2511.09516.
-
-### 10.H — World-model / VLA substrate
-39. Assran, Bardes, et al. (Meta FAIR). **V-JEPA 2.** arXiv:2506.09985.
-40. Sun et al. **VLA-JEPA: Enhancing VLA with a Latent World Model.** arXiv:2602.10098.
-41. Hafner, Pasukonis, Ba, Lillicrap. **DreamerV3.** Nature 640:647–653, 2025. arXiv:2301.04104. — RSSM recurrent latent state.
-42. Hafner et al. **Learning Latent Dynamics for Planning from Pixels (PlaNet / RSSM).** ICML 2019. arXiv:1811.04551.
-43. Hansen, Su, Wang. **TD-MPC2.** ICLR 2024. arXiv:2310.16828.
-44. Wu et al. **iVideoGPT.** NeurIPS 2024. arXiv:2405.15223.
-45. Zhou, Pan, LeCun, Pinto. **DINO-WM.** ICML 2025. arXiv:2411.04983.
-
----
-
-*End of proposal. Descriptive only; implementing it requires the code changes outlined per `file:line` above, none of which have been made. The headline design (recurrent `[mem]` tokens + fast-weight associative matrix) is the recommended default; §5.6 gives a minimal and a heavy variant on the same in-model, differentiable, reset-aware foundation.*
+These papers motivate the design space; they do not prove that a particular module will improve this repository. The staged causal ablations are the deciding evidence.
