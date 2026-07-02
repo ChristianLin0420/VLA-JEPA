@@ -37,6 +37,10 @@ except (ImportError, RuntimeError):
     TORCHCODEC_AVAILABLE = False
 
 
+class VideoDecodingError(RuntimeError):
+    """A recoverable failure while decoding an input video sample."""
+
+
 def get_frames_by_indices(
     video_path: str,
     indices: list[int] | np.ndarray,
@@ -131,26 +135,25 @@ def get_frames_by_timestamps(
     elif video_backend == "torchvision_av":
         torchvision.set_video_backend("pyav")
         loaded_frames = []
-        loaded_ts = []
-        
+
         reader = None
         try:
             reader = torchvision.io.VideoReader(video_path, "video")
-            
+
             for target_ts in timestamps:
                 # Reset reader state
                 reader.seek(target_ts, keyframes_only=True)
-                
+
                 closest_frame = None
                 closest_ts_diff = float('inf')
-                
+
                 for frame in reader:
                     current_ts = frame["pts"]
                     current_diff = abs(current_ts - target_ts)
-                    
+
                     if closest_frame is None:
                         closest_frame = frame
-                    
+
                     if current_diff < closest_ts_diff:
                         # Release previous frame reference
                         if closest_frame is not None:
@@ -166,11 +169,13 @@ def get_frames_by_timestamps(
                     if isinstance(frame_data, torch.Tensor):
                         frame_data = frame_data.cpu().numpy()
                     loaded_frames.append(frame_data)
-                    loaded_ts.append(closest_frame["pts"])
-                    
+
                     # Immediately release frame reference
                     del closest_frame
-                    
+        except av.error.FFmpegError as exc:
+            raise VideoDecodingError(
+                f"Failed to decode {video_path!r} with torchvision_av: {exc}"
+            ) from exc
         finally:
             # Thoroughly clean resources
             if reader is not None:
@@ -182,8 +187,25 @@ def get_frames_by_timestamps(
             # Force garbage collection
             import gc
             gc.collect()
-        
-        frames = np.array(loaded_frames)
+
+        expected_frames = len(timestamps)
+        if len(loaded_frames) != expected_frames:
+            raise VideoDecodingError(
+                f"Failed to decode {video_path!r} with torchvision_av: "
+                f"requested {expected_frames} frame(s), got {len(loaded_frames)}"
+            )
+        try:
+            frames = np.stack(loaded_frames, axis=0)
+        except ValueError as exc:
+            raise VideoDecodingError(
+                f"Failed to decode {video_path!r} with torchvision_av: "
+                "decoded frames have inconsistent shapes"
+            ) from exc
+        if frames.ndim != 4 or frames.shape[1] != 3:
+            raise VideoDecodingError(
+                f"Failed to decode {video_path!r} with torchvision_av: "
+                f"expected TCHW RGB frames, got shape {frames.shape}"
+            )
         return frames.transpose(0, 2, 3, 1)
     else:
         raise NotImplementedError

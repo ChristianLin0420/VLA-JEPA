@@ -40,7 +40,11 @@ import random
 import torch
 import cv2
 
-from starVLA.dataloader.gr00t_lerobot.video import get_all_frames, get_frames_by_timestamps
+from starVLA.dataloader.gr00t_lerobot.video import (
+    VideoDecodingError,
+    get_all_frames,
+    get_frames_by_timestamps,
+)
 
 from starVLA.dataloader.gr00t_lerobot.embodiment_tags import EmbodimentTag
 from starVLA.dataloader.gr00t_lerobot.schema import (
@@ -69,6 +73,7 @@ SUPPORTED_SAMPLE_MODES = {
     SAMPLE_MODE_SINGLE_STEP,
     SAMPLE_MODE_CONTIGUOUS_SEGMENT,
 }
+MAX_VIDEO_DECODE_ATTEMPTS = 10
 
 def calculate_dataset_statistics(parquet_paths: list[Path]) -> dict:
     """Calculate the dataset statistics of all columns for a list of parquet files."""
@@ -1660,22 +1665,32 @@ class LeRobotMixtureDataset(Dataset):
         self.epoch = epoch
         # self.sampled_steps = self.sample_epoch()
 
-    def _segment_rng(self, index: int) -> np.random.Generator:
+    def _segment_rng(self, index: int, retry_attempt: int = 0) -> np.random.Generator:
         """Return the only RNG used by deterministic segment selection."""
 
         effective_epoch = self.epoch if self.mode == "train" else 0
-        seed = safe_hash(("segment-v1", effective_epoch, int(index), self.seed))
+        if retry_attempt == 0:
+            seed_items = ("segment-v1", effective_epoch, int(index), self.seed)
+        else:
+            seed_items = (
+                "segment-decode-retry-v1",
+                effective_epoch,
+                int(index),
+                self.seed,
+                int(retry_attempt),
+            )
+        seed = safe_hash(seed_items)
         return np.random.default_rng(seed)
 
     def _sample_segment_location(
-        self, index: int
+        self, index: int, retry_attempt: int = 0
     ) -> tuple[LeRobotSingleDataset, dict, int, int, int]:
         """Choose dataset, trajectory, and fully valid supervised start."""
 
         if self.sample_mode != SAMPLE_MODE_CONTIGUOUS_SEGMENT:
             raise RuntimeError("sample_segment requires sample_mode='contiguous_segment'")
 
-        rng = self._segment_rng(index)
+        rng = self._segment_rng(index, retry_attempt=retry_attempt)
         dataset_index = int(
             rng.choice(len(self.datasets), p=self.dataset_sampling_weights)
         )
@@ -1699,7 +1714,7 @@ class LeRobotMixtureDataset(Dataset):
         episode_id = int(catalog["trajectory_ids"][trajectory_index])
         return dataset, catalog, trajectory_index, episode_id, supervised_start
 
-    def sample_segment(self, index: int) -> dict:
+    def sample_segment(self, index: int, retry_attempt: int = 0) -> dict:
         """Return one fixed-size burn-in + supervised segment.
 
         The first J positions are a bounded burn-in prefix, left-padded with
@@ -1708,7 +1723,7 @@ class LeRobotMixtureDataset(Dataset):
         """
 
         dataset, catalog, trajectory_index, episode_id, supervised_start = (
-            self._sample_segment_location(index)
+            self._sample_segment_location(index, retry_attempt=retry_attempt)
         )
         stride = self.segment_stride
         burn_in = self.burn_in_max_decisions
@@ -1882,9 +1897,25 @@ class LeRobotMixtureDataset(Dataset):
             dict: The data for the trajectory and start index.
         """
         if self.sample_mode == SAMPLE_MODE_CONTIGUOUS_SEGMENT:
-            # Segment sampling is deterministic and fail-fast.  Substituting a
-            # global-random example after a decode error would break exact resume.
-            return self.sample_segment(index)
+            # A corrupt video must not make one rank leave the training loop while
+            # its peers enter the next collective. Retry only decoder failures and
+            # derive each alternate segment from stable inputs so exact resume is
+            # preserved. Programming and formatting errors remain fail-fast.
+            last_exception = None
+            for retry_attempt in range(MAX_VIDEO_DECODE_ATTEMPTS):
+                try:
+                    return self.sample_segment(index, retry_attempt=retry_attempt)
+                except VideoDecodingError as exc:
+                    last_exception = exc
+                    if retry_attempt < MAX_VIDEO_DECODE_ATTEMPTS - 1:
+                        print(
+                            "Video decode failed for deterministic segment "
+                            f"index {index}; retrying alternate "
+                            f"{retry_attempt + 1}/{MAX_VIDEO_DECODE_ATTEMPTS - 1}: {exc}",
+                            flush=True,
+                        )
+            assert last_exception is not None
+            raise last_exception
 
         max_retries = 10
         last_exception = None

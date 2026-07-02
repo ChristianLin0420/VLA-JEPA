@@ -6,9 +6,11 @@ from omegaconf import OmegaConf
 
 from starVLA.dataloader.gr00t_lerobot.datasets import (
     LeRobotMixtureDataset,
+    MAX_VIDEO_DECODE_ATTEMPTS,
     SAMPLE_MODE_CONTIGUOUS_SEGMENT,
     SAMPLE_MODE_SINGLE_STEP,
 )
+from starVLA.dataloader.gr00t_lerobot.video import VideoDecodingError
 from starVLA.dataloader.lerobot_datasets import get_vla_dataset
 
 
@@ -139,7 +141,7 @@ class ContiguousSegmentSamplingTest(unittest.TestCase):
             self.assertEqual(sample[key].dtype, np.bool_)
             self.assertEqual(sample[key].shape, (6,))
 
-    def test_segment_decode_failure_is_fail_fast_not_randomly_substituted(self):
+    def test_non_video_decode_failure_remains_fail_fast(self):
         dataset = _FakeRawDataset()
         mixture = _make_mixture(dataset)
         with mock.patch.object(
@@ -150,6 +152,58 @@ class ContiguousSegmentSamplingTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "decode failed"):
                 mixture[2]
         global_retry.assert_not_called()
+
+    def test_video_decode_failure_uses_deterministic_shape_stable_retry(self):
+        first = _make_mixture(_FakeRawDataset())
+        second = _make_mixture(_FakeRawDataset())
+        expected_retry = first.sample_segment(9, retry_attempt=1)
+
+        def decode_failure_on_initial_attempt(sample_segment):
+            def wrapped(index, retry_attempt=0):
+                if retry_attempt == 0:
+                    raise VideoDecodingError("corrupt packet")
+                return sample_segment(index, retry_attempt=retry_attempt)
+
+            return wrapped
+
+        with mock.patch.object(
+            first,
+            "sample_segment",
+            side_effect=decode_failure_on_initial_attempt(first.sample_segment),
+        ), mock.patch.object(
+            second,
+            "sample_segment",
+            side_effect=decode_failure_on_initial_attempt(second.sample_segment),
+        ), mock.patch(
+            "starVLA.dataloader.gr00t_lerobot.datasets.random.randint"
+        ) as global_retry:
+            first_sample = first[9]
+            second_sample = second[9]
+
+        global_retry.assert_not_called()
+        self.assertEqual(_signature(first_sample), _signature(expected_retry))
+        self.assertEqual(_signature(first_sample), _signature(second_sample))
+        self.assertEqual(len(first_sample["steps"]), 6)
+        self.assertEqual(first_sample["base_indices"].shape, (6,))
+        self.assertEqual(first_sample["sequence_valid"].shape, (6,))
+        self.assertTrue(
+            all(
+                step is None or step["video"].shape == (2, 3, 4, 4, 3)
+                for step in first_sample["steps"]
+            )
+        )
+
+    def test_video_decode_retry_budget_is_bounded(self):
+        mixture = _make_mixture(_FakeRawDataset())
+        with mock.patch.object(
+            mixture,
+            "sample_segment",
+            side_effect=VideoDecodingError("permanently corrupt video"),
+        ) as sample_segment:
+            with self.assertRaisesRegex(VideoDecodingError, "permanently corrupt"):
+                mixture[4]
+
+        self.assertEqual(sample_segment.call_count, MAX_VIDEO_DECODE_ATTEMPTS)
 
     def test_selection_is_deterministic_by_epoch_index_and_seed(self):
         first = _make_mixture(_FakeRawDataset())
