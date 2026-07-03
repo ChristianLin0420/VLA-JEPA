@@ -81,8 +81,10 @@ for task in "${items[@]}"; do
       --args.blackout_num_decisions "${BLACKOUT_D:-1}"
       --args.blackout_fill "${BLACKOUT_FILL:-black}"
       --args.blackout_views "${BLACKOUT_VIEWS:-both}"
-      --args.suppress_write_during_blackout "${BLACKOUT_SUPPRESS_WRITE:-False}"
     )
+    # tyro booleans are bare flags, not value-taking options
+    [[ "${BLACKOUT_SUPPRESS_WRITE:-false}" == "true" ]] && \
+      blackout_args+=(--args.suppress-write-during-blackout)
   fi
   $sim_python ./examples/LIBERO/eval_libero.py \
       --args.pretrained-path "$CKPT" --args.host "$host" --args.port "$port" \
