@@ -73,11 +73,23 @@ for task in "${items[@]}"; do
       > "$video_out/server.log" 2>&1 &
   server_pids+=($!)
   sleep 30   # give the server time to load the 7.5GB model before the sim connects
+  # Optional T0.5 blackout protocol (client-side observation corruption).
+  blackout_args=()
+  if [[ -n "${BLACKOUT_START:-}" ]]; then
+    blackout_args+=(
+      --args.blackout_start_decision "$BLACKOUT_START"
+      --args.blackout_num_decisions "${BLACKOUT_D:-1}"
+      --args.blackout_fill "${BLACKOUT_FILL:-black}"
+      --args.blackout_views "${BLACKOUT_VIEWS:-both}"
+      --args.suppress_write_during_blackout "${BLACKOUT_SUPPRESS_WRITE:-False}"
+    )
+  fi
   $sim_python ./examples/LIBERO/eval_libero.py \
       --args.pretrained-path "$CKPT" --args.host "$host" --args.port "$port" \
       --args.task-suite-name "$task" --args.num-trials-per-task "$num_trials_per_task" \
       --args.video-out-path "$video_out" --args.with_state "$with_state" \
       --args.unnorm-key "$unnorm_key" \
+      ${blackout_args[@]+"${blackout_args[@]}"} \
       > "$video_out/eval.log" 2>&1 &
   sim_pids+=($!)
 done
