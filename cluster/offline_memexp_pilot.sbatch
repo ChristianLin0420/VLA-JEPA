@@ -28,12 +28,18 @@ OUT_ROOT="${OUT_ROOT:-results/offline/$(basename "$CKPT" .pt)}"
 MAX_EPISODES="${MAX_EPISODES:-60}"
 mkdir -p "$OUT_ROOT"
 
+# cache_tokens writes episode files under <out-dir>/<suite>/; skip suites
+# whose cache already exists so replay-only reruns reuse the Qwen encodes.
 pids=()
 gpu=0
 for suite in libero_10 libero_goal libero_object libero_spatial; do
+  if compgen -G "$OUT_ROOT/cache/$suite/*ep*.pt" > /dev/null; then
+    echo "[skip] cache exists for $suite"
+    continue
+  fi
   $PY scripts/offline_eval/cache_tokens.py \
       --ckpt "$CKPT" --dataset "${suite}_no_noops_1.0.0_lerobot" --suite "$suite" \
-      --data-root "$DATA_ROOT" --out-dir "$OUT_ROOT/cache/$suite" \
+      --data-root "$DATA_ROOT" --out-dir "$OUT_ROOT/cache" \
       --max-episodes "$MAX_EPISODES" --device "cuda:$gpu" \
       > "$OUT_ROOT/cache_$suite.log" 2>&1 &
   pids+=($!); gpu=$((gpu+1))
