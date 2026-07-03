@@ -41,6 +41,13 @@ class ResidualMemoryFusion(nn.Module):
         self.output_projection = nn.Linear(bottleneck_dim, consumer_dim)
         self.gate = nn.Parameter(torch.tensor(float(gate_init), dtype=torch.float32))
 
+        # Runtime knobs and diagnostics (plain attributes, never checkpointed):
+        # `residual_scale` rescales the gated residual (λ dose-response) and
+        # `capture_diagnostics` additionally records the read-attention map.
+        self.residual_scale = 1.0
+        self.capture_diagnostics = False
+        self.last_fusion_diagnostics = None
+
         self._reset_parameters()
 
     def _reset_parameters(self) -> None:
@@ -80,21 +87,28 @@ class ResidualMemoryFusion(nn.Module):
         if not consumer_tokens.is_floating_point() or not memory_tokens.is_floating_point():
             raise TypeError("consumer_tokens and memory_tokens must be floating point")
         if bypass:
+            self.last_fusion_diagnostics = {"injection_ratio": 0.0}
             return consumer_tokens
 
         original_dtype = consumer_tokens.dtype
+        need_weights = bool(self.capture_diagnostics)
         with torch.autocast(device_type=consumer_tokens.device.type, enabled=False):
             consumer = consumer_tokens.to(dtype=torch.float32)
             memory = memory_tokens.to(dtype=torch.float32)
             query = self.query_projection(self.consumer_norm(consumer))
             key_value = self.memory_projection(self.memory_norm(memory))
-            attended, _ = self.attention(
+            attended, read_attention = self.attention(
                 query=query,
                 key=key_value,
                 value=key_value,
-                need_weights=False,
+                need_weights=need_weights,
             )
             residual = self.output_projection(attended)
-            gated_residual = torch.tanh(self.gate) * residual
+            gated_residual = torch.tanh(self.gate) * self.residual_scale * residual
 
+        self.last_fusion_diagnostics = {
+            "injection_ratio": float(gated_residual.norm() / consumer.norm())
+        }
+        if need_weights:
+            self.last_fusion_diagnostics["read_attention"] = read_attention.detach()
         return consumer_tokens + gated_residual.to(dtype=original_dtype)

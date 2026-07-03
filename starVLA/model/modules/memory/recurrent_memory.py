@@ -56,6 +56,13 @@ class RecurrentMemory(nn.Module):
         self.update_gate = nn.Linear(2 * memory_dim, memory_dim)
         self.candidate_projection = nn.Linear(memory_dim, memory_dim)
 
+        # Diagnostics side-channel (mirrors the framework's `capture_jepa`
+        # pattern): read()/write() populate the attributes below only while
+        # `capture_diagnostics` is set, and clear them otherwise.
+        self.capture_diagnostics = False
+        self.last_read_diagnostics = None
+        self.last_write_diagnostics = None
+
         self._reset_parameters(update_gate_init=update_gate_init, init_std=init_std)
 
     def _reset_parameters(self, *, update_gate_init: float, init_std: float) -> None:
@@ -226,6 +233,12 @@ class RecurrentMemory(nn.Module):
             "steps": state.steps.to(dtype=torch.float32),
             "active": active.to(dtype=torch.float32),
         }
+        # The read itself is attention-free; the policy-side read-attention map
+        # is captured by ResidualMemoryFusion.  The key is kept for contract
+        # stability with the write-side capture.
+        self.last_read_diagnostics = (
+            {"read_attention": None} if self.capture_diagnostics else None
+        )
         return MemoryRead(tokens=tokens, diagnostics=diagnostics)
 
     def write(
@@ -256,11 +269,11 @@ class RecurrentMemory(nn.Module):
             previous = state.working
             slot_identity = self.slot_ids.to(dtype=torch.float32).unsqueeze(0)
             query = self.slot_norm(previous + slot_identity)
-            context, _ = self.update_attention(
+            context, write_attention = self.update_attention(
                 query=query,
                 key=source,
                 value=source,
-                need_weights=False,
+                need_weights=self.capture_diagnostics,
             )
 
             gate_input = torch.cat((self.slot_norm(previous), context), dim=-1)
@@ -270,6 +283,24 @@ class RecurrentMemory(nn.Module):
 
             working = torch.where(active[:, None, None], proposed, previous)
             steps = state.steps + active.to(dtype=torch.int64)
+
+        if self.capture_diagnostics:
+            gate_values = gate.detach().reshape(-1)
+            slots = working.detach()
+            unit = slots / slots.norm(dim=-1, keepdim=True).clamp_min(1.0e-12)
+            cosine = unit @ unit.transpose(1, 2)
+            num_slots = cosine.shape[-1]
+            off_diagonal = cosine.sum(dim=(-2, -1)) - cosine.diagonal(dim1=-2, dim2=-1).sum(dim=-1)
+            self.last_write_diagnostics = {
+                "update_gate_mean": float(gate_values.mean()),
+                "update_gate_p05": float(torch.quantile(gate_values, 0.05)),
+                "update_gate_p95": float(torch.quantile(gate_values, 0.95)),
+                "per_slot_delta_norm": (working - previous).detach().norm(dim=-1),
+                "slot_cosine_mean": float(off_diagonal.mean() / max(num_slots * (num_slots - 1), 1)),
+                "write_attention": write_attention.detach(),
+            }
+        else:
+            self.last_write_diagnostics = None
 
         return MemoryState(
             working=working,

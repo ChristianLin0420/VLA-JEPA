@@ -127,6 +127,7 @@ class VLA_JEPA(baseframework):
         self.memory_module = None
         self.policy_memory_fusion = None
         self.last_memory_diagnostics = None
+        self.last_qwen_cache = None
         if self.memory_enabled:
             short_cfg = memory_cfg.get("short_term", {})
             action_cfg = memory_cfg.get("action_conditioning", {})
@@ -343,6 +344,7 @@ class VLA_JEPA(baseframework):
         update_mask: Optional[torch.Tensor] = None,
         include_action_loss: bool = True,
         include_world_loss: bool = True,
+        fusion_bypass: bool = False,
     ) -> Tuple[Dict[str, torch.Tensor], Optional[MemoryState], Dict[str, torch.Tensor]]:
         if not examples:
             raise ValueError("examples must contain at least one sample")
@@ -387,7 +389,9 @@ class VLA_JEPA(baseframework):
             state_before = self.memory_module.reset_state(state_before, reset_mask)
             memory_read = self.memory_module.read(qwen.action_tokens, state_before, read_mask=active_mask)
             diagnostics.update(memory_read.diagnostics)
-            policy_tokens = self.policy_memory_fusion(policy_tokens, memory_read.tokens)
+            policy_tokens = self.policy_memory_fusion(
+                policy_tokens, memory_read.tokens, bypass=fusion_bypass
+            )
             diagnostics["policy_gate"] = torch.tanh(self.policy_memory_fusion.gate).detach()
 
         losses: Dict[str, torch.Tensor] = {}
@@ -535,24 +539,32 @@ class VLA_JEPA(baseframework):
         generator: Optional[torch.Generator] = None,
         initial_noise: Optional[torch.Tensor] = None,
         update_memory: bool = True,
+        memory_bypass: bool = False,
+        qwen_cache: Optional[QwenTokenBundle] = None,
+        keep_qwen_cache: bool = False,
         **kwargs,
     ):
-        train_obs_image_size = getattr(self.config.datasets.vla_data, "image_size", None)
-        if train_obs_image_size:
-            batch_images = resize_images(batch_images, target_size=train_obs_image_size)
-
-        qwen = self._encode_qwen_tokens(
-            batch_images,
-            instructions,
-            self.config.datasets.vla_data.get("CoT_prompt", ""),
-            require_embodied=True,
-        )
+        if qwen_cache is not None:
+            qwen = qwen_cache
+        else:
+            train_obs_image_size = getattr(self.config.datasets.vla_data, "image_size", None)
+            if train_obs_image_size:
+                batch_images = resize_images(batch_images, target_size=train_obs_image_size)
+            qwen = self._encode_qwen_tokens(
+                batch_images,
+                instructions,
+                self.config.datasets.vla_data.get("CoT_prompt", ""),
+                require_embodied=True,
+            )
+        # A kept cache lets a paired same-decision call (e.g. the bypass
+        # counterfactual) skip the resize + Qwen encode entirely.
+        self.last_qwen_cache = qwen if keep_qwen_cache else None
         embodied = qwen.embodied_action_tokens
         if embodied is None:
             raise RuntimeError("inference prompt did not produce embodied-action tokens")
         state_before = memory_state
         diagnostics: Dict[str, torch.Tensor] = {}
-        if self.memory_enabled:
+        if self.memory_enabled and not memory_bypass:
             batch_size = embodied.shape[0]
             device = embodied.device
             if state_before is None:
@@ -581,7 +593,7 @@ class VLA_JEPA(baseframework):
             )
 
         state_after = state_before
-        if self.memory_enabled and update_memory:
+        if self.memory_enabled and update_memory and not memory_bypass:
             state_after = self.memory_module.write(qwen.action_tokens, state_before)
         if state_after is not None:
             state_after = state_after.detach()

@@ -267,16 +267,37 @@ class FlowmatchingActionHead(nn.Module):
         return BatchFeature(data=batch)
 
 
-    def forward(self, vl_embs: torch.Tensor, actions: torch.Tensor, state: torch.Tensor = None):
+    def forward(
+        self,
+        vl_embs: torch.Tensor,
+        actions: torch.Tensor,
+        state: torch.Tensor = None,
+        t: torch.Tensor = None,
+        noise: torch.Tensor = None,
+    ):
         """
         vl_embs: shape (B, seq_length, feature_dim)
         actions: shape (B, future_action_window_size, D_action)
+        t / noise: optional pre-sampled flow time (B,) and noise (same shape as
+            actions) for deterministic teacher-forced loss evaluation.
         """
         device = vl_embs.device
 
         # Embed noised action trajectory.
-        noise = torch.randn(actions.shape, device=actions.device, dtype=actions.dtype)
-        t = self.sample_time(actions.shape[0], device=actions.device, dtype=actions.dtype)
+        if noise is None:
+            noise = torch.randn(actions.shape, device=actions.device, dtype=actions.dtype)
+        else:
+            if tuple(noise.shape) != tuple(actions.shape):
+                raise ValueError(
+                    f"noise must have shape {tuple(actions.shape)}, got {tuple(noise.shape)}"
+                )
+            noise = noise.to(device=actions.device, dtype=actions.dtype)
+        if t is None:
+            t = self.sample_time(actions.shape[0], device=actions.device, dtype=actions.dtype)
+        else:
+            if tuple(t.shape) != (actions.shape[0],):
+                raise ValueError(f"t must have shape ({actions.shape[0]},), got {tuple(t.shape)}")
+            t = t.to(device=actions.device, dtype=actions.dtype)
         t = t[:, None, None]  # shape (B,1,1) for broadcast
 
         noisy_trajectory = (1 - t) * noise + t * actions

@@ -422,6 +422,9 @@ class VLAMTrainer(TrainerUtils):
             self.optimizer.zero_grad()
             if self._unwrapped is not None:
                 self._unwrapped.capture_jepa = bool(getattr(self, "_capture", False))
+                memory_module = getattr(self._unwrapped, "memory_module", None)
+                if memory_module is not None:
+                    memory_module.capture_diagnostics = bool(getattr(self, "_capture", False))
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 output_dict = self.model(batch_vla)  # __call__ -> DDP grad sync hooks
                 total_loss = sum(output_dict.values())
@@ -436,6 +439,9 @@ class VLAMTrainer(TrainerUtils):
                     pass
             self.optimizer.step()
             self.lr_scheduler.step()
+            # Cache robot-pass memory scalars now: the video pass below calls
+            # forward() on non-robot batches, which resets last_memory_diagnostics.
+            memory_metrics = self._collect_memory_metrics()
 
             vlm_output = None
             vlm_loss = None
@@ -459,14 +465,37 @@ class VLAMTrainer(TrainerUtils):
         log_dict["loss/vla_total"] = float(total_loss.item())
         if vlm_loss is not None:
             log_dict["loss/vlm_total"] = float(vlm_loss.item())
-        diagnostics = getattr(self._unwrapped, "last_memory_diagnostics", None)
+        log_dict.update(memory_metrics)
+        return log_dict
+
+    def _collect_memory_metrics(self):
+        """Robot-pass memory scalars; must be read before the video pass runs."""
+        metrics = {}
+        model = self._unwrapped
+        if model is None:
+            return metrics
+        diagnostics = getattr(model, "last_memory_diagnostics", None)
         if diagnostics:
             for key, value in diagnostics.items():
                 try:
-                    log_dict[f"memory/{key}"] = float(value.float().mean().item())
+                    metrics[f"memory/{key}"] = float(value.float().mean().item())
                 except Exception:
                     pass
-        return log_dict
+        fusion_diagnostics = getattr(
+            getattr(model, "policy_memory_fusion", None), "last_fusion_diagnostics", None
+        )
+        if fusion_diagnostics:
+            metrics["memory/injection_ratio"] = float(fusion_diagnostics["injection_ratio"])
+        write_diagnostics = getattr(
+            getattr(model, "memory_module", None), "last_write_diagnostics", None
+        )
+        if write_diagnostics:
+            for key, value in write_diagnostics.items():
+                if isinstance(value, float):
+                    metrics[f"memory/{key}"] = value
+                elif key == "per_slot_delta_norm":
+                    metrics[f"memory/{key}"] = float(value.float().mean().item())
+        return metrics
 
     def _log_metrics(self, metrics):
         if self.completed_steps % self.config.trainer.logging_frequency != 0:
