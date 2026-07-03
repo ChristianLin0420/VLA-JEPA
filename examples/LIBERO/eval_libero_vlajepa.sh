@@ -23,7 +23,8 @@ if [[ "$MUJOCO_GL" == "egl" ]]; then
   export PYOPENGL_PLATFORM=egl
 fi
 
-REPO=/lustre/fsw/portfolios/edgeai/projects/edgeai_tao-ptm_image-foundation-model-clip/users/chrislin/projects/VLA-JEPA
+# Resolve the repo from this script's location so worktree checkouts eval their own code.
+REPO=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 cd "$REPO"
 export LIBERO_HOME=/lustre/fsw/portfolios/edgeai/users/chrislin/anamnesis_stage/LIBERO
 # LIBERO reads $LIBERO_CONFIG_PATH/config.yaml; the valid (ANAMNESIS-staged) config
