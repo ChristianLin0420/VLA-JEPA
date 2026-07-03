@@ -22,3 +22,13 @@ export NCCL_IB_HCA=mlx5 NCCL_SOCKET_IFNAME='^lo,docker0'
 bash examples/LIBERO/eval_libero_vlajepa.sh
 echo "[$(date -Is)] eval finished; computing success rates"
 grep -riE 'success' results/*/"$(basename ${CKPT:-VLA-JEPA-cotrain-step2000.pt} .pt)"/eval.log 2>/dev/null | tail -20 || true
+# Push per-arm eval results to wandb (WANDB_EVAL=off to skip); never fails the job.
+if [[ "${WANDB_EVAL:-on}" != "off" ]]; then
+  PY=/lustre/fsw/portfolios/edgeai/users/chrislin/miniconda3/envs/VLA_JEPA/bin/python
+  CA="$($PY -c 'import certifi; print(certifi.where())' 2>/dev/null || true)"
+  [[ -n "$CA" ]] && export REQUESTS_CA_BUNDLE="$CA" SSL_CERT_FILE="$CA" CURL_CA_BUNDLE="$CA"
+  [[ -f "$HOME/.wandb_api_key" ]] && export WANDB_API_KEY="$(tr -d '[:space:]' < "$HOME/.wandb_api_key")"
+  $PY scripts/analysis/log_eval_to_wandb.py \
+    --ckpt-name "$(basename ${CKPT:-VLA-JEPA-cotrain-step2000.pt} .pt)" \
+    || echo "[warn] wandb eval logging failed (job continues)"
+fi

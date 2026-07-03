@@ -62,4 +62,15 @@ for suite in libero_10 libero_goal libero_object libero_spatial; do
 done
 for pid in "${pids[@]}"; do wait "$pid" || status=1; done
 [[ $status -eq 0 ]] || { echo "[fatal] replay failed; see $OUT_ROOT/replay_*.log" >&2; exit 1; }
+
+# Push offline pilot results to wandb (WANDB_EVAL=off to skip); never fails the job.
+if [[ "${WANDB_EVAL:-on}" != "off" ]]; then
+  CA="$($PY -c 'import certifi; print(certifi.where())' 2>/dev/null || true)"
+  [[ -n "$CA" ]] && export REQUESTS_CA_BUNDLE="$CA" SSL_CERT_FILE="$CA" CURL_CA_BUNDLE="$CA"
+  [[ -f "$HOME/.wandb_api_key" ]] && export WANDB_API_KEY="$(tr -d '[:space:]' < "$HOME/.wandb_api_key")"
+  $PY scripts/analysis/log_eval_to_wandb.py \
+    --ckpt-name "$(basename "$CKPT" .pt)" \
+    --results-root "$(dirname "$(dirname "$OUT_ROOT")")" \
+    || echo "[warn] wandb eval logging failed (job continues)"
+fi
 echo "OFFLINE_PILOT_COMPLETE ckpt=$(basename "$CKPT") out=$OUT_ROOT"
