@@ -58,6 +58,7 @@ class M1Inference:
             self.action_ensembler = None
         self.num_image_history = 0
         self._episode_counter = 0
+        self.last_memory_extras = None  # memory_extras from the most recent infer response
 
         self.action_norm_stats = self.get_action_stats(self.unnorm_key, policy_ckpt_path=policy_ckpt_path)
         self.action_chunk_size = self.get_action_chunk_size(policy_ckpt_path=policy_ckpt_path)
@@ -79,6 +80,7 @@ class M1Inference:
         if self.action_ensemble:
             self.action_ensembler.reset()
         self.num_image_history = 0
+        self.last_memory_extras = None
 
         self.sticky_action_is_on = False
         self.gripper_action_repeat = 0
@@ -92,6 +94,7 @@ class M1Inference:
         task_description: Optional[str] = None,
         state: Optional[np.ndarray] = None,
         step: int = 0,
+        suppress_write: bool = False,
         **kwargs
     ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
         """
@@ -119,10 +122,14 @@ class M1Inference:
 
         if state is not None:
             vla_input["state"] = [state]  # add batch dim
-        
+
+        if suppress_write:
+            vla_input["suppress_write"] = True
+
         action_chunk_size = self.action_chunk_size
         if step % action_chunk_size == 0:
             response = self.client.infer(vla_input)
+            self.last_memory_extras = response["data"].get("memory_extras")
             # unnormalize the action
             # import ipdb; ipdb.set_trace()
             normalized_actions = response["data"]["normalized_actions"] # B, chunk, D        

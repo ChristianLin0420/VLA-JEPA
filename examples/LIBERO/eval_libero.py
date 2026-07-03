@@ -28,6 +28,16 @@ _torch.load = _compat_torch_load
 from libero.libero import benchmark, get_libero_path
 from libero.libero.envs import OffScreenRenderEnv
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+from examples.LIBERO.blackout import (
+    BLACKOUT_FILLS,
+    BLACKOUT_VIEWS,
+    corrupt_views,
+    decision_record,
+    episode_record,
+    in_blackout,
+    memory_params_from_env,
+    read_git_sha,
+)
 from examples.LIBERO.model2libero_interface import M1Inference
 
 
@@ -68,6 +78,15 @@ class Args:
         #Sensor Noise
 
     #################################################################################################################
+    # Observation blackout (client-side, aligned to decision boundaries; T0.5)
+    #################################################################################################################
+    blackout_start_decision: int = -1  # first blacked-out decision index d0; -1 disables
+    blackout_num_decisions: int = 0  # blackout length D (decisions [d0, d0+D))
+    blackout_fill: str = "black"  # "black" | "freeze" (repeat last clean frame)
+    blackout_views: str = "both"  # "agentview" | "both"
+    suppress_write_during_blackout: bool = False  # send suppress_write on blacked-out decisions
+
+    #################################################################################################################
     # Utils
     #################################################################################################################
     video_out_path: str = "experiments/libero/logs"  # Path to save videos
@@ -103,8 +122,21 @@ def eval_libero(args: Args) -> None:
     logging.info(f"Task suite: {args.task_suite_name}")
 
     # args.video_out_path = f"{date_base}+{args.job_name}"
-    
+
     pathlib.Path(args.video_out_path).mkdir(parents=True, exist_ok=True)
+
+    if args.blackout_fill not in BLACKOUT_FILLS:
+        raise ValueError(f"blackout_fill must be one of {BLACKOUT_FILLS}: {args.blackout_fill}")
+    if args.blackout_views not in BLACKOUT_VIEWS:
+        raise ValueError(f"blackout_views must be one of {BLACKOUT_VIEWS}: {args.blackout_views}")
+
+    # Self-describing episode records: the server owns the memory policy, so the
+    # mode/params are mirrored from the same env the server was launched with.
+    memory_mode = os.environ.get("MEMORY_MODE", "live")
+    memory_params = memory_params_from_env()
+    git_sha = read_git_sha(pathlib.Path(__file__).resolve().parent)
+    episodes_path = pathlib.Path(args.video_out_path) / "episodes.jsonl"
+    decisions_path = pathlib.Path(args.video_out_path) / "decisions.jsonl"
 
     if args.task_suite_name == "libero_spatial":
         max_steps = 250  # longest training demo has 193 steps
@@ -147,6 +179,7 @@ def eval_libero(args: Args) -> None:
 
             # Reset environment
             model.reset(task_description=task_description)  # Reset the client connection
+            episode_seed = model._episode_counter  # seed sent with the reset RPC
             env.reset()
 
             # Set initial states
@@ -160,7 +193,10 @@ def eval_libero(args: Args) -> None:
 
             logging.info(f"Starting episode {task_episodes + 1}...")
             step = 0
-            
+            num_decisions = 0
+            decision_rows = []
+            last_clean_img, last_clean_wrist = None, None
+
             # full_actions = np.load("./debug/action.npy")
             
             while t < max_steps + args.num_steps_wait:
@@ -177,6 +213,24 @@ def eval_libero(args: Args) -> None:
                 wrist_img = np.ascontiguousarray(
                     obs["robot0_eye_in_hand_image"][::-1, ::-1]
                 )
+
+                # Observation blackout: corrupt env steps [7*d0, 7*(d0+D)), i.e.
+                # exactly decisions [d0, d0+D) (the server is called when step % 7 == 0).
+                decision_idx = step // model.action_chunk_size
+                blackout_active = in_blackout(
+                    decision_idx, args.blackout_start_decision, args.blackout_num_decisions
+                )
+                if blackout_active:
+                    img, wrist_img = corrupt_views(
+                        img,
+                        wrist_img,
+                        args.blackout_fill,
+                        args.blackout_views,
+                        last_clean_img,
+                        last_clean_wrist,
+                    )
+                else:
+                    last_clean_img, last_clean_wrist = img, wrist_img
 
                 # Save preprocessed image for replay video
                 replay_images.append(img)
@@ -210,11 +264,26 @@ def eval_libero(args: Args) -> None:
                 if args.with_state == "true":
                     obs_input["state"] = observation["observation.state"]
 
+                if blackout_active and args.suppress_write_during_blackout:
+                    obs_input["suppress_write"] = True
+
                 start_time = time.time()
-                
-                response = model.step(**obs_input) 
-                
+
+                response = model.step(**obs_input)
+
                 end_time = time.time()
+
+                if step % model.action_chunk_size == 0:
+                    num_decisions += 1
+                    decision_rows.append(
+                        decision_record(
+                            episode_idx=episode_idx,
+                            d=decision_idx,
+                            memory_extras=model.last_memory_extras,
+                            blackout_active=blackout_active,
+                            extras={"task_id": task_id},
+                        )
+                    )
                 # print(f"time: {end_time - start_time}")
                 
                 # # 
@@ -271,6 +340,35 @@ def eval_libero(args: Args) -> None:
             logging.info(
                 f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)"
             )
+
+            record = episode_record(
+                suite=args.task_suite_name,
+                task_id=task_id,
+                task_description=task_description,
+                episode_idx=episode_idx,
+                memory_mode=memory_mode,
+                memory_params=memory_params,
+                episode_seed=episode_seed,
+                success=done,
+                num_env_steps=len(full_actions),
+                num_decisions=num_decisions,
+                ckpt=args.pretrained_path,
+                git_sha=git_sha,
+                extras={
+                    "blackout": {
+                        "start_decision": args.blackout_start_decision,
+                        "num_decisions": args.blackout_num_decisions,
+                        "fill": args.blackout_fill,
+                        "views": args.blackout_views,
+                        "suppress_write": args.suppress_write_during_blackout,
+                    }
+                },
+            )
+            with open(episodes_path, "a") as f:
+                f.write(json.dumps(record) + "\n")
+            if decision_rows:
+                with open(decisions_path, "a") as f:
+                    f.writelines(json.dumps(row) + "\n" for row in decision_rows)
 
         # Log final results
         logging.info(
