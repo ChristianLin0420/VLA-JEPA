@@ -215,6 +215,26 @@ def iter_consumed_indices(completed_steps: int, world_size: int, epoch_length: i
             yield epoch, (t * world_size + rank) % epoch_length
 
 
+def validate_run_config(cfg) -> None:
+    """Guards for the assumptions baked into ``iter_consumed_indices``."""
+    data_cfg = cfg.datasets.vla_data
+    if data_cfg.sample_mode != "contiguous_segment":
+        raise ValueError(f"expected contiguous_segment sampling, got {data_cfg.sample_mode!r}")
+    if int(data_cfg.per_device_batch_size) != 1:
+        raise NotImplementedError(
+            "index schedule is only exact for per_device_batch_size=1 "
+            f"(got {data_cfg.per_device_batch_size})"
+        )
+    accumulation = int(cfg.trainer.get("gradient_accumulation_steps", 1))
+    if accumulation != 1:
+        raise NotImplementedError(
+            "index schedule is only exact for gradient_accumulation_steps=1 "
+            f"(got {accumulation}): completed_steps advances once per optimizer "
+            "sync, so a step maps to exactly one batch per rank only without "
+            "accumulation"
+        )
+
+
 def filtered_mixture_spec(data_mix: str) -> list[tuple[str, float, str]]:
     """Mirror get_vla_dataset's duplicate filter (lerobot_datasets.py:100-108)."""
     included, spec = set(), []
@@ -313,14 +333,8 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = OmegaConf.load(args.config)
+    validate_run_config(cfg)
     data_cfg = cfg.datasets.vla_data
-    if data_cfg.sample_mode != "contiguous_segment":
-        raise ValueError(f"expected contiguous_segment sampling, got {data_cfg.sample_mode!r}")
-    if int(data_cfg.per_device_batch_size) != 1:
-        raise NotImplementedError(
-            "index schedule is only exact for per_device_batch_size=1 "
-            f"(got {data_cfg.per_device_batch_size})"
-        )
     segment_length = int(data_cfg.segment_length)
     segment_stride = int(data_cfg.segment_stride)
     action_horizon = int(cfg.framework.action_model.action_horizon)

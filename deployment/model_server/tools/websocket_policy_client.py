@@ -89,6 +89,7 @@ class WebsocketClientPolicy:
         *,
         episode_id: str | None = None,
         episode_seed: int = 0,
+        task_key: str | None = None,
     ) -> Dict:
         request_id = uuid.uuid4().hex
         payload = {
@@ -96,6 +97,8 @@ class WebsocketClientPolicy:
             "episode_id": episode_id or request_id,
             "episode_seed": int(episode_seed),
         }
+        if task_key is not None:
+            payload["task_key"] = task_key
         self._ws.send(
             self._packer.pack(
                 {"type": "reset", "request_id": request_id, "payload": payload}

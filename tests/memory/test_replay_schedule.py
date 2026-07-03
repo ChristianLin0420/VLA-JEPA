@@ -1,5 +1,12 @@
+import argparse
+import gzip
+import json
 import math
+import sys
+import tempfile
 import unittest
+from pathlib import Path
+from unittest import mock
 
 import numpy as np
 import torch
@@ -10,14 +17,17 @@ from scripts.offline_eval.replay_engine import (
     SmokeFusion,
     SmokeHead,
     SmokeMemory,
+    _replay_all,
     build_plan,
     build_state_dump,
     burn_in_indices,
     make_smoke_cache,
     parse_conditions,
+    pick_donor_index,
     replay_episode,
     stable_seed,
     teacher_forced_states,
+    write_records,
 )
 
 
@@ -46,6 +56,7 @@ def _run(plan, num_decisions=5, donor_decisions=3, episode_seed=123, noise_draws
         episode_seed=episode_seed,
         noise_draws=noise_draws,
         donor_states=donor_states,
+        donor_episode=1,
     )
     return records, memory, fusion, head, cache, donor_cache, donor_states
 
@@ -223,6 +234,13 @@ class RecordContractTest(unittest.TestCase):
         self.assertTrue(all(r["J"] == -1 for r in base))
         frozen = [r for r in first if r["condition"] == "frozen_after"]
         self.assertTrue(all(r["J"] == 2 for r in frozen))
+        # donor_episode is populated on shuffled rows only (additive column).
+        shuffled = [r for r in first if r["condition"] == "shuffled"]
+        self.assertTrue(shuffled)
+        self.assertTrue(all(r["donor_episode"] == 1 for r in shuffled))
+        self.assertTrue(
+            all(r["donor_episode"] is None for r in first if r["condition"] != "shuffled")
+        )
 
     def test_shuffled_skipped_without_donor(self):
         memory, fusion, head = SmokeMemory(), SmokeFusion(), SmokeHead()
@@ -243,7 +261,11 @@ class StateDumpCaptureTest(unittest.TestCase):
         states, write_diags = teacher_forced_states(
             memory, cache["action_tokens"], capture=True
         )
+        # teacher_forced_states restores the capture flag it toggled (try/finally).
+        self.assertFalse(memory.capture_diagnostics)
         self.assertEqual(len(write_diags), 4)
+        # _replay_all pins capture across the dump pass; mirror that here.
+        memory.capture_diagnostics = True
         dump = build_state_dump(memory, cache, states, write_diags)
         self.assertEqual(dump["states"].shape, (4, memory.num_slots, memory.memory_dim))
         self.assertEqual(dump["token_mean"].shape, (4, cache["action_tokens"].shape[-1]))
@@ -267,6 +289,124 @@ class StateDumpCaptureTest(unittest.TestCase):
         cache = make_smoke_cache(0, 2)
         with self.assertRaisesRegex(RuntimeError, "last_write_diagnostics"):
             teacher_forced_states(memory, cache["action_tokens"], capture=True)
+        # The capture flag is restored even when the trajectory pass raises.
+        self.assertFalse(memory.capture_diagnostics)
+
+    def test_fusion_capture_supplies_read_attention(self):
+        from starVLA.model.modules.memory import ResidualMemoryFusion
+
+        memory = SmokeMemory()  # num_slots=2, memory_dim=4
+        cache = make_smoke_cache(0, 3)  # embodied tokens [3, 32, 16]
+        states, write_diags = teacher_forced_states(
+            memory, cache["action_tokens"], capture=True
+        )
+        fusion = ResidualMemoryFusion(
+            consumer_dim=16, memory_dim=4, bottleneck_dim=4, num_heads=2
+        )
+        fusion.eval()
+        fusion.capture_diagnostics = True
+        with torch.no_grad():
+            dump = build_state_dump(memory, cache, states, write_diags, fusion=fusion)
+        # The real read-attention map comes from the fusion side (hook H2):
+        # [decision, batch, consumer tokens, slots].
+        self.assertEqual(dump["read_attention"].shape, (3, 1, 32, 2))
+        np.testing.assert_allclose(
+            dump["read_attention"].sum(axis=-1), np.ones((3, 1, 32)), rtol=1e-5
+        )
+
+
+class DonorSelectionTest(unittest.TestCase):
+    """pick_donor_index prefers a different-task donor (plan T0.2 'shuffled')."""
+
+    def test_prefers_nearest_different_task_episode(self):
+        caches = [make_smoke_cache(episode, 2) for episode in range(4)]  # langs 0,1,0,1
+        self.assertEqual(pick_donor_index(caches, 0), 3)
+        self.assertEqual(pick_donor_index(caches, 1), 0)
+        self.assertEqual(pick_donor_index(caches, 2), 1)
+
+    def test_single_task_set_falls_back_to_adjacent_episode(self):
+        caches = [make_smoke_cache(episode, 2) for episode in range(3)]
+        for cache in caches:
+            cache["lang"] = "same task"
+        self.assertEqual(pick_donor_index(caches, 0), 2)
+        self.assertEqual(pick_donor_index(caches, 1), 0)
+
+    def test_single_episode_has_no_donor(self):
+        self.assertIsNone(pick_donor_index([make_smoke_cache(0, 2)], 0))
+
+
+class ReplayAllTest(unittest.TestCase):
+    @staticmethod
+    def _args(state_dump=None):
+        return argparse.Namespace(state_dump=state_dump, seed=7, noise_draws=2)
+
+    def test_cross_task_donor_feeds_shuffled_and_donor_episode_column(self):
+        memory, fusion, head = SmokeMemory(), SmokeFusion(), SmokeHead()
+        caches = [make_smoke_cache(episode, 3) for episode in range(3)]  # langs 0,1,0
+        records = _replay_all(
+            memory, fusion, head, caches,
+            [PlanRow("live"), PlanRow("shuffled")],
+            self._args(), torch.device("cpu"),
+        )
+        donors = {
+            record["episode"]: record["donor_episode"]
+            for record in records
+            if record["condition"] == "shuffled"
+        }
+        self.assertEqual(donors, {0: 1, 1: 0, 2: 1})
+        self.assertTrue(
+            all(r["donor_episode"] is None for r in records if r["condition"] == "live")
+        )
+
+    def test_state_dump_pins_and_restores_capture(self):
+        memory, fusion, head = SmokeMemory(), SmokeFusion(), SmokeHead()
+        caches = [make_smoke_cache(episode, 3) for episode in range(2)]
+        with tempfile.TemporaryDirectory() as tmp:
+            _replay_all(
+                memory, fusion, head, caches, [PlanRow("live")],
+                self._args(state_dump=tmp), torch.device("cpu"),
+            )
+            files = sorted(Path(tmp).glob("*.npz"))
+            self.assertEqual(len(files), 2)
+            with np.load(files[0]) as dump:
+                self.assertIn("read_attention", dump)
+        self.assertFalse(memory.capture_diagnostics)
+        self.assertFalse(getattr(fusion, "capture_diagnostics", True))
+
+    def test_no_dump_leaves_capture_untouched(self):
+        memory, fusion, head = SmokeMemory(), SmokeFusion(), SmokeHead()
+        caches = [make_smoke_cache(episode, 2) for episode in range(2)]
+        _replay_all(
+            memory, fusion, head, caches, [PlanRow("live")],
+            self._args(), torch.device("cpu"),
+        )
+        self.assertFalse(memory.capture_diagnostics)
+        self.assertFalse(getattr(fusion, "capture_diagnostics", False))
+        self.assertIsNone(memory.last_write_diagnostics)
+
+
+class WriteRecordsFallbackTest(unittest.TestCase):
+    def test_jsonl_fallback_emits_null_for_non_finite_floats(self):
+        records, *_ = _run([PlanRow("live"), PlanRow("bypass")], num_decisions=2)
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(sys.modules, {"pandas": None}):
+                path = write_records(records, Path(tmp) / "records")
+            self.assertEqual(path.suffixes, [".jsonl", ".gz"])
+            with gzip.open(path, "rt") as handle:
+                text = handle.read()
+        self.assertNotIn("NaN", text)
+
+        def _reject(constant):  # json.dumps' NaN/Infinity tokens are invalid JSON
+            raise AssertionError(f"invalid JSON constant {constant!r}")
+
+        rows = [json.loads(line, parse_constant=_reject) for line in text.splitlines()]
+        self.assertEqual(len(rows), len(records))
+        self.assertTrue(
+            all(row["working_norm"] is None for row in rows if row["condition"] == "bypass")
+        )
+        self.assertTrue(
+            all(row["working_norm"] is not None for row in rows if row["condition"] == "live")
+        )
 
 
 if __name__ == "__main__":

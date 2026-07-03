@@ -1,15 +1,21 @@
+import hashlib
 import json
+import os
+import tempfile
 import unittest
+from pathlib import Path
 
 import numpy as np
 
 from examples.LIBERO.blackout import (
     EPISODE_RECORD_KEYS,
+    checkpoint_sha,
     corrupt_views,
     decision_record,
     episode_record,
     in_blackout,
     memory_params_from_env,
+    resolve_memory_mode,
 )
 
 
@@ -91,6 +97,7 @@ class EpisodeRecordTest(unittest.TestCase):
             num_env_steps=np.int64(140),
             num_decisions=20,
             ckpt="ckpt/VLA-JEPA-memv1-live-step_34729.pt",
+            ckpt_sha="0123456789ab",
             git_sha="abc123",
         )
         kwargs.update(overrides)
@@ -129,6 +136,40 @@ class EpisodeRecordTest(unittest.TestCase):
     def test_decision_record_without_memory_extras(self):
         record = decision_record(episode_idx=0, d=0)
         self.assertEqual(record, {"episode_idx": 0, "d": 0, "blackout_active": False})
+
+
+class ResolveMemoryModeTest(unittest.TestCase):
+    def test_server_mode_is_authoritative(self):
+        self.assertEqual(resolve_memory_mode(None, "prior"), "prior")
+        self.assertEqual(resolve_memory_mode("prior", "prior"), "prior")
+
+    def test_env_is_fallback_for_memoryless_policies(self):
+        self.assertEqual(resolve_memory_mode("live", None), "live")
+        self.assertEqual(resolve_memory_mode(None, None), "live")
+
+    def test_zero_alias_agrees_with_prior(self):
+        self.assertEqual(resolve_memory_mode("zero", "prior"), "prior")
+
+    def test_disagreement_is_a_hard_error(self):
+        with self.assertRaises(RuntimeError):
+            resolve_memory_mode("prior", "live")
+        with self.assertRaises(RuntimeError):
+            resolve_memory_mode("live", "prior")
+
+
+class CheckpointShaTest(unittest.TestCase):
+    def test_hash_is_content_sha256_prefix_and_follows_symlinks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ckpt = Path(tmp) / "ckpt.pt"
+            ckpt.write_bytes(b"weights" * 1024)
+            expected = hashlib.sha256(ckpt.read_bytes()).hexdigest()[:12]
+            self.assertEqual(checkpoint_sha(ckpt), expected)
+            link = Path(tmp) / "alias.pt"
+            os.symlink(ckpt, link)
+            self.assertEqual(checkpoint_sha(link), expected)
+
+    def test_unreadable_checkpoint_yields_none(self):
+        self.assertIsNone(checkpoint_sha("/nonexistent/ckpt.pt"))
 
 
 if __name__ == "__main__":

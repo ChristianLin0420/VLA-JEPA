@@ -31,12 +31,14 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 from examples.LIBERO.blackout import (
     BLACKOUT_FILLS,
     BLACKOUT_VIEWS,
+    checkpoint_sha,
     corrupt_views,
     decision_record,
     episode_record,
     in_blackout,
     memory_params_from_env,
     read_git_sha,
+    resolve_memory_mode,
 )
 from examples.LIBERO.model2libero_interface import M1Inference
 
@@ -130,13 +132,19 @@ def eval_libero(args: Args) -> None:
     if args.blackout_views not in BLACKOUT_VIEWS:
         raise ValueError(f"blackout_views must be one of {BLACKOUT_VIEWS}: {args.blackout_views}")
 
-    # Self-describing episode records: the server owns the memory policy, so the
-    # mode/params are mirrored from the same env the server was launched with.
-    memory_mode = os.environ.get("MEMORY_MODE", "live")
+    # Self-describing episode records: the server owns the memory policy; the
+    # env-mirrored MEMORY_MODE is only a fallback/cross-check against the
+    # authoritative per-decision memory_extras["mode"] (resolve_memory_mode).
+    env_memory_mode = os.environ.get("MEMORY_MODE")
     memory_params = memory_params_from_env()
     git_sha = read_git_sha(pathlib.Path(__file__).resolve().parent)
+    ckpt_sha = checkpoint_sha(args.pretrained_path)
     episodes_path = pathlib.Path(args.video_out_path) / "episodes.jsonl"
     decisions_path = pathlib.Path(args.video_out_path) / "decisions.jsonl"
+    # Fresh record files per process: a rerun into the same output dir must not
+    # silently interleave with earlier records.
+    for record_path in (episodes_path, decisions_path):
+        record_path.write_text("")
 
     if args.task_suite_name == "libero_spatial":
         max_steps = 250  # longest training demo has 193 steps
@@ -177,8 +185,14 @@ def eval_libero(args: Args) -> None:
         for episode_idx in tqdm.tqdm(range(args.num_trials_per_task)):
             logging.info(f"\nTask: {task_description}")
 
-            # Reset environment
-            model.reset(task_description=task_description)  # Reset the client connection
+            # Reset environment. The structured episode_id/task_key keep parallel
+            # suite servers from colliding on state-dump keys and let foreign
+            # mode exclude same-task donors.
+            model.reset(
+                task_description=task_description,
+                episode_id=f"{args.task_suite_name}--{task_id}--ep{episode_idx}",
+                task_key=f"{args.task_suite_name}--{task_id}",
+            )
             episode_seed = model._episode_counter  # seed sent with the reset RPC
             env.reset()
 
@@ -195,6 +209,7 @@ def eval_libero(args: Args) -> None:
             step = 0
             num_decisions = 0
             decision_rows = []
+            first_memory_extras = None
             last_clean_img, last_clean_wrist = None, None
 
             # full_actions = np.load("./debug/action.npy")
@@ -275,6 +290,8 @@ def eval_libero(args: Args) -> None:
 
                 if step % model.action_chunk_size == 0:
                     num_decisions += 1
+                    if first_memory_extras is None:
+                        first_memory_extras = model.last_memory_extras
                     decision_rows.append(
                         decision_record(
                             episode_idx=episode_idx,
@@ -341,18 +358,20 @@ def eval_libero(args: Args) -> None:
                 f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)"
             )
 
+            server_extras = first_memory_extras or {}
             record = episode_record(
                 suite=args.task_suite_name,
                 task_id=task_id,
                 task_description=task_description,
                 episode_idx=episode_idx,
-                memory_mode=memory_mode,
+                memory_mode=resolve_memory_mode(env_memory_mode, server_extras.get("mode")),
                 memory_params=memory_params,
                 episode_seed=episode_seed,
                 success=done,
                 num_env_steps=len(full_actions),
                 num_decisions=num_decisions,
                 ckpt=args.pretrained_path,
+                ckpt_sha=ckpt_sha,
                 git_sha=git_sha,
                 extras={
                     "blackout": {
@@ -361,7 +380,10 @@ def eval_libero(args: Args) -> None:
                         "fill": args.blackout_fill,
                         "views": args.blackout_views,
                         "suppress_write": args.suppress_write_during_blackout,
-                    }
+                    },
+                    # Donor provenance (foreign mode): donor episode of the
+                    # first decision; decisions.jsonl carries the full stream.
+                    "donor_source": server_extras.get("donor_episode"),
                 },
             )
             with open(episodes_path, "a") as f:

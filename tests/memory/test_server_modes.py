@@ -96,14 +96,28 @@ class _StatelessPolicy(nn.Module):
         return {"normalized_actions": np.zeros((len(batch_images), 1, 1), dtype=np.float32)}
 
 
-def _reset(server, session, seed=7, episode_id="episode"):
+def _reset(server, session, seed=7, episode_id="episode", task_key=None):
+    payload = {"episode_id": episode_id, "episode_seed": seed}
+    if task_key is not None:
+        payload["task_key"] = task_key
     return server._route_message(
-        {
-            "type": "reset",
-            "request_id": "reset",
-            "payload": {"episode_id": episode_id, "episode_seed": seed},
-        },
+        {"type": "reset", "request_id": "reset", "payload": payload},
         session=session,
+    )
+
+
+def _save_bank_state(directory: Path, index: int, fill: float) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    state = _make_state(fill)
+    torch.save(
+        {
+            "working": state.working,
+            "episodic": None,
+            "steps": state.steps,
+            "valid": state.valid,
+            "decision_index": index,
+        },
+        directory / f"d{index}.pt",
     )
 
 
@@ -181,12 +195,19 @@ class DecisionPlanTest(unittest.TestCase):
                     (override, False, False),
                 )
 
-    def test_permute_schedule(self):
-        for plan in _schedule(MemoryServerConfig(mode="permute")):
+    def test_permute_once_schedule(self):
+        plans = _schedule(MemoryServerConfig(mode="permute_once", permute_at=3))
+        for counter, plan in enumerate(plans):
+            expected = "permute" if counter == 3 else None
             self.assertEqual(
                 (plan.memory_state_override, plan.update_memory, plan.memory_bypass),
-                ("permute", True, False),
+                (expected, True, False),
             )
+
+    def test_permute_once_defaults_permute_at(self):
+        self.assertEqual(MemoryServerConfig(mode="permute_once").permute_at, 4)
+        with self.assertRaises(ValueError):
+            MemoryServerConfig(mode="permute_once", permute_at=0)
 
     def test_noreset_schedule_keeps_state_across_resets(self):
         for plan in _schedule(MemoryServerConfig(mode="noreset")):
@@ -338,10 +359,10 @@ class ServerDispatchTest(unittest.TestCase):
             config = MemoryServerConfig(mode="live", state_dump_dir=tmp)
             server = WebsocketPolicyServer(policy, memory_config=config)
             session = _ConnectionSession()
-            _reset(server, session, episode_id="libero_10-task3-ep0")
+            _reset(server, session, episode_id="libero_10--3--ep0")
             for _ in range(3):
                 self.assertTrue(_infer(server, session)["ok"])
-            episode_dir = Path(tmp) / "libero_10-task3-ep0"
+            episode_dir = Path(tmp) / "libero_10--3--ep0"
             self.assertEqual(
                 sorted(p.name for p in episode_dir.iterdir()), ["d0.pt", "d1.pt", "d2.pt"]
             )
@@ -351,13 +372,143 @@ class ServerDispatchTest(unittest.TestCase):
             donor_server = WebsocketPolicyServer(donor_policy, memory_config=donor_config)
             donor_session = _ConnectionSession()
             _reset(donor_server, donor_session)
-            for _ in range(4):
-                self.assertTrue(_infer(donor_server, donor_session)["ok"])
-            # decision-index-matched donor states, clamped at the donor's last decision
-            injected = [float(call["memory_state"].working[0, 0, 0]) for call in donor_policy.calls]
+            responses = [_infer(donor_server, donor_session) for _ in range(5)]
+            self.assertTrue(all(out["ok"] for out in responses))
+            # Maturity convention: decision d injects donor file d<d-1> (the
+            # post-write state of decision d-1, i.e. what a live read at d has
+            # absorbed), clamped to the donor's last file; d=0 reads the prior.
+            self.assertIsNone(donor_policy.calls[0]["memory_state"])
+            injected = [
+                float(call["memory_state"].working[0, 0, 0])
+                for call in donor_policy.calls[1:]
+            ]
             self.assertEqual(injected, [1.0, 2.0, 3.0, 3.0])
             self.assertFalse(any(call["update_memory"] for call in donor_policy.calls))
             self.assertIsNone(donor_session.memory_state)
+            extras = [out["data"]["memory_extras"] for out in responses]
+            self.assertEqual(
+                [e["donor_episode"] for e in extras], ["libero_10--3--ep0"] * 5
+            )
+            self.assertEqual([e["donor_decision"] for e in extras], [None, 0, 1, 2, 2])
+
+    def test_foreign_excludes_same_task_donors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _save_bank_state(Path(tmp) / "libero_10--3--ep0", 0, 1.0)
+            _save_bank_state(Path(tmp) / "libero_10--5--ep0", 0, 5.0)
+            policy = _RecordingPolicy()
+            server = WebsocketPolicyServer(
+                policy, memory_config=MemoryServerConfig(mode="foreign", donor_dir=tmp)
+            )
+            session = _ConnectionSession()
+            # seed 0 would pick the first (same-task) episode without exclusion;
+            # task_key is derived from the structured episode_id.
+            _reset(server, session, seed=0, episode_id="libero_10--3--ep9")
+            _infer(server, session)
+            out = _infer(server, session)
+            self.assertEqual(float(policy.calls[1]["memory_state"].working[0, 0, 0]), 5.0)
+            self.assertEqual(
+                out["data"]["memory_extras"]["donor_episode"], "libero_10--5--ep0"
+            )
+            # An explicit task_key in the reset payload wins over parsing.
+            explicit = _ConnectionSession()
+            _reset(server, explicit, seed=0, episode_id="opaque", task_key="libero_10--5")
+            _infer(server, explicit)
+            _infer(server, explicit)
+            self.assertEqual(
+                float(policy.calls[-1]["memory_state"].working[0, 0, 0]), 1.0
+            )
+            # A bank whose only episodes share the recipient's task cannot serve.
+            solo = _ConnectionSession()
+            rejected = _reset(server, solo, seed=0, episode_id="x", task_key=None)
+            self.assertTrue(rejected["ok"])  # no exclusion without a task key
+            single_task = WebsocketPolicyServer(
+                _RecordingPolicy(),
+                memory_config=MemoryServerConfig(
+                    mode="foreign", donor_dir=str(Path(tmp) / "libero_10--3--ep0")
+                ),
+            )
+            failed = _reset(single_task, _ConnectionSession(), episode_id="libero_10--3--ep1")
+            self.assertFalse(failed["ok"])
+            self.assertIn("cross-task", failed["error"]["message"])
+
+    def test_foreign_bank_without_task_metadata_warns_and_skips_exclusion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _save_bank_state(Path(tmp) / "libero-1", 0, 1.0)
+            _save_bank_state(Path(tmp) / "libero-2", 0, 2.0)
+            policy = _RecordingPolicy()
+            with self.assertLogs(level="WARNING") as logs:
+                server = WebsocketPolicyServer(
+                    policy, memory_config=MemoryServerConfig(mode="foreign", donor_dir=tmp)
+                )
+            self.assertTrue(any("task metadata" in line for line in logs.output))
+            session = _ConnectionSession()
+            _reset(server, session, seed=0, episode_id="libero_10--3--ep0")
+            _infer(server, session)
+            _infer(server, session)
+            # no exclusion possible: seed 0 picks the first episode
+            self.assertEqual(float(policy.calls[1]["memory_state"].working[0, 0, 0]), 1.0)
+
+    def test_state_dump_only_on_committed_writes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            policy = _RecordingPolicy()
+            config = MemoryServerConfig(mode="write_every", write_every=2, state_dump_dir=tmp)
+            server = WebsocketPolicyServer(policy, memory_config=config)
+            session = _ConnectionSession()
+            _reset(server, session, episode_id="libero_10--0--ep0")
+            for _ in range(4):
+                self.assertTrue(_infer(server, session)["ok"])
+            episode_dir = Path(tmp) / "libero_10--0--ep0"
+            # d<i> = state after decision i's committed write; skipped decisions dump nothing
+            self.assertEqual(sorted(p.name for p in episode_dir.iterdir()), ["d0.pt", "d2.pt"])
+
+            live = WebsocketPolicyServer(
+                _RecordingPolicy(),
+                memory_config=MemoryServerConfig(mode="live", state_dump_dir=tmp),
+            )
+            suppressed = _ConnectionSession()
+            _reset(live, suppressed, episode_id="libero_10--0--ep1")
+            self.assertTrue(_infer(live, suppressed, suppress_write=True)["ok"])
+            self.assertTrue(_infer(live, suppressed)["ok"])
+            episode_dir = Path(tmp) / "libero_10--0--ep1"
+            self.assertEqual(sorted(p.name for p in episode_dir.iterdir()), ["d1.pt"])
+
+    def test_non_live_config_requires_memory_policy(self):
+        for config in (
+            MemoryServerConfig(mode="prior"),
+            MemoryServerConfig(mode="live", counterfactual=True),
+            MemoryServerConfig(mode="live", state_dump_dir="/tmp/dumps"),
+            MemoryServerConfig(mode="live", donor_dir="/tmp/donors"),
+        ):
+            with self.assertRaises(RuntimeError):
+                WebsocketPolicyServer(_StatelessPolicy(), memory_config=config)
+        WebsocketPolicyServer(_StatelessPolicy())  # plain live serving stays legal
+
+    def test_counterfactual_noise_matches_policy_param_dtype(self):
+        policy = _RecordingPolicy().to(torch.bfloat16)
+        config = MemoryServerConfig(mode="live", counterfactual=True)
+        server = WebsocketPolicyServer(policy, memory_config=config)
+        session = _ConnectionSession()
+        _reset(server, session)
+        self.assertTrue(_infer(server, session)["ok"])
+        self.assertEqual(policy.calls[0]["initial_noise"].dtype, torch.bfloat16)
+
+    def test_legacy_flat_reset_warns_once_per_session_for_non_live_modes(self):
+        server = WebsocketPolicyServer(
+            _RecordingPolicy(), memory_config=MemoryServerConfig(mode="prior")
+        )
+        session = _ConnectionSession()
+        with self.assertLogs(level="WARNING") as logs:
+            self.assertTrue(
+                server._route_message({"reset": True, "instruction": "legacy"}, session=session)["ok"]
+            )
+        self.assertTrue(any("legacy flat reset" in line for line in logs.output))
+        with self.assertNoLogs(level="WARNING"):
+            server._route_message({"reset": True, "instruction": "legacy"}, session=session)
+        live = WebsocketPolicyServer(_RecordingPolicy())
+        with self.assertNoLogs(level="WARNING"):
+            live._route_message(
+                {"reset": True, "instruction": "legacy"}, session=_ConnectionSession()
+            )
 
     def test_noisematch_state_is_seeded_and_moment_matched(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -401,25 +552,34 @@ class ServerDispatchTest(unittest.TestCase):
                 torch.equal(policy.calls[-1]["memory_state"].working, first.working)
             )
 
-    def test_permute_applies_fixed_slot_permutation_to_live_state(self):
+    def test_permute_once_is_a_derangement(self):
         state = _make_state(0.0, slots=8, dim=2)
         state.working.copy_(torch.arange(8, dtype=torch.float32)[None, :, None].expand(1, 8, 2))
         permuted = _permute_slots(state)
         order = permuted.working[0, :, 0]
-        self.assertFalse(torch.equal(order, state.working[0, :, 0]))
+        # No slot keeps its index, content multiset preserved, deterministic.
+        self.assertFalse(bool((order == state.working[0, :, 0]).any()))
         torch.testing.assert_close(order.sort().values, state.working[0, :, 0])
         torch.testing.assert_close(_permute_slots(state).working, permuted.working)
 
+    def test_permute_once_enters_committed_chain_exactly_once(self):
         policy = _RecordingPolicy()
-        server = WebsocketPolicyServer(policy, memory_config=MemoryServerConfig(mode="permute"))
+        server = WebsocketPolicyServer(
+            policy, memory_config=MemoryServerConfig(mode="permute_once", permute_at=1)
+        )
         session = _ConnectionSession()
         _reset(server, session)
         _infer(server, session)
-        self.assertIsNone(policy.calls[0]["memory_state"])  # nothing to permute yet
+        self.assertIsNone(policy.calls[0]["memory_state"])  # live before permute_at
         committed = session.memory_state
-        _infer(server, session)
+        _infer(server, session)  # decision 1: rolled state read AND written
         torch.testing.assert_close(
             policy.calls[1]["memory_state"].working, _permute_slots(committed).working
+        )
+        after_permute = session.memory_state
+        _infer(server, session)  # decision 2: live again, no second roll
+        torch.testing.assert_close(
+            policy.calls[2]["memory_state"].working, after_permute.working
         )
 
     def test_noreset_preserves_state_across_resets(self):

@@ -58,7 +58,11 @@ class RecurrentMemory(nn.Module):
 
         # Diagnostics side-channel (mirrors the framework's `capture_jepa`
         # pattern): read()/write() populate the attributes below only while
-        # `capture_diagnostics` is set, and clear them otherwise.
+        # `capture_diagnostics` is set, and clear them otherwise.  Caveat:
+        # capture toggles need_weights on the write attention, which takes the
+        # MHA off the SDPA fastpath, so capture-on vs capture-off write
+        # numerics can differ at ulp level; paired comparisons must hold the
+        # capture context fixed.
         self.capture_diagnostics = False
         self.last_read_diagnostics = None
         self.last_write_diagnostics = None

@@ -7,15 +7,21 @@ N pre-sampled ``initial_noise`` draws that are shared bit-identically across all
 conditions.  Emits one record per (episode, decision, condition, J, lambda) with
 the pinned column schema
 
-    {dataset, suite, episode, decision, condition, J, lam, mse, tf_loss, working_norm}
+    {dataset, suite, episode, decision, condition, J, lam, mse, tf_loss,
+     working_norm, donor_episode}
 
 as parquet when pandas/pyarrow import, else gzipped JSONL.  ``J = -1`` and
-``lam = 1.0`` mean "not applicable".  Conditions:
+``lam = 1.0`` mean "not applicable"; ``donor_episode`` is null except on
+``shuffled`` rows.  Scoring feeds the action head ``state=None`` (no proprio),
+which matches WITH_STATE=false serving — the convention for all memv1 evals.
+Conditions:
 
     live            state after all same-episode writes before the decision
     bypass          exact fusion skip (no read, no injection)
     prior           learned initial slots, never written (zero-as-served)
-    shuffled        foreign-episode state at matched decision index
+    shuffled        different-task episode's state at matched decision index
+                    (falls back to the adjacent episode, loudly, when the
+                    cache set has no other task)
     frozen_after=J  writes stop after the first J decisions
     burnin_<order>  fresh J-decision write window per decision; order in
                     {forward, shuffled, reversed} (T0.2b)
@@ -33,6 +39,7 @@ import gzip
 import hashlib
 import inspect
 import json
+import math
 from contextlib import nullcontext
 from pathlib import Path
 from typing import List, NamedTuple, Optional
@@ -44,7 +51,7 @@ from starVLA.model.modules.memory.state import MemoryRead, MemoryState
 
 RECORD_COLUMNS = (
     "dataset", "suite", "episode", "decision",
-    "condition", "J", "lam", "mse", "tf_loss", "working_norm",
+    "condition", "J", "lam", "mse", "tf_loss", "working_norm", "donor_episode",
 )
 BASE_CONDITIONS = ("live", "bypass", "prior", "shuffled")
 BURN_IN_ORDERS = ("forward", "shuffled", "reversed")
@@ -119,21 +126,26 @@ def build_plan(conditions: str, burnin: str, burnin_orders: str, lam: str, lam_c
 def teacher_forced_states(memory, action_tokens: torch.Tensor, *, capture: bool = False):
     """Full write trajectory: ``states[d]`` is the state read at decision ``d``."""
 
+    previous_capture = getattr(memory, "capture_diagnostics", False)
     if capture:
         memory.capture_diagnostics = True
     state = memory.init_state(1, device=action_tokens.device)
     states, write_diags = [state], []
-    for d in range(action_tokens.shape[0]):
-        state = memory.write(action_tokens[d : d + 1], state)
-        states.append(state)
+    try:
+        for d in range(action_tokens.shape[0]):
+            state = memory.write(action_tokens[d : d + 1], state)
+            states.append(state)
+            if capture:
+                diag = getattr(memory, "last_write_diagnostics", None)
+                if diag is None:
+                    raise RuntimeError(
+                        "capture_diagnostics set but write() left no last_write_diagnostics; "
+                        "land hook H3 before --state-dump runs"
+                    )
+                write_diags.append(diag)
+    finally:
         if capture:
-            diag = getattr(memory, "last_write_diagnostics", None)
-            if diag is None:
-                raise RuntimeError(
-                    "capture_diagnostics set but write() left no last_write_diagnostics; "
-                    "land hook H3 before --state-dump runs"
-                )
-            write_diags.append(diag)
+            memory.capture_diagnostics = previous_capture
     return states, write_diags
 
 
@@ -158,6 +170,13 @@ def condition_state(
     if row.condition == "frozen_after":
         return states[min(decision, row.J)]
     if row.condition == "shuffled":
+        # Donor maturity convention (shared with the online foreign mode): the
+        # live read at decision d sees a state that has absorbed d writes, and
+        # ``donor_states[d]`` is exactly that pre-write read state, so index d
+        # is maturity-matched (including the shared learned prior at d=0).
+        # Online donor dump files are post-write (d<i>.pt = i+1 writes), so
+        # the server injects d<d-1> — None/prior at d=0 — to land on the same
+        # d-writes convention.
         return donor_states[min(decision, len(donor_states) - 1)]
     if row.condition.startswith("burnin_"):
         order = row.condition[len("burnin_"):]
@@ -212,6 +231,7 @@ def replay_episode(
     episode_seed: int,
     noise_draws: int = 8,
     donor_states: Optional[List[MemoryState]] = None,
+    donor_episode: Optional[int] = None,
 ) -> List[dict]:
     """Score every (decision, plan row) of one episode with shared noise draws."""
 
@@ -257,6 +277,7 @@ def replay_episode(
                 fused = fused.expand(noise_draws, -1, -1)
                 gt = gt_actions[decision]
                 with autocast:
+                    # state=None matches WITH_STATE=false serving (all memv1 evals).
                     pred = head.predict_action(fused, None, initial_noise=noise[decision])
                     tf_loss = teacher_forced_flow_loss(
                         head,
@@ -278,6 +299,7 @@ def replay_episode(
                         "mse": mse,
                         "tf_loss": tf_loss,
                         "working_norm": working_norm,
+                        "donor_episode": donor_episode if row.condition == "shuffled" else None,
                     }
                 )
         finally:
@@ -286,7 +308,9 @@ def replay_episode(
     return records
 
 
-def build_state_dump(memory, cache: dict, states: List[MemoryState], write_diags: List[dict]) -> dict:
+def build_state_dump(
+    memory, cache: dict, states: List[MemoryState], write_diags: List[dict], fusion=None
+) -> dict:
     """Per-episode npz payload for the probe frontend (plan T0.6)."""
 
     num_decisions = cache["action_tokens"].shape[0]
@@ -311,14 +335,24 @@ def build_state_dump(memory, cache: dict, states: List[MemoryState], write_diags
         )
     read_attentions = []
     for d in range(num_decisions):
-        memory.read(cache["action_tokens"][d : d + 1], states[d])
-        read_diag = getattr(memory, "last_read_diagnostics", None)
-        # RecurrentMemory keeps the key with a None value (the read itself is
-        # attention-free); dump the map only when a module actually produces one.
-        if read_diag is None or read_diag.get("read_attention") is None:
+        read = memory.read(cache["action_tokens"][d : d + 1], states[d])
+        read_attention = None
+        if fusion is not None and getattr(fusion, "capture_diagnostics", False):
+            # The policy-side read-attention map lives on the fusion module
+            # (RecurrentMemory.read is attention-free): re-run the fused read
+            # under capture and collect its diagnostics (plan T0.6d, hook H3).
+            fusion(cache["embodied_action_tokens"][d : d + 1], read.tokens)
+            fusion_diag = getattr(fusion, "last_fusion_diagnostics", None) or {}
+            read_attention = fusion_diag.get("read_attention")
+        if read_attention is None:
+            # Stub modules may report the map from read() itself; RecurrentMemory
+            # keeps the key with a None value, which ends the collection.
+            read_diag = getattr(memory, "last_read_diagnostics", None) or {}
+            read_attention = read_diag.get("read_attention")
+        if read_attention is None:
             break
         read_attentions.append(
-            np.asarray(torch.as_tensor(read_diag["read_attention"]).to(torch.float32).cpu())
+            np.asarray(torch.as_tensor(read_attention).to(torch.float32).cpu())
         )
     if len(read_attentions) == num_decisions:
         dump["read_attention"] = np.stack(read_attentions)
@@ -336,7 +370,13 @@ def write_records(records: List[dict], out_stem: Path) -> Path:
         path = out_stem.with_suffix(".jsonl.gz")
         with gzip.open(path, "wt") as handle:
             for record in records:
-                handle.write(json.dumps(record) + "\n")
+                # json.dumps would emit the invalid token NaN for non-finite
+                # floats (bypass rows carry working_norm = nan); emit null.
+                safe = {
+                    key: None if isinstance(value, float) and not math.isfinite(value) else value
+                    for key, value in record.items()
+                }
+                handle.write(json.dumps(safe) + "\n")
     return path
 
 
@@ -481,43 +521,92 @@ def build_argparser() -> argparse.ArgumentParser:
     return parser
 
 
+def pick_donor_index(caches: List[dict], index: int) -> Optional[int]:
+    """Donor episode for ``shuffled``: nearest cache with a different task.
+
+    Falls back to the adjacent episode — loudly — when every other cache
+    shares the recipient's instruction (e.g. a single-task cache set or caches
+    without task metadata).  Returns None when there is no other episode.
+    """
+
+    if len(caches) < 2:
+        return None
+    lang = caches[index].get("lang")
+    for offset in range(1, len(caches)):
+        donor = (index - offset) % len(caches)
+        if lang is not None and caches[donor].get("lang") != lang:
+            return donor
+    donor = (index - 1) % len(caches)
+    print(
+        f"[shuffled] WARNING: no different-task donor for episode "
+        f"{caches[index]['episode']} ({lang!r}); falling back to adjacent "
+        f"episode {caches[donor]['episode']} (same task)"
+    )
+    return donor
+
+
 def _replay_all(memory, fusion, head, caches, plan, args, device) -> List[dict]:
     capture = args.state_dump is not None
     dump_dir = Path(args.state_dump) if capture else None
     if dump_dir is not None:
         dump_dir.mkdir(parents=True, exist_ok=True)
 
-    trajectories, diagnostics = [], []
-    for cache in caches:
-        cache["action_tokens"] = cache["action_tokens"].to(device)
-        cache["embodied_action_tokens"] = cache["embodied_action_tokens"].to(device)
-        cache["gt_actions"] = cache["gt_actions"].to(device)
-        states, write_diags = teacher_forced_states(
-            memory, cache["action_tokens"], capture=capture
-        )
-        trajectories.append(states)
-        diagnostics.append(write_diags)
+    # State dumps need the H3 write capture and the fusion-side read-attention
+    # map, so pin both capture flags for the whole run (every write shares one
+    # capture context; see the ulp caveat on RecurrentMemory) and restore after.
+    if capture:
+        previous_memory_capture = getattr(memory, "capture_diagnostics", False)
+        previous_fusion_capture = getattr(fusion, "capture_diagnostics", False)
+        memory.capture_diagnostics = True
+        fusion.capture_diagnostics = True
+    try:
+        # State trajectories are small ([D+1, 8, 512] fp32); the token caches
+        # are not (~23 MB per 100-decision episode), so caches stay on the CPU
+        # and stream to the device one episode at a time (plan T0.2d scale).
+        trajectories, diagnostics = [], []
+        for cache in caches:
+            action_tokens = cache["action_tokens"].to(device)
+            states, write_diags = teacher_forced_states(memory, action_tokens, capture=capture)
+            trajectories.append(states)
+            diagnostics.append(write_diags)
+            del action_tokens
 
-    records = []
-    for index, cache in enumerate(caches):
-        donor_states = trajectories[(index - 1) % len(caches)] if len(caches) > 1 else None
-        episode_seed = stable_seed(
-            "replay-noise-v1", args.seed, cache["suite"], cache["dataset"], cache["episode"]
-        )
-        records.extend(
-            replay_episode(
-                memory, fusion, head, cache, plan, trajectories[index],
-                episode_seed=episode_seed,
-                noise_draws=args.noise_draws,
-                donor_states=donor_states,
+        records = []
+        for index, cache in enumerate(caches):
+            donor_index = pick_donor_index(caches, index)
+            episode = dict(
+                cache,
+                action_tokens=cache["action_tokens"].to(device),
+                embodied_action_tokens=cache["embodied_action_tokens"].to(device),
+                gt_actions=cache["gt_actions"].to(device),
             )
-        )
-        if dump_dir is not None:
-            dump = build_state_dump(memory, cache, trajectories[index], diagnostics[index])
-            np.savez_compressed(
-                dump_dir / f"{cache['suite']}__{cache['dataset']}__ep{int(cache['episode']):06d}.npz",
-                **dump,
+            episode_seed = stable_seed(
+                "replay-noise-v1", args.seed, cache["suite"], cache["dataset"], cache["episode"]
             )
+            records.extend(
+                replay_episode(
+                    memory, fusion, head, episode, plan, trajectories[index],
+                    episode_seed=episode_seed,
+                    noise_draws=args.noise_draws,
+                    donor_states=trajectories[donor_index] if donor_index is not None else None,
+                    donor_episode=(
+                        int(caches[donor_index]["episode"]) if donor_index is not None else None
+                    ),
+                )
+            )
+            if dump_dir is not None:
+                dump = build_state_dump(
+                    memory, episode, trajectories[index], diagnostics[index], fusion=fusion
+                )
+                np.savez_compressed(
+                    dump_dir / f"{cache['suite']}__{cache['dataset']}__ep{int(cache['episode']):06d}.npz",
+                    **dump,
+                )
+            del episode  # free the device copies before the next episode
+    finally:
+        if capture:
+            memory.capture_diagnostics = previous_memory_capture
+            fusion.capture_diagnostics = previous_fusion_capture
     return records
 
 

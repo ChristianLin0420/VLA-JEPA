@@ -40,8 +40,9 @@ UNNORM_KEY="${UNNORM_KEY:-franka}"
   echo "[fatal] unsafe OUT_PREFIX: $OUT_PREFIX" >&2
   exit 2
 }
-[[ "$MEMORY_MODE" == "live" || "$MEMORY_MODE" == "zero" ]] || {
-  echo "[fatal] MEMORY_MODE must be live or zero: $MEMORY_MODE" >&2
+# Standing-pipeline modes; "zero" passes through (the server aliases it to prior).
+[[ "$MEMORY_MODE" =~ ^(live|zero|prior|bypass)$ ]] || {
+  echo "[fatal] MEMORY_MODE must be live|zero|prior|bypass: $MEMORY_MODE" >&2
   exit 2
 }
 [[ "$WITH_STATE" == "true" || "$WITH_STATE" == "false" ]] || {

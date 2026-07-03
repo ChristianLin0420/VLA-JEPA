@@ -43,7 +43,13 @@ class ResidualMemoryFusion(nn.Module):
 
         # Runtime knobs and diagnostics (plain attributes, never checkpointed):
         # `residual_scale` rescales the gated residual (λ dose-response) and
-        # `capture_diagnostics` additionally records the read-attention map.
+        # `capture_diagnostics` gates ALL diagnostic work — injection_ratio
+        # (a GPU->host sync) and the read-attention map.  When it is False the
+        # default training path performs no diagnostic arithmetic and
+        # `last_fusion_diagnostics` is None.  Caveat: need_weights=True takes
+        # the MHA off the SDPA fastpath, so capture-on vs capture-off outputs
+        # can differ at ulp level; hold the capture context fixed across any
+        # paired comparison.
         self.residual_scale = 1.0
         self.capture_diagnostics = False
         self.last_fusion_diagnostics = None
@@ -86,12 +92,12 @@ class ResidualMemoryFusion(nn.Module):
             raise ValueError("consumer_tokens and memory_tokens must be on the same device")
         if not consumer_tokens.is_floating_point() or not memory_tokens.is_floating_point():
             raise TypeError("consumer_tokens and memory_tokens must be floating point")
+        need_weights = bool(self.capture_diagnostics)
         if bypass:
-            self.last_fusion_diagnostics = {"injection_ratio": 0.0}
+            self.last_fusion_diagnostics = {"injection_ratio": 0.0} if need_weights else None
             return consumer_tokens
 
         original_dtype = consumer_tokens.dtype
-        need_weights = bool(self.capture_diagnostics)
         with torch.autocast(device_type=consumer_tokens.device.type, enabled=False):
             consumer = consumer_tokens.to(dtype=torch.float32)
             memory = memory_tokens.to(dtype=torch.float32)
@@ -106,9 +112,11 @@ class ResidualMemoryFusion(nn.Module):
             residual = self.output_projection(attended)
             gated_residual = torch.tanh(self.gate) * self.residual_scale * residual
 
-        self.last_fusion_diagnostics = {
-            "injection_ratio": float(gated_residual.norm() / consumer.norm())
-        }
         if need_weights:
-            self.last_fusion_diagnostics["read_attention"] = read_attention.detach()
+            self.last_fusion_diagnostics = {
+                "injection_ratio": float(gated_residual.norm() / consumer.norm()),
+                "read_attention": read_attention.detach(),
+            }
+        else:
+            self.last_fusion_diagnostics = None
         return consumer_tokens + gated_residual.to(dtype=original_dtype)

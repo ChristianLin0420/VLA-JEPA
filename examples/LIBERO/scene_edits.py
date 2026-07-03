@@ -26,8 +26,9 @@ def displace_object(env, object_name: str, dxyz, seed: int | None = None):
     combined with ``seed`` to draw a reproducible random direction in the
     xy-plane (the T2.1 "seeded 4-6 cm offset"). Call at a decision boundary,
     before the next observation is rendered. Returns ``(old_pos, new_pos)``.
-    Guards assert the qpos edit persisted through ``sim.forward()`` and that
-    ``env.check_success()`` still evaluates to a bool afterwards.
+    Guards raise RuntimeError (asserts vanish under ``-O``) if the qpos edit
+    did not persist through ``sim.forward()`` or ``env.check_success()`` stops
+    returning a bool afterwards.
     """
     dxyz = np.asarray(dxyz, dtype=np.float64)
     if dxyz.ndim == 0:
@@ -48,11 +49,13 @@ def displace_object(env, object_name: str, dxyz, seed: int | None = None):
     sim.forward()
 
     new_pos = np.array(sim.data.qpos[start : start + 3])
-    assert np.allclose(new_pos, old_pos + dxyz), "qpos edit did not persist through sim.forward()"
+    if not np.allclose(new_pos, old_pos + dxyz):
+        raise RuntimeError("qpos edit did not persist through sim.forward()")
     success = env.check_success()
-    assert isinstance(success, (bool, np.bool_)), (
-        f"env.check_success() no longer returns a bool after the edit: {success!r}"
-    )
+    if not isinstance(success, (bool, np.bool_)):
+        raise RuntimeError(
+            f"env.check_success() no longer returns a bool after the edit: {success!r}"
+        )
     return old_pos, new_pos
 
 

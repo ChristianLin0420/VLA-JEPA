@@ -49,6 +49,7 @@ class ResidualScaleTest(unittest.TestCase):
         self.assertTrue(torch.equal(scaled, bypassed))
 
     def test_injection_ratio_is_finite_float_and_linear_in_scale(self):
+        self.fusion.capture_diagnostics = True
         ratios = {}
         for scale in (0.5, 1.0, 2.0):
             self.fusion.residual_scale = scale
@@ -62,17 +63,24 @@ class ResidualScaleTest(unittest.TestCase):
         self.assertAlmostEqual(ratios[1.0] / ratios[0.5], 2.0, places=5)
         self.assertAlmostEqual(ratios[2.0] / ratios[1.0], 2.0, places=5)
 
-    def test_bypass_reports_zero_injection_ratio(self):
+    def test_capture_off_leaves_diagnostics_none(self):
+        # The default training path performs no diagnostic arithmetic: both
+        # the fused and the bypass forward must leave the side-channel empty.
+        self.assertFalse(self.fusion.capture_diagnostics)
+        with torch.no_grad():
+            self.fusion(self.consumer, self.memory)
+        self.assertIsNone(self.fusion.last_fusion_diagnostics)
+        with torch.no_grad():
+            self.fusion(self.consumer, self.memory, bypass=True)
+        self.assertIsNone(self.fusion.last_fusion_diagnostics)
+
+    def test_bypass_reports_zero_injection_ratio_under_capture(self):
+        self.fusion.capture_diagnostics = True
         with torch.no_grad():
             self.fusion(self.consumer, self.memory, bypass=True)
         self.assertEqual(self.fusion.last_fusion_diagnostics, {"injection_ratio": 0.0})
 
     def test_capture_records_read_attention_map(self):
-        self.assertFalse(self.fusion.capture_diagnostics)
-        with torch.no_grad():
-            self.fusion(self.consumer, self.memory)
-        self.assertNotIn("read_attention", self.fusion.last_fusion_diagnostics)
-
         self.fusion.capture_diagnostics = True
         with torch.no_grad():
             self.fusion(self.consumer, self.memory)

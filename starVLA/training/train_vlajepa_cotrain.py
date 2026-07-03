@@ -422,9 +422,13 @@ class VLAMTrainer(TrainerUtils):
             self.optimizer.zero_grad()
             if self._unwrapped is not None:
                 self._unwrapped.capture_jepa = bool(getattr(self, "_capture", False))
-                memory_module = getattr(self._unwrapped, "memory_module", None)
-                if memory_module is not None:
-                    memory_module.capture_diagnostics = bool(getattr(self, "_capture", False))
+                # Toggle both memory capture flags together so fusion's
+                # injection_ratio (a GPU sync) is only computed on capture
+                # steps; memory/injection_ratio is therefore cadence-sampled.
+                for module_name in ("memory_module", "policy_memory_fusion"):
+                    module = getattr(self._unwrapped, module_name, None)
+                    if module is not None:
+                        module.capture_diagnostics = bool(getattr(self, "_capture", False))
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 output_dict = self.model(batch_vla)  # __call__ -> DDP grad sync hooks
                 total_loss = sum(output_dict.values())

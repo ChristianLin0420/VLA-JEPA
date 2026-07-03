@@ -5,6 +5,7 @@ record construction. Deliberately simulator-free so unit tests run without
 LIBERO installed.
 """
 
+import hashlib
 import os
 import subprocess
 
@@ -37,6 +38,7 @@ EPISODE_RECORD_KEYS = (
     "num_env_steps",
     "num_decisions",
     "ckpt",
+    "ckpt_sha",
     "git_sha",
 )
 
@@ -83,6 +85,46 @@ def memory_params_from_env(env=None) -> dict:
     return {key: env[key] for key in MEMORY_PARAM_ENV_KEYS if key in env}
 
 
+def resolve_memory_mode(env_mode: str | None, server_mode: str | None) -> str:
+    """Authoritative memory_mode for episodes.jsonl.
+
+    The server owns the memory policy, so its per-decision
+    ``memory_extras["mode"]`` wins when present; a set-but-disagreeing client
+    env MEMORY_MODE means a mislabeled experiment and is a hard error
+    ('zero' is the documented alias of 'prior'). The env value (default
+    'live') remains the fallback for memory-less policies that report no
+    memory_extras.
+    """
+    if server_mode is None:
+        return env_mode or "live"
+    if env_mode is not None:
+        normalized = "prior" if env_mode == "zero" else env_mode
+        if normalized != server_mode:
+            raise RuntimeError(
+                f"memory_mode mismatch: client env MEMORY_MODE={env_mode!r} but the "
+                f"server reports {server_mode!r}; refusing to write a mislabeled "
+                "episodes.jsonl"
+            )
+    return server_mode
+
+
+def checkpoint_sha(ckpt_path, chunk_bytes: int = 1 << 20) -> str | None:
+    """First 12 sha256 hex chars of the resolved checkpoint file contents.
+
+    Resolves symlinks (live/zero exports are symlinked identical weights) so
+    the hash identifies the weights independently of the link name. Streaming
+    read, computed once at startup; None when the file is unreadable.
+    """
+    try:
+        with open(os.path.realpath(str(ckpt_path)), "rb") as f:
+            digest = hashlib.sha256()
+            for chunk in iter(lambda: f.read(chunk_bytes), b""):
+                digest.update(chunk)
+    except OSError:
+        return None
+    return digest.hexdigest()[:12]
+
+
 def episode_record(
     *,
     suite,
@@ -96,6 +138,7 @@ def episode_record(
     num_env_steps,
     num_decisions,
     ckpt,
+    ckpt_sha,
     git_sha,
     extras: dict | None = None,
 ) -> dict:
@@ -112,6 +155,7 @@ def episode_record(
         "num_env_steps": int(num_env_steps),
         "num_decisions": int(num_decisions),
         "ckpt": str(ckpt),
+        "ckpt_sha": None if ckpt_sha is None else str(ckpt_sha),
         "git_sha": git_sha,
     }
     if extras:

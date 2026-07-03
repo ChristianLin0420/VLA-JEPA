@@ -32,11 +32,18 @@ _MEMORY_MODES = {
     "write_every",
     "foreign",
     "noisematch",
-    "permute",
+    "permute_once",
     "noreset",
 }
-_PERMUTE_SEED = 0
 _DUMP_FILE_PATTERN = re.compile(r"d(\d+)\.pt")
+# Structured episode ids are "<suite>--<task_id>--ep<episode_idx>"; the prefix
+# before the trailing "--ep<idx>" is the task key used for donor exclusion.
+_EPISODE_ID_PATTERN = re.compile(r"(?P<task_key>.+)--ep\d+$")
+
+
+def _task_key_from_episode_id(episode_id: str) -> Optional[str]:
+    match = _EPISODE_ID_PATTERN.match(episode_id)
+    return match.group("task_key") if match else None
 
 
 @dataclass(frozen=True)
@@ -51,6 +58,7 @@ class MemoryServerConfig:
     donor_dir: Optional[str] = None
     state_dump_dir: Optional[str] = None
     counterfactual: bool = False
+    permute_at: Optional[int] = None
 
     def __post_init__(self) -> None:
         if self.mode == "zero":
@@ -66,6 +74,11 @@ class MemoryServerConfig:
             raise ValueError("write_every mode requires MEMORY_WRITE_EVERY >= 1")
         if self.mode in {"foreign", "noisematch"} and not self.donor_dir:
             raise ValueError(f"{self.mode} mode requires MEMORY_DONOR_DIR")
+        if self.mode == "permute_once":
+            if self.permute_at is None:
+                object.__setattr__(self, "permute_at", 4)
+            elif self.permute_at < 1:
+                raise ValueError("permute_once mode requires MEMORY_PERMUTE_AT >= 1")
 
     @classmethod
     def from_env(cls, env: Optional[Mapping[str, str]] = None) -> "MemoryServerConfig":
@@ -88,6 +101,7 @@ class MemoryServerConfig:
             donor_dir=env.get("MEMORY_DONOR_DIR") or None,
             state_dump_dir=env.get("MEMORY_STATE_DUMP_DIR") or None,
             counterfactual=counterfactual == "1",
+            permute_at=_int("MEMORY_PERMUTE_AT"),
         )
 
 
@@ -120,8 +134,9 @@ def plan_memory_decision(config: MemoryServerConfig, counter: int) -> _DecisionP
         return _DecisionPlan("donor", False, False, True)
     if mode == "noisematch":
         return _DecisionPlan("noise", False, False, True)
-    if mode == "permute":
-        return _DecisionPlan("permute", True, False, True)
+    if mode == "permute_once":
+        override = "permute" if counter == config.permute_at else None
+        return _DecisionPlan(override, True, False, True)
     if mode == "noreset":
         return _DecisionPlan(None, True, False, False)
     return _DecisionPlan(None, True, False, True)  # live
@@ -159,12 +174,16 @@ def _load_memory_state(path: Path, device: torch.device) -> MemoryState:
 
 
 def _permute_slots(state: MemoryState) -> MemoryState:
-    """Permute working slots with a fixed seeded permutation (destroys slot binding)."""
+    """Cyclically roll the working slots (a derangement: no slot keeps its index).
 
-    num_slots = state.working.shape[1]
-    perm = torch.randperm(num_slots, generator=torch.Generator().manual_seed(_PERMUTE_SEED))
+    Fusion reads are permutation-invariant over slots (slot_ids enter only the
+    write query), so a permutation is only meaningful when its written successor
+    is committed back into the state chain: permute_once applies this exactly
+    once, at MEMORY_PERMUTE_AT, to probe write-side slot-binding consistency.
+    """
+
     return MemoryState(
-        working=state.working[:, perm.to(state.working.device)],
+        working=state.working.roll(shifts=1, dims=1),
         episodic=state.episodic,
         steps=state.steps,
         valid=state.valid,
@@ -175,18 +194,21 @@ class _DonorBank:
     """Read-only donor states laid out as MEMORY_STATE_DUMP_DIR writes them.
 
     Accepts a single state file, one episode directory of ``d<idx>.pt`` files,
-    or a directory of such episode directories.
+    or a directory of such episode directories. Episode directories named
+    ``<suite>--<task_id>--ep<idx>`` carry the task key used to exclude
+    same-task donors in foreign mode.
     """
 
     def __init__(self, root: str) -> None:
         self._episodes = self._index(Path(root))
         if not self._episodes:
             raise ValueError(f"no donor states found under {root}")
+        self._task_keys = [_task_key_from_episode_id(name) for name, _ in self._episodes]
 
     @staticmethod
-    def _index(root: Path) -> List[List[Path]]:
+    def _index(root: Path) -> List[Tuple[str, List[Path]]]:
         if root.is_file():
-            return [[root]]
+            return [(root.stem, [root])]
         if not root.is_dir():
             raise ValueError(f"donor path does not exist: {root}")
 
@@ -200,16 +222,43 @@ class _DonorBank:
 
         direct = _states(root)
         if direct:
-            return [direct]
-        episodes = [_states(child) for child in sorted(root.iterdir()) if child.is_dir()]
-        return [episode for episode in episodes if episode]
+            return [(root.name, direct)]
+        episodes = [(child.name, _states(child)) for child in sorted(root.iterdir()) if child.is_dir()]
+        return [(name, files) for name, files in episodes if files]
 
-    def pick_episode(self, seed: int) -> int:
-        return seed % len(self._episodes)
+    @property
+    def has_task_metadata(self) -> bool:
+        return any(key is not None for key in self._task_keys)
 
-    def state_for(self, episode: int, decision: int, device: torch.device) -> MemoryState:
-        files = self._episodes[episode]
-        return _load_memory_state(files[min(decision, len(files) - 1)], device)
+    def episode_name(self, episode: int) -> str:
+        return self._episodes[episode][0]
+
+    def pick_episode(self, seed: int, task_key: Optional[str] = None) -> int:
+        """Deterministic donor pick, excluding donors from the recipient's task."""
+
+        eligible = [
+            index
+            for index, donor_key in enumerate(self._task_keys)
+            if task_key is None or donor_key is None or donor_key != task_key
+        ]
+        if not eligible:
+            raise ValueError(f"donor bank has no cross-task donor for task {task_key!r}")
+        return eligible[seed % len(eligible)]
+
+    def write_index(self, episode: int, decision: int) -> Optional[int]:
+        """Donor file injected at recipient decision ``d`` under the maturity
+        convention: live at decision d reads a state with d absorbed writes
+        (decisions 0..d-1) and dump files are post-write (``d<i>.pt`` = state
+        after decision i's write), so decision d injects file d<d-1>, clamped
+        to the donor's last file; decision 0 reads the prior (None)."""
+
+        if decision == 0:
+            return None
+        files = self._episodes[episode][1]
+        return min(decision - 1, len(files) - 1)
+
+    def state_for(self, episode: int, write_index: int, device: torch.device) -> MemoryState:
+        return _load_memory_state(self._episodes[episode][1][write_index], device)
 
     def fit_moments(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """Per-slot-channel mean/std of working states over the whole bank."""
@@ -217,7 +266,7 @@ class _DonorBank:
         bank = torch.stack(
             [
                 _load_memory_state(path, torch.device("cpu")).working[0]
-                for episode in self._episodes
+                for _, episode in self._episodes
                 for path in episode
             ]
         )
@@ -236,6 +285,7 @@ class _ConnectionSession:
     decision_index: int = 0
     donor_episode: int | None = None
     donor_state: object = None
+    legacy_reset_warned: bool = False
 
 class WebsocketPolicyServer:
     """Serves a policy using the websocket protocol. See websocket_client_policy.py for a client implementation.
@@ -257,11 +307,31 @@ class WebsocketPolicyServer:
         self._port = port
         self._metadata = metadata or {}
         self._memory_config = memory_config or MemoryServerConfig(mode=memory_mode)
+        if not getattr(policy, "memory_enabled", False) and (
+            self._memory_config.mode != "live"
+            or self._memory_config.donor_dir
+            or self._memory_config.state_dump_dir
+            or self._memory_config.counterfactual
+        ):
+            raise RuntimeError(
+                f"memory serve options configured (mode={self._memory_config.mode!r}, "
+                f"donor_dir={self._memory_config.donor_dir!r}, "
+                f"state_dump_dir={self._memory_config.state_dump_dir!r}, "
+                f"counterfactual={self._memory_config.counterfactual}) but the served "
+                "policy has no memory module; a wrong checkpoint must not fabricate "
+                "a null result"
+            )
         self._donor_bank = (
             _DonorBank(self._memory_config.donor_dir)
             if self._memory_config.mode in {"foreign", "noisematch"}
             else None
         )
+        if self._memory_config.mode == "foreign" and not self._donor_bank.has_task_metadata:
+            logging.warning(
+                "MEMORY_DONOR_DIR=%s episode dirs carry no '<suite>--<task_id>--ep<idx>' "
+                "task metadata; same-task donor exclusion is DISABLED for foreign mode",
+                self._memory_config.donor_dir,
+            )
         self._donor_moments = (
             self._donor_bank.fit_moments() if self._memory_config.mode == "noisematch" else None
         )
@@ -313,7 +383,12 @@ class WebsocketPolicyServer:
             return torch.device("cpu")
 
     def _sample_noise_state(self, episode_seed: int, device: torch.device) -> MemoryState:
-        """Gaussian working state with per-slot-channel moments from the donor bank."""
+        """Gaussian working state with per-slot-channel moments from the donor bank.
+
+        By design this is ONE static per-episode draw, re-injected unchanged at
+        every decision: noisematch is the statistics control (on-manifold
+        moments, wrong content), not a maturity-matched stream like foreign.
+        """
 
         mean, std = self._donor_moments
         noise = torch.randn(mean.shape, generator=torch.Generator().manual_seed(episode_seed))
@@ -330,20 +405,31 @@ class WebsocketPolicyServer:
         if plan.memory_state_override == "prior":
             return None
         if plan.memory_state_override == "donor":
+            write_index = self._donor_bank.write_index(
+                session.donor_episode, session.decision_index
+            )
+            if write_index is None:
+                return None  # decision 0 reads the learned prior, like live
             return self._donor_bank.state_for(
-                session.donor_episode, session.decision_index, self._policy_device()
+                session.donor_episode, write_index, self._policy_device()
             )
         if plan.memory_state_override == "noise":
             return session.donor_state
-        # permute: live state with slots shuffled; nothing to permute before the first commit
+        # permute (one-shot): the rolled state's written successor is committed,
+        # so the derangement enters the live chain exactly once.
         state = session.memory_state
         return _permute_slots(state) if state is not None else None
 
     def _sample_initial_noise(self, batch_size: int, session: _ConnectionSession) -> torch.Tensor:
         head_config = self._policy.action_model.config
+        # Match the action head's internal draw dtype (policy parameter dtype;
+        # bf16 under --use_bf16) so counterfactual-on runs stay draw-for-draw
+        # paired with counterfactual-off runs.
+        param = next(self._policy.parameters())
         return torch.randn(
             (batch_size, head_config.action_horizon, head_config.action_dim),
-            device=self._policy_device(),
+            device=param.device,
+            dtype=param.dtype,
             generator=session.generator,
         )
 
@@ -363,13 +449,26 @@ class WebsocketPolicyServer:
         fusion_diag = getattr(fusion, "last_fusion_diagnostics", None) or {}
         memory = getattr(self._policy, "memory_module", None)
         write_diag = getattr(memory, "last_write_diagnostics", None) or {}
-        return {
+        extras = {
             "mode": self._memory_config.mode,
             "decision_index": session.decision_index,
             "working_norm": _scalar(read_diag.get("working_norm")),
             "injection_ratio": _scalar(fusion_diag.get("injection_ratio")),
             "update_gate_mean": _scalar(write_diag.get("update_gate_mean")),
         }
+        if self._memory_config.mode == "permute_once":
+            extras["permute_applied"] = session.decision_index == self._memory_config.permute_at
+        if self._memory_config.mode == "foreign":
+            donor = session.donor_episode
+            extras["donor_episode"] = (
+                None if donor is None else self._donor_bank.episode_name(donor)
+            )
+            extras["donor_decision"] = (
+                None
+                if donor is None
+                else self._donor_bank.write_index(donor, session.decision_index)
+            )
+        return extras
 
     def _counterfactual_delta(self, call_payload: dict, live_output: dict) -> float:
         """Re-run the decision with memory bypassed, reusing tokens and noise."""
@@ -390,6 +489,10 @@ class WebsocketPolicyServer:
         return float(np.linalg.norm(delta))
 
     def _dump_state(self, state: MemoryState, session: _ConnectionSession) -> None:
+        # Donor convention: d<i>.pt = state after decision i's committed write;
+        # the caller only dumps decisions whose write was committed. The episode
+        # dir is the sanitized full episode_id ("<suite>--<task_id>--ep<idx>"),
+        # so parallel suite servers sharing one dump dir cannot collide.
         episode = re.sub(r"[^A-Za-z0-9._-]+", "_", session.episode_id or "default")
         out_dir = Path(self._memory_config.state_dump_dir) / episode
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -425,7 +528,8 @@ class WebsocketPolicyServer:
         req_id = msg.get("request_id", "default")
         mtype = msg.get("type", "infer")          # default = infer
         payload = msg.get("payload", msg)         # when no explicit payload, treat top-level as payload
-        if mtype == "infer" and msg.get("reset") is True:
+        legacy_reset = mtype == "infer" and msg.get("reset") is True
+        if legacy_reset:
             # Compatibility with the original flat reset request.
             mtype = "reset"
             payload = {
@@ -434,6 +538,14 @@ class WebsocketPolicyServer:
             }
         if session is None:
             session = _ConnectionSession()
+        if legacy_reset and self._memory_config.mode != "live" and not session.legacy_reset_warned:
+            session.legacy_reset_warned = True
+            logging.warning(
+                "legacy flat reset under memory mode %r: episode_seed/episode_id "
+                "defaulted (seed=%s), so the per-episode noise/donor design is not honored",
+                self._memory_config.mode,
+                payload["episode_seed"],
+            )
 
         # ping
         if mtype == "ping":
@@ -457,7 +569,8 @@ class WebsocketPolicyServer:
                 donor_episode = None
                 donor_state = None
                 if self._memory_config.mode == "foreign":
-                    donor_episode = self._donor_bank.pick_episode(episode_seed)
+                    task_key = payload.get("task_key") or _task_key_from_episode_id(episode_id)
+                    donor_episode = self._donor_bank.pick_episode(episode_seed, task_key)
                 elif self._memory_config.mode == "noisematch":
                     donor_state = self._sample_noise_state(episode_seed, device)
                 # Commit reset state only after every validation/initialization
@@ -544,8 +657,11 @@ class WebsocketPolicyServer:
                         )
                     if update_memory:
                         session.memory_state = candidate_state
-                    if self._memory_config.state_dump_dir and candidate_state is not None:
-                        self._dump_state(candidate_state, session)
+                        # Dump only committed writes: skipped/suppressed decisions
+                        # must not pollute the donor bank with stale or injected
+                        # states masquerading as post-write states.
+                        if self._memory_config.state_dump_dir and candidate_state is not None:
+                            self._dump_state(candidate_state, session)
                     output_dict["memory_extras"] = memory_extras
                     session.decision_index += 1
                 else:

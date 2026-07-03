@@ -78,6 +78,24 @@ class SceneEditsTest(unittest.TestCase):
         with self.assertRaisesRegex(NotImplementedError, "BDDL"):
             insert_occluder(_FakeEnv(), pos=[0.0, 0.0, 1.0], size=[0.1, 0.1, 0.01])
 
+    def test_reverted_qpos_edit_raises_runtime_error(self):
+        # Validity guards must be RuntimeError raises, not asserts (which
+        # vanish under python -O).
+        env = _FakeEnv()
+
+        def _reverting_forward():
+            env.sim.data.qpos[9:12] = [0.1, 0.2, 0.9]
+
+        env.sim.forward = _reverting_forward
+        with self.assertRaisesRegex(RuntimeError, "did not persist"):
+            displace_object(env, "akita_black_bowl_1", [0.05, -0.02, 0.0])
+
+    def test_non_bool_check_success_raises_runtime_error(self):
+        env = _FakeEnv()
+        env.check_success = lambda: 0.7
+        with self.assertRaisesRegex(RuntimeError, "check_success"):
+            displace_object(env, "akita_black_bowl_1", [0.05, -0.02, 0.0])
+
 
 if __name__ == "__main__":
     unittest.main()

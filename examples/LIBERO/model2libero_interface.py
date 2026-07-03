@@ -68,12 +68,26 @@ class M1Inference:
         self.image_history.append(image)
         self.num_image_history = min(self.num_image_history + 1, self.horizon)
 
-    def reset(self, task_description: str) -> None:
+    def reset(
+        self,
+        task_description: str,
+        *,
+        episode_id: str | None = None,
+        task_key: str | None = None,
+    ) -> None:
+        """Reset the server session.
+
+        ``episode_id`` should be the globally unique "<suite>--<task_id>--ep<idx>"
+        form (with ``task_key`` = "<suite>--<task_id>") so parallel suite servers
+        never collide on state-dump keys and foreign mode can exclude same-task
+        donors; the bare counter id is a legacy fallback.
+        """
         self._episode_counter += 1
         self.client.reset(
             instruction=task_description,
-            episode_id=f"libero-{self._episode_counter}",
+            episode_id=episode_id or f"libero-{self._episode_counter}",
             episode_seed=self._episode_counter,
+            task_key=task_key,
         )
         self.task_description = task_description
         self.image_history.clear()

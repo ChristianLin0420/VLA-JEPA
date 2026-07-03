@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest import mock
 
 import numpy as np
+from omegaconf import OmegaConf
 from torch.utils.data import BatchSampler, SequentialSampler
 from accelerate.data_loader import BatchSamplerShard
 
@@ -201,6 +202,33 @@ class ConsumedEnumeratorEquivalenceTest(unittest.TestCase):
                 (0, 7),
                 msg=robot_type,
             )
+
+    def test_run_config_guards(self):
+        def _cfg(sample_mode="contiguous_segment", batch_size=1, accumulation=1):
+            return OmegaConf.create(
+                {
+                    "datasets": {
+                        "vla_data": {
+                            "sample_mode": sample_mode,
+                            "per_device_batch_size": batch_size,
+                        }
+                    },
+                    "trainer": {"gradient_accumulation_steps": accumulation},
+                }
+            )
+
+        enumerator.validate_run_config(_cfg())  # repo configs pass
+        with self.assertRaisesRegex(ValueError, "contiguous_segment"):
+            enumerator.validate_run_config(_cfg(sample_mode="random"))
+        with self.assertRaisesRegex(NotImplementedError, "per_device_batch_size"):
+            enumerator.validate_run_config(_cfg(batch_size=2))
+        # completed_steps maps to one batch per rank only without accumulation.
+        with self.assertRaisesRegex(NotImplementedError, "gradient_accumulation_steps"):
+            enumerator.validate_run_config(_cfg(accumulation=2))
+        # A config predating the key defaults to 1 and passes.
+        legacy = _cfg()
+        del legacy.trainer.gradient_accumulation_steps
+        enumerator.validate_run_config(legacy)
 
     def test_summary_counts_unseen_at_decision_thresholds(self):
         consumed = {"synthetic_a": {11, 13}, "synthetic_b": {0, 1, 2, 3, 4}}
