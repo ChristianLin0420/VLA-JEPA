@@ -5,7 +5,10 @@
 import logging
 import socket
 import argparse
-from deployment.model_server.tools.websocket_policy_server import WebsocketPolicyServer
+from deployment.model_server.tools.websocket_policy_server import (
+    MemoryServerConfig,
+    WebsocketPolicyServer,
+)
 from starVLA.model.framework.base_framework import baseframework
 import torch, os
 
@@ -25,11 +28,16 @@ def main(args) -> None:
     if args.use_bf16: # False
         vla = vla.to(torch.bfloat16)
     vla = vla.to(device).eval()
+    memory_config = MemoryServerConfig.from_env()
     if getattr(vla, "memory_enabled", False):
         # Runtime state and memory/fusion math are intentionally FP32 even when
         # the heavy backbone is served in BF16.
         vla.memory_module.float()
         vla.policy_memory_fusion.float()
+        vla.memory_module.capture_diagnostics = True
+        if memory_config.gate_scale is not None:
+            vla.policy_memory_fusion.residual_scale = memory_config.gate_scale
+            logging.info("MEMORY_GATE_SCALE=%s applied to fusion.residual_scale", memory_config.gate_scale)
 
     hostname = socket.gethostname()
     local_ip = socket.gethostbyname(hostname)
@@ -41,7 +49,7 @@ def main(args) -> None:
         host=args.host,
         port=args.port,
         metadata={"env": "simpler_env"},
-        memory_mode=os.environ.get("MEMORY_MODE", "live"),
+        memory_config=memory_config,
     )
     logging.info("server running ...")
     server.serve_forever()
