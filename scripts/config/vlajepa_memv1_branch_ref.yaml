@@ -140,7 +140,7 @@ trainer:
   memory_bptt_steps: 4
   memory_detach_burn_in: true
   memory_direct_context_dropout: 0.0
-  pretrained_checkpoint: /lustre/fsw/portfolios/edgeai/projects/edgeai_tao-ptm_image-foundation-model-clip/users/chrislin/projects/VLA-JEPA/outputs/wt-memexp/results/offline/archaeology/exports/VLA-JEPA-memv1-arch-step_40000.pt
+  pretrained_checkpoint: /lustre/fsw/portfolios/edgeai/projects/edgeai_tao-ptm_image-foundation-model-clip/users/chrislin/projects/VLA-JEPA/outputs/wt-memexp/results/offline/archaeology/exports/40000/checkpoints/VLA-JEPA-memv1-step_40000.pt
   checkpoint_migration:
     enabled: false
     strict: true
