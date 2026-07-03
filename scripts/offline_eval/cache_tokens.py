@@ -20,8 +20,10 @@ Usage:
         --ckpt <export.pt> --dataset libero_10_no_noops_1.0.0_lerobot \
         --suite libero_10 --out-dir results/offline/token_cache [--max-episodes N]
 
-``--smoke`` exercises the full lattice/save/index plumbing on synthetic tensors
-without a checkpoint or dataset.
+``--episodes`` restricts caching to an explicit index list (one per line), for
+enumerator-selected unseen episodes (plan T0.2d); every requested episode must
+be cached or the run fails loudly.  ``--smoke`` exercises the full
+lattice/save/index plumbing on synthetic tensors without a checkpoint or dataset.
 """
 
 import argparse
@@ -47,6 +49,8 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--suite", type=str, required=True, help="label recorded in every cache")
     parser.add_argument("--out-dir", type=str, required=True)
     parser.add_argument("--max-episodes", type=int, default=None)
+    parser.add_argument("--episodes", type=str, default=None,
+                        help="file of episode indices (whitespace-separated); cache exactly these")
     parser.add_argument("--data-root", type=str, default=DEFAULT_DATA_ROOT)
     parser.add_argument("--robot-type", type=str, default="libero_franka",
                         help="ROBOT_TYPE_CONFIG_MAP key (droid_libero for DROID)")
@@ -55,6 +59,26 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--smoke", action="store_true",
                         help="run the full plumbing on synthetic tensors, no checkpoint")
     return parser
+
+
+def load_episode_selection(path) -> set:
+    """Episode indices from a whitespace/newline-separated file (plan T0.2d)."""
+    tokens = Path(path).read_text().split()
+    if not tokens:
+        raise ValueError(f"empty episode selection file: {path}")
+    return {int(token) for token in tokens}
+
+
+def assert_selection_cached(selected: set, cached_ids: set) -> None:
+    """Fail loudly when a requested episode was not cached (no silent truncation)."""
+    missing = sorted(selected - cached_ids)
+    if missing:
+        preview = ", ".join(str(episode) for episode in missing[:10])
+        raise SystemExit(
+            f"{len(missing)} selected episodes not cached (absent from the catalog "
+            f"or without a valid decision): {preview}"
+            + (" ..." if len(missing) > 10 else "")
+        )
 
 
 def write_episode_cache(suite_dir: Path, record: dict) -> Path:
@@ -168,11 +192,14 @@ def run(args) -> None:
     )
     catalog = mixture._segment_catalogs[0]
 
+    selected = load_episode_selection(args.episodes) if args.episodes else None
     suite_dir = Path(args.out_dir) / args.suite
     suite_dir.mkdir(parents=True, exist_ok=True)
-    cached = 0
+    cached, cached_ids = 0, set()
     with torch.inference_mode():
         for episode_index, episode_id in enumerate(catalog["trajectory_ids"]):
+            if selected is not None and int(episode_id) not in selected:
+                continue
             if args.max_episodes is not None and cached >= args.max_episodes:
                 break
             length = int(catalog["trajectory_lengths"][episode_index])
@@ -189,7 +216,10 @@ def run(args) -> None:
             path = write_episode_cache(suite_dir, record)
             append_index(suite_dir, record, path)
             cached += 1
+            cached_ids.add(int(episode_id))
             print(f"[{cached}] episode {int(episode_id)}: {bases.size} decisions -> {path.name}")
+    if selected is not None:
+        assert_selection_cached(selected, cached_ids)
     print(f"cached {cached} episodes under {suite_dir}")
 
 
