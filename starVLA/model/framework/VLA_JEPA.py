@@ -589,7 +589,9 @@ class VLA_JEPA(baseframework):
             key: value.detach() for key, value in diagnostics.items()
         } if diagnostics else None
         public_output = {
-            "normalized_actions": pred_actions.detach().cpu().numpy(),
+            "normalized_actions": pred_actions.to(
+                dtype=torch.float32
+            ).detach().cpu().numpy(),
             "embodied_action_tokens": qwen.embodied_action_tokens.to(
                 dtype=torch.float32
             ).detach().cpu().numpy(),
