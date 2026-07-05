@@ -67,7 +67,8 @@ class Args:
     #################################################################################################################
     # LIBERO environment-specific parameters
     #################################################################################################################
-    task_suite_name: str = "libero_goal"  # Task suite. Options: libero_spatial, libero_object, libero_goal, libero_10, libero_90
+    task_suite_name: str = "libero_goal"  # Task suite. Options: libero_spatial, libero_object, libero_goal, libero_10, libero_90, libero_mem
+    task_ids: str = ""  # Comma-separated task indices to evaluate (default "": all tasks in suite)
     num_steps_wait: int = 10  # Number of steps to wait for objects to stabilize i n sim
     num_trials_per_task: int = 50  # Number of rollouts per task
     category_value: str = "Background Textures"
@@ -156,6 +157,11 @@ def eval_libero(args: Args) -> None:
         max_steps = 520  # longest training demo has 505 steps
     elif args.task_suite_name == "libero_90":
         max_steps = 400  # longest training demo has 373 steps
+    elif args.task_suite_name == "libero_mem":
+        # LIBERO-Mem (AAAI 2026): longest human demo is 672 env steps
+        # (task 8, rotate-3-bowls); needs the libero-mem fork as LIBERO_HOME
+        # (set LIBERO_HOME_OVERRIDE in eval_libero_vlajepa.sh).
+        max_steps = 720
     else:
         raise ValueError(f"Unknown task suite: {args.task_suite_name}")
 
@@ -168,9 +174,19 @@ def eval_libero(args: Args) -> None:
     )
 
 
+    # Optional task filter (e.g. --args.task-ids 0 for a single-task smoke).
+    selected_task_ids = None
+    if args.task_ids.strip():
+        selected_task_ids = {int(x) for x in args.task_ids.split(",") if x.strip()}
+        bad = [i for i in selected_task_ids if not 0 <= i < num_tasks_in_suite]
+        if bad:
+            raise ValueError(f"task_ids {bad} out of range for {args.task_suite_name} (n={num_tasks_in_suite})")
+
     # Start evaluation
     total_episodes, total_successes = 0, 0
     for task_id in tqdm.tqdm(range(num_tasks_in_suite)):
+        if selected_task_ids is not None and task_id not in selected_task_ids:
+            continue
         # Get task
         task = task_suite.get_task(task_id)
 

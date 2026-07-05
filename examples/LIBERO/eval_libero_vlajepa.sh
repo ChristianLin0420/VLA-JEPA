@@ -26,12 +26,18 @@ fi
 # Resolve the repo from this script's location so worktree checkouts eval their own code.
 REPO=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 cd "$REPO"
-export LIBERO_HOME=/lustre/fsw/portfolios/edgeai/users/chrislin/anamnesis_stage/LIBERO
+# Benchmark-aware LIBERO tree selection: LIBERO_HOME_OVERRIDE points at an
+# alternate LIBERO fork (e.g. memexp_stage/libero-mem-home for the libero_mem
+# suite). Default remains the shared anamnesis staging (never modified).
+export LIBERO_HOME=${LIBERO_HOME_OVERRIDE:-/lustre/fsw/portfolios/edgeai/users/chrislin/anamnesis_stage/LIBERO}
 # LIBERO reads $LIBERO_CONFIG_PATH/config.yaml; the valid (ANAMNESIS-staged) config
 # lives at ~/.libero/config.yaml. Pointing here avoids LIBERO's first-run input() prompt
 # (which EOFErrors under batch). Seed it if somehow absent.
-export LIBERO_CONFIG_PATH="${HOME}/.libero"
-if [[ ! -f "${LIBERO_CONFIG_PATH}/config.yaml" ]]; then
+if [[ -n "${LIBERO_HOME_OVERRIDE:-}" ]]; then
+  # Overridden trees get their own config dir (inside the override tree) so the
+  # shared ~/.libero config is never rewritten. Regenerated every run: the yaml
+  # paths must track the override.
+  export LIBERO_CONFIG_PATH="${LIBERO_HOME}/.libero_config"
   mkdir -p "${LIBERO_CONFIG_PATH}"
   cat > "${LIBERO_CONFIG_PATH}/config.yaml" <<YAML
 benchmark_root: ${LIBERO_HOME}/libero/libero
@@ -40,6 +46,18 @@ init_states: ${LIBERO_HOME}/libero/libero/init_files
 datasets: ${LIBERO_HOME}/libero/datasets
 assets: ${LIBERO_HOME}/libero/libero/assets
 YAML
+else
+  export LIBERO_CONFIG_PATH="${HOME}/.libero"
+  if [[ ! -f "${LIBERO_CONFIG_PATH}/config.yaml" ]]; then
+    mkdir -p "${LIBERO_CONFIG_PATH}"
+    cat > "${LIBERO_CONFIG_PATH}/config.yaml" <<YAML
+benchmark_root: ${LIBERO_HOME}/libero/libero
+bddl_files: ${LIBERO_HOME}/libero/libero/bddl_files
+init_states: ${LIBERO_HOME}/libero/libero/init_files
+datasets: ${LIBERO_HOME}/libero/datasets
+assets: ${LIBERO_HOME}/libero/libero/assets
+YAML
+  fi
 fi
 # Do not append the login shell's stale /tmp/LIBERO path: that regular package
 # shadows the staged namespace and makes `from libero.libero ...` fail.
@@ -75,6 +93,8 @@ for task in "${items[@]}"; do
   sleep 30   # give the server time to load the 7.5GB model before the sim connects
   # Optional T0.5 blackout protocol (client-side observation corruption).
   blackout_args=()
+  # Optional task filter (comma-separated indices), e.g. TASK_IDS=0 for smokes.
+  [[ -n "${TASK_IDS:-}" ]] && blackout_args+=(--args.task-ids "$TASK_IDS")
   if [[ -n "${BLACKOUT_START:-}" ]]; then
     blackout_args+=(
       --args.blackout_start_decision "$BLACKOUT_START"
