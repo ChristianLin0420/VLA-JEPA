@@ -72,4 +72,9 @@ ROBOT_TYPE_TO_EMBODIMENT_TAG = {
     "oxe_rt1": EmbodimentTag.OXE_RT1,
     "demo_sim_franka_delta_joints": EmbodimentTag.FRANKA,
     "custom_robot_config": EmbodimentTag.NEW_EMBODIMENT,
+    # MIKASA actions are pre-normalized [-1,1] over +-0.1 m/step (2x LIBERO's
+    # +-0.05), so its statistics/unnorm block must never merge with FRANKA.
+    # Metadata merging groups by tag; NEW_EMBODIMENT is unused by any other
+    # dataset in the training mixtures, giving MIKASA its own block.
+    "mikasa_robo": EmbodimentTag.NEW_EMBODIMENT,
 }

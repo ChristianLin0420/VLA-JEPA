@@ -87,5 +87,85 @@ DATASET_NAMED_MIXTURES = {
         ("BEHAVIOR_challenge", 1.0, "R1Pro"),
     ],
 
+    # MIKASA-Robo-VLA anchor subset (21 of 90 tasks; converted LeRobot v3->v2
+    # by scripts/data/mikasa_v3_to_v2.py; 128x128 top+wrist, 7-D proprio/action,
+    # actions pre-normalized [-1,1] over +-0.1 m/step -> own 'mikasa_robo'
+    # stats/unnorm block, never merged with LIBERO franka).
+    #
+    # Selection is dictated by dataloader mechanics: contiguous_segment mode
+    # requires episode_length >= 1 + max_delta(7) + (K-1)*stride(3*7) = 29
+    # frames or a task contributes zero segments and is skipped
+    # (datasets.py:_build_segment_catalog). The short variants of
+    # RememberColor/Shape, FindImposter, and no-shuffle ShellGame are 10-30
+    # frames -> unusable; anchors therefore use the *_long / shuffle variants.
+    # Coverage across MIKASA memory families: spatial (ShellGame*), object
+    # (RememberColor{3,5,9}/Shape/ShapeAndColor), object permanence
+    # (TakeItBack), sequential (ChainOfColors*/SeqOfColors), capacity
+    # (BunchOfColors/GatherAndRecall), counting (BatteriesChecker/BlinkCount),
+    # duration (TimedTransfer), spatiotemporal (TraceShape), velocity
+    # (InterceptGrab).
+    "mikasa_vla": [
+        ("mikasa_shell_game_shuffle_touch_vla_v0", 1.0, "mikasa_robo"),
+        ("mikasa_shell_game_shuffle_touch_long_vla_v0", 1.0, "mikasa_robo"),
+        ("mikasa_shell_game_shuffle_color_lamp_touch_vla_v0", 1.0, "mikasa_robo"),
+        ("mikasa_remember_color_3_long_vla_v0", 1.0, "mikasa_robo"),
+        ("mikasa_remember_color_5_long_vla_v0", 1.0, "mikasa_robo"),
+        ("mikasa_remember_color_9_long_vla_v0", 1.0, "mikasa_robo"),
+        ("mikasa_take_it_back_vla_v0", 1.0, "mikasa_robo"),
+        ("mikasa_chain_of_colors_3_vla_v0", 1.0, "mikasa_robo"),
+        ("mikasa_chain_of_colors_5_vla_v0", 1.0, "mikasa_robo"),
+        ("mikasa_chain_of_colors_7_vla_v0", 1.0, "mikasa_robo"),
+        ("mikasa_seq_of_colors_5_vla_v0", 1.0, "mikasa_robo"),
+        ("mikasa_bunch_of_colors_5_vla_v0", 1.0, "mikasa_robo"),
+        ("mikasa_gather_and_recall_3_vla_v0", 1.0, "mikasa_robo"),
+        ("mikasa_gather_and_recall_5_vla_v0", 1.0, "mikasa_robo"),
+        ("mikasa_remember_shape_5_long_vla_v0", 1.0, "mikasa_robo"),
+        ("mikasa_remember_shape_and_color_3x3_long_vla_v0", 1.0, "mikasa_robo"),
+        ("mikasa_batteries_checker_easy_3_vla_v0", 1.0, "mikasa_robo"),
+        ("mikasa_blink_count_button_press_medium_vla_v0", 1.0, "mikasa_robo"),
+        ("mikasa_timed_transfer_medium_vla_v0", 1.0, "mikasa_robo"),
+        ("mikasa_trace_shape_medium_vla_v0", 1.0, "mikasa_robo"),
+        ("mikasa_intercept_grab_fast_vla_v0", 1.0, "mikasa_robo"),
+    ],
+
+    # all_robot + MIKASA at ~1:4 effective weight. Mechanics: the mixture is
+    # built with balance_dataset_weights=False (get_vla_dataset defaults), so
+    # the per-draw probability of a dataset is weight/sum(weights), independent
+    # of dataset size. all_robot = 7 datasets x 1.0 = 7.0 units; MIKASA total
+    # must be 7/4 = 1.75 units -> 1.75/21 = 1/12 per task. Mikasa fraction of
+    # robot draws = 1.75/8.75 = 20% (1:4). Weight 1.0 also marks the existing
+    # corpora as 'primary' for epoch-length accounting, which mikasa's 1/12
+    # deliberately does not disturb. (Dataset multiplicity cannot express this:
+    # duplicate (name, robot_type) entries are dropped by get_vla_dataset.)
+    "all_robot_mikasa": [
+        ("libero_object_no_noops_1.0.0_lerobot", 1.0, "libero_franka"),
+        ("libero_goal_no_noops_1.0.0_lerobot", 1.0, "libero_franka"),
+        ("libero_spatial_no_noops_1.0.0_lerobot", 1.0, "libero_franka"),
+        ("libero_10_no_noops_1.0.0_lerobot", 1.0, "libero_franka"),
+        ("droid_lerobot", 1.0, "droid_libero"),
+        ("bridge_orig_1.0.0_lerobot", 1.0, "oxe_bridge"),
+        ("fractal20220817_data_0.1.0_lerobot", 1.0, "oxe_rt1"),
+        ("mikasa_shell_game_shuffle_touch_vla_v0", 0.0833333, "mikasa_robo"),
+        ("mikasa_shell_game_shuffle_touch_long_vla_v0", 0.0833333, "mikasa_robo"),
+        ("mikasa_shell_game_shuffle_color_lamp_touch_vla_v0", 0.0833333, "mikasa_robo"),
+        ("mikasa_remember_color_3_long_vla_v0", 0.0833333, "mikasa_robo"),
+        ("mikasa_remember_color_5_long_vla_v0", 0.0833333, "mikasa_robo"),
+        ("mikasa_remember_color_9_long_vla_v0", 0.0833333, "mikasa_robo"),
+        ("mikasa_take_it_back_vla_v0", 0.0833333, "mikasa_robo"),
+        ("mikasa_chain_of_colors_3_vla_v0", 0.0833333, "mikasa_robo"),
+        ("mikasa_chain_of_colors_5_vla_v0", 0.0833333, "mikasa_robo"),
+        ("mikasa_chain_of_colors_7_vla_v0", 0.0833333, "mikasa_robo"),
+        ("mikasa_seq_of_colors_5_vla_v0", 0.0833333, "mikasa_robo"),
+        ("mikasa_bunch_of_colors_5_vla_v0", 0.0833333, "mikasa_robo"),
+        ("mikasa_gather_and_recall_3_vla_v0", 0.0833333, "mikasa_robo"),
+        ("mikasa_gather_and_recall_5_vla_v0", 0.0833333, "mikasa_robo"),
+        ("mikasa_remember_shape_5_long_vla_v0", 0.0833333, "mikasa_robo"),
+        ("mikasa_remember_shape_and_color_3x3_long_vla_v0", 0.0833333, "mikasa_robo"),
+        ("mikasa_batteries_checker_easy_3_vla_v0", 0.0833333, "mikasa_robo"),
+        ("mikasa_blink_count_button_press_medium_vla_v0", 0.0833333, "mikasa_robo"),
+        ("mikasa_timed_transfer_medium_vla_v0", 0.0833333, "mikasa_robo"),
+        ("mikasa_trace_shape_medium_vla_v0", 0.0833333, "mikasa_robo"),
+        ("mikasa_intercept_grab_fast_vla_v0", 0.0833333, "mikasa_robo"),
+    ],
 
 }

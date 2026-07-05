@@ -782,6 +782,21 @@ class SingleFrankaRobotiqDeltaJointsDataConfig:
 ###########################################################################################
 
 
+class MikasaRoboDataConfig(Libero4in1DataConfig):
+    """MIKASA-Robo-VLA (ManiSkill3 Franka, converted v3->v2 by
+    scripts/data/mikasa_v3_to_v2.py): same delta-EE 7-D action layout and
+    top/wrist video keys as LIBERO, but 7-D proprio (no 'pad' slot)."""
+
+    state_keys = [
+        "state.x",
+        "state.y",
+        "state.z",
+        "state.roll",
+        "state.pitch",
+        "state.yaw",
+        "state.gripper",
+    ]
+
 
 ROBOT_TYPE_CONFIG_MAP = {
     "libero_franka": Libero4in1DataConfig,
@@ -795,4 +810,5 @@ ROBOT_TYPE_CONFIG_MAP = {
     "oxe_rt1": OxeRT1DataConfig,
     #"demo_sim_franka_delta_joints": SingleFrankaRobotiqDeltaJointsDataConfig(),
     #"custom_robot_config": SingleFrankaRobotiqDeltaEefDataConfig()
+    "mikasa_robo": MikasaRoboDataConfig,
 }
