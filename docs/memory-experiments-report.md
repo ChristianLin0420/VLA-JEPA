@@ -155,3 +155,80 @@ Doubling the credit window produced **zero content use** and **no additional sto
 2. **Train-under-demand** — once T0.8 exists, a branch trained with occlusion/dropout of present-token content (e.g., the dormant `memory_direct_context_dropout` knob, T2.4) is the constructive counterpart to the T2.3 negative.
 3. **T1.1 no-memory twin** — now scoped as the *training-attribution* row only (does the pacing signal help training at all vs a twin?), 40K-step staged commitment.
 4. Paper framing: "What does a differentiable memory learn when the data never asks? Anatomy of an episode clock" — mechanism + diagnosis + benchmark contribution.
+
+---
+
+# Chapter 2 — External memory benchmarks and the content-demand fine-tune (2026-07-05)
+
+## 9. Benchmark adoption
+
+Three external memory benchmarks integrated behind our websocket harness (identical
+episodes/decisions records and memory-mode ablations everywhere): **LIBERO-Mem**
+(AAAI 2026; same robosuite/MuJoCo stack, drop-in), **MIKASA-Robo-VLA** (ManiSkill3/
+SAPIEN; headless Vulkan verified on H100 with zero config), **RoboMME** (ICML 2026
+Spotlight). Full survey and adoption rationale: `docs/memory-benchmark-adoption-plan.md`.
+
+## 10. Zero-shot floors (LIBERO-trained models, memory or not)
+
+| Benchmark | live | foreign | bypass | prior | no-memory baseline (allv2) |
+|---|---|---|---|---|---|
+| LIBERO-Mem (10 tasks × 20) | 0/200 | 0/200 | 0/200 | 0/200 | 0/200 |
+| MIKASA anchors (4 × 50) | 0/200 | — | — | — | — |
+| RoboMME Reference (16 × 50) | 0/800 | — | — | — | — |
+
+Current Markovian-trained VLAs have zero transferable competence on genuine
+memory tasks, with or without a memory module.
+
+## 11. Content-demand fine-tune (T-FT)
+
+15K steps from step_100000; MIKASA anchors at exactly 0.20 of the mixture
+(own `new_embodiment` stats block); recurrent TBPTT pipeline unchanged.
+Closed-loop MIKASA remained at floor post-FT (live 1/200, bypass 0/200) —
+15K × 20% is below the behavioral acquisition threshold; the offline
+discriminator below is therefore the authoritative readout. Vanilla-LIBERO
+regression at mid-FT: 47/78/88/91 → 22/56/69/60 (naive-mixture forgetting;
+a finding in itself).
+
+## 12. THE decisive measurement — offline content-read discriminator, before vs after content-demand training
+
+Paired dMSE vs live on 4,537 identical cached MIKASA segments (Qwen frozen in
+both checkpoints → same caches; 4 anchor tasks × 40 episodes):
+
+| checkpoint | bypass | prior | **shuffled content** |
+|---|---|---|---|
+| pre-FT (100K, LIBERO-only) | −0.0064 | −0.0181 | −0.000030 |
+| post-FT (15K on MIKASA) | +0.0081 | +0.0179 | **−0.000010** |
+
+Three results in one table:
+1. **Content-reading did not emerge** (shuffled ≈ 0 in both rows) — even when
+   the training data causally requires content, at this training dose the
+   policy does not learn to read what the memory demonstrably stores.
+2. **The pathway rows flip sign**: pre-FT, the memory injection *hurt* on
+   out-of-distribution MIKASA data (negative bypass/prior deltas — the DROID
+   negative-transfer result replicated on a third corpus); post-FT the head
+   re-established its clock dependence on the new domain (+0.008/+0.018)
+   within 15K steps. The pacemaker co-adaptation is the attractor state of
+   this architecture under BC, regardless of domain.
+3. Combined with Chapter 1: stored content ✓ (probes), credit window ✓
+   (T2.3), **content demand ✓ (this chapter)** — and content still is not
+   read. The read/fusion mechanism itself (slot-attention read into a small
+   gated residual) is now the primary suspect: gradient descent consistently
+   finds the maturity-statistics shortcut before any content-routing
+   solution, under every condition tested.
+
+**Caveats:** 15K steps at 20% mixture is a modest dose (closed-loop success
+had not emerged either); a MIKASA-dominant or longer run could still differ.
+The clean escalation: (a) heavier/longer content-demand training with the
+discriminator as the tracked metric, (b) read-path redesign (e.g.
+content-addressed retrieval keyed on present-observation uncertainty, or a
+higher-capacity ungated read) trained under the same demand.
+
+## 13. Updated recommendation
+
+The paper is now a complete arc without further compute: *a differentiable
+memory under behavior cloning collapses to an episode pacemaker; this is
+robust to training duration, credit horizon, and even explicit content
+demand at moderate dose; the failure locus is the read pathway; and current
+VLA evaluation practice (Markovian suites) cannot detect any of this.* The
+audit toolkit + three-benchmark floor table + the pre/post discriminator are
+the contributions. Read-path redesign is the follow-up work.
