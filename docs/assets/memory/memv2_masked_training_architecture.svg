@@ -1,0 +1,188 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1680" height="880" viewBox="0 0 1680 880" role="img" aria-labelledby="title desc">
+  <title id="title">memv2 masked-reconstruction memory training architecture</title>
+  <desc id="desc">At a masked decision the observation is blacked before Qwen, the sparse-key memory read produces a whitened content residual plus an explicit time-tap token, and the fused policy tokens feed three tied consumers: the DiT action head, the reused JEPA predictor for masked latent reconstruction, and an episodic InfoNCE head. Writes commit only after prediction.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8.5" refY="3.5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L9,3.5 L0,7 Z" fill="#334155"/>
+    </marker>
+    <marker id="arrowTeal" markerWidth="10" markerHeight="10" refX="8.5" refY="3.5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L9,3.5 L0,7 Z" fill="#3A7D78"/>
+    </marker>
+    <marker id="arrowAmber" markerWidth="10" markerHeight="10" refX="8.5" refY="3.5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L9,3.5 L0,7 Z" fill="#C98B2E"/>
+    </marker>
+    <filter id="softShadow" x="-15%" y="-15%" width="130%" height="140%">
+      <feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#0F172A" flood-opacity="0.10"/>
+    </filter>
+    <style>
+      .title { font: 700 28px Helvetica, Arial, sans-serif; fill: #16324F; }
+      .subtitle { font: 400 15px Helvetica, Arial, sans-serif; fill: #5B6573; }
+      .group { fill: #F8FAFC; stroke: #CBD5E1; stroke-width: 1.2; stroke-dasharray: 6 5; }
+      .group-label { font: 700 14px Helvetica, Arial, sans-serif; letter-spacing: 1.2px; fill: #64748B; }
+      .box { stroke-width: 1.6; filter: url(#softShadow); }
+      .blue { fill: #EAF2F8; stroke: #2F6690; }
+      .teal { fill: #E8F4F2; stroke: #3A7D78; }
+      .amber { fill: #FFF4E1; stroke: #C98B2E; }
+      .gray { fill: #F1F5F9; stroke: #64748B; }
+      .white { fill: #FFFFFF; stroke: #94A3B8; }
+      .label { font: 700 18px Helvetica, Arial, sans-serif; fill: #16324F; text-anchor: middle; }
+      .small { font: 400 14px Helvetica, Arial, sans-serif; fill: #475569; text-anchor: middle; }
+      .tiny { font: 400 12px Helvetica, Arial, sans-serif; fill: #64748B; text-anchor: middle; }
+      .edge { fill: none; stroke: #334155; stroke-width: 1.8; marker-end: url(#arrow); }
+      .mem-edge { fill: none; stroke: #3A7D78; stroke-width: 2.2; marker-end: url(#arrowTeal); }
+      .dependency { fill: none; stroke: #C98B2E; stroke-width: 1.7; stroke-dasharray: 6 5; marker-end: url(#arrowAmber); }
+      .edge-label { font: 600 12px Helvetica, Arial, sans-serif; fill: #475569; text-anchor: middle; }
+      .badge { fill: #FFFFFF; stroke-width: 1.1; }
+      .badge-text { font: 700 10px Helvetica, Arial, sans-serif; letter-spacing: 0.6px; text-anchor: middle; }
+    </style>
+  </defs>
+
+  <rect x="0" y="0" width="1680" height="880" fill="#FFFFFF"/>
+  <text x="840" y="42" class="title" text-anchor="middle">memv2: Masked-Reconstruction Memory Training at Decision t</text>
+  <text x="840" y="68" class="subtitle" text-anchor="middle">Sparse-key read with a whitened content channel and an explicit time tap; three losses tied to the policy's own conditioning tensor; writes commit only after prediction</text>
+
+  <!-- Inputs group -->
+  <rect x="40" y="100" width="250" height="400" rx="12" class="group"/>
+  <text x="60" y="126" class="group-label">INPUTS</text>
+
+  <rect x="60" y="142" width="210" height="64" rx="10" class="box white"/>
+  <text x="165" y="168" class="label" style="font-size:16px">mask_plan[t]</text>
+  <text x="165" y="192" class="tiny">dataloader &#183; deterministic per (epoch, index, seed)</text>
+
+  <rect x="60" y="244" width="210" height="92" rx="10" class="box blue"/>
+  <rect x="160" y="252" width="100" height="20" rx="8" class="badge" stroke="#C98B2E"/>
+  <text x="210" y="266" class="badge-text" fill="#C98B2E">BLACK IF MASKED</text>
+  <text x="165" y="284" class="label">Observation o_t</text>
+  <text x="165" y="308" class="small">both camera views</text>
+  <text x="165" y="328" class="tiny">masked t: frames blacked before the encoder</text>
+  <path d="M165 206 V244" class="dependency"/>
+
+  <rect x="60" y="376" width="210" height="92" rx="10" class="box gray"/>
+  <text x="165" y="408" class="label" style="font-size:16px">video_clean</text>
+  <text x="165" y="432" class="small">true frames of masked t</text>
+  <text x="165" y="453" class="tiny">targets only &#8212; never a model input</text>
+
+  <!-- Qwen and embodied tokens -->
+  <rect x="360" y="244" width="200" height="92" rx="10" class="box blue"/>
+  <rect x="472" y="252" width="78" height="20" rx="8" class="badge" stroke="#2F6690"/>
+  <text x="511" y="266" class="badge-text" fill="#2F6690">FROZEN</text>
+  <text x="460" y="284" class="label">Qwen3-VL</text>
+  <text x="460" y="308" class="small">current-token encoder</text>
+  <text x="460" y="328" class="tiny">robot: embodied + action markers</text>
+  <path d="M270 290 H360" class="edge"/>
+
+  <rect x="620" y="244" width="210" height="92" rx="10" class="box blue"/>
+  <text x="725" y="276" class="label">Embodied tokens E_t</text>
+  <text x="725" y="300" class="small">policy stream</text>
+  <text x="725" y="321" class="tiny">[B, 32, 2048] &#183; near-constant when masked</text>
+  <path d="M560 290 H620" class="edge"/>
+
+  <!-- Memory bridge group -->
+  <rect x="340" y="384" width="890" height="426" rx="12" class="group"/>
+  <text x="360" y="410" class="group-label">MEMORY BRIDGE &#8212; SPARSE-KEY FUSION (MEMV2)</text>
+
+  <rect x="360" y="434" width="230" height="120" rx="10" class="box teal"/>
+  <text x="475" y="464" class="label">State M_(t&#8722;1)</text>
+  <text x="475" y="488" class="small">8 working slots [B, 8, 512]</text>
+  <text x="475" y="509" class="small">&#9733; content keys [B, 8, 128]</text>
+  <text x="475" y="531" class="tiny">steps &#183; valid &#183; FP32</text>
+
+  <rect x="660" y="420" width="260" height="250" rx="10" class="box teal"/>
+  <rect x="852" y="428" width="58" height="20" rx="8" class="badge" stroke="#3A7D78"/>
+  <text x="881" y="442" class="badge-text" fill="#3A7D78">NEW</text>
+  <text x="790" y="452" class="label">Sparse key read</text>
+  <line x1="680" y1="464" x2="900" y2="464" stroke="#A7D3CF" stroke-width="1"/>
+  <text x="790" y="488" class="small">q = qk_proj(LN(E_t))</text>
+  <text x="790" y="512" class="small">top-2 softmax over &#9733; keys</text>
+  <text x="790" y="536" class="small">r&#770; = whiten(out_proj(attn &#183; V))</text>
+  <text x="790" y="560" class="small">content gate g_c(r&#770;, match stats)</text>
+  <text x="790" y="584" class="small">time tap: log(1 + steps)</text>
+  <text x="790" y="610" class="tiny">whitened residual cannot carry norm/maturity</text>
+  <text x="790" y="630" class="tiny">the clock is paid off through the tap</text>
+  <path d="M590 494 H660" class="mem-edge"/>
+  <path d="M725 336 V420" class="edge"/>
+
+  <rect x="990" y="434" width="210" height="120" rx="10" class="box white"/>
+  <text x="1095" y="464" class="label">policy_tokens</text>
+  <text x="1095" y="488" class="small">E_t + tanh(&#947;_c) &#183; (g_c &#8857; r&#770;)</text>
+  <text x="1095" y="509" class="small">&#8853; time-tap token</text>
+  <text x="1095" y="531" class="tiny">[B, 33, 2048]</text>
+  <path d="M920 494 H990" class="mem-edge"/>
+
+  <!-- L_nce -->
+  <rect x="990" y="600" width="210" height="86" rx="10" class="box teal"/>
+  <rect x="1122" y="608" width="58" height="20" rx="8" class="badge" stroke="#3A7D78"/>
+  <text x="1151" y="622" class="badge-text" fill="#3A7D78">NEW</text>
+  <text x="1095" y="632" class="label" style="font-size:16px">L_nce</text>
+  <text x="1095" y="654" class="small">episodic InfoNCE &#215;0.2</text>
+  <text x="1095" y="674" class="tiny">same-task negatives &#183; robot steps</text>
+  <path d="M850 670 V643 H990" class="dependency" stroke="#3A7D78" marker-end="url(#arrowTeal)"/>
+  <text x="905" y="636" class="edge-label">pre-gate residual r</text>
+
+  <!-- Write path -->
+  <rect x="660" y="712" width="260" height="86" rx="10" class="box teal"/>
+  <text x="790" y="740" class="label" style="font-size:16px">Write (after prediction)</text>
+  <text x="790" y="762" class="small">gated convex update + &#9733; key update</text>
+  <text x="790" y="783" class="tiny">masked t: no write (phase A) &#183; count always ticks</text>
+  <path d="M460 336 V755 H660" class="edge"/>
+  <text x="540" y="746" class="edge-label">action markers Z_t [B, 24, 2048]</text>
+  <path d="M475 554 V712 H620 H660" class="mem-edge" opacity="0.85"/>
+
+  <rect x="990" y="712" width="210" height="86" rx="10" class="box teal"/>
+  <text x="1095" y="744" class="label">State M_t</text>
+  <text x="1095" y="768" class="small">to decision t+1</text>
+  <text x="1095" y="788" class="tiny">read-before-write preserved</text>
+  <path d="M920 755 H990" class="mem-edge"/>
+
+  <!-- Consumers: DiT / L_act -->
+  <rect x="1290" y="140" width="180" height="92" rx="10" class="box amber"/>
+  <rect x="1368" y="148" width="92" height="20" rx="8" class="badge" stroke="#C98B2E"/>
+  <text x="1414" y="162" class="badge-text" fill="#C98B2E">UNCHANGED</text>
+  <text x="1380" y="180" class="label">DiT action head</text>
+  <text x="1380" y="204" class="small">cross-attends policy_tokens</text>
+  <text x="1380" y="224" class="tiny">flow matching</text>
+  <path d="M1095 434 V186 H1290" class="edge"/>
+
+  <rect x="1510" y="140" width="130" height="92" rx="10" class="box amber"/>
+  <text x="1575" y="174" class="label">L_act</text>
+  <text x="1575" y="198" class="small">expert chunk [B, 7, 7]</text>
+  <text x="1575" y="219" class="tiny">all steps, incl. masked &#215;1.0</text>
+  <path d="M1470 186 H1510" class="edge"/>
+
+  <!-- Consumers: adapter -> predictor -> L_rec -->
+  <rect x="1290" y="300" width="180" height="86" rx="10" class="box teal"/>
+  <rect x="1394" y="308" width="58" height="20" rx="8" class="badge" stroke="#3A7D78"/>
+  <text x="1423" y="322" class="badge-text" fill="#3A7D78">NEW</text>
+  <text x="1380" y="334" class="label" style="font-size:16px">mem_cond_adapter</text>
+  <text x="1380" y="356" class="small">zero-init &#183; 32&#8594;24 mixer</text>
+  <text x="1380" y="376" class="tiny">grad-scale &#945;=0.1 into policy_tokens</text>
+  <path d="M1200 470 H1244 V343 H1290" class="dependency"/>
+  <rect x="1204" y="252" width="130" height="20" rx="8" class="badge" stroke="#C98B2E"/>
+  <text x="1269" y="266" class="badge-text" fill="#C98B2E">MASKED STEPS ONLY</text>
+
+  <rect x="1290" y="430" width="180" height="112" rx="10" class="box blue"/>
+  <rect x="1386" y="438" width="72" height="20" rx="8" class="badge" stroke="#2F6690"/>
+  <text x="1422" y="452" class="badge-text" fill="#2F6690">REUSED</text>
+  <text x="1380" y="470" class="label">vj_predictor</text>
+  <text x="1380" y="494" class="small">&#9733; wm_mask_token inputs</text>
+  <text x="1380" y="515" class="small">mem_cond conditioning</text>
+  <text x="1380" y="533" class="tiny">RoPE positions unchanged</text>
+  <path d="M1380 386 V430" class="dependency"/>
+
+  <rect x="1510" y="430" width="130" height="112" rx="10" class="box amber"/>
+  <text x="1575" y="464" class="label">L_rec</text>
+  <text x="1575" y="488" class="small">L1 vs frozen teacher</text>
+  <text x="1575" y="509" class="small">masked steps</text>
+  <text x="1575" y="530" class="tiny">&#215;0.5 stage 1 &#8594; &#215;0.2 co-train</text>
+  <path d="M1470 486 H1510" class="dependency"/>
+
+  <rect x="1290" y="590" width="180" height="92" rx="10" class="box gray"/>
+  <text x="1380" y="620" class="label" style="font-size:15px">sg(vj_enc(video_clean))</text>
+  <text x="1380" y="644" class="small">frozen teacher targets</text>
+  <text x="1380" y="665" class="tiny">[B, 768, 2048] &#183; no-grad</text>
+  <path d="M270 422 H310 V636 H1290" class="dependency"/>
+  <path d="M1470 636 H1575 V542" class="dependency"/>
+
+  <!-- Legend -->
+  <text x="60" y="846" class="tiny" text-anchor="start">solid = tensor flow &#183; teal = memory path &#183; dashed amber = masked-step or target-only dependency &#183; &#9733; = new in memv2 &#183; whitening + time tap make the clock shortcut structurally worthless</text>
+</svg>

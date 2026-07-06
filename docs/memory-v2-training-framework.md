@@ -67,33 +67,23 @@ Kept exactly as-is on unmasked robot steps (×0.1 hardcode at `VLA_JEPA.py:403` 
 
 ### 3.1 Forward pass with masking (robot supervised decision t; ★ = new)
 
-```
-mask_plan[t] ──────────────┐ (dataloader; deterministic)
-                           ▼
-image/video ──(★ black if masked)──> _encode_qwen_tokens ──> action_tokens [B,24,2048]
-video_clean ──(targets only)                              └─> embodied_tokens [B,32,2048]
+![memv2 forward pass at a masked decision, showing the blacked observation entering frozen Qwen, the sparse-key memory read producing a whitened content residual plus an explicit time-tap token, the fused policy tokens feeding the DiT action head, the reused JEPA predictor for masked latent reconstruction, and the episodic InfoNCE head, with writes committing only after prediction](assets/memory/memv2_masked_training_architecture.svg)
 
-RecurrentMemory.read(state) ─> tokens [B,8,512] + ★keys [B,8,128]
-                           │
-embodied_tokens ───────────┴──> ★SparseKeyMemoryFusion:
-    q = qk_proj(LN(embodied))                        [B,32,128]
-    scores = q · key_norm(state.keys)ᵀ / √128        [B,32,8]
-    attn  = top2-softmax(scores)  (learnable temp, floor)
-    r     = out_proj(attn · value_proj(state.working))   [B,32,2048]
-    r̂     = LayerNorm_no_affine(r)              ← WHITENED: no norm/maturity carrier
-    g_c   = σ(gate_mlp([proj64(r̂); max score; top1−top2 margin; attn entropy]))
-    tap   = time_mlp(sinusoid64(log(1+steps)))   [B,1,2048]  ← the clock, paid off
-    policy_tokens = [embodied + tanh(γ_c)·(g_c ⊙ r̂) ; tap]   [B,33,2048]
-                           │
-        ┌──────────────────┼───────────────────────────┐
-        ▼                  ▼ (masked steps only)        ▼ (unmasked steps only)
-   DiT action head    ★mem_cond_adapter(policy_tokens) vj_predictor(input_states,
-   → L_act [all]      → vj_predictor(★wm_mask_token,     action_tokens) → L_wm ×0.1
-                         mem_cond) vs sg(vj_enc(video_clean))
-                      → L_rec        (pre-gate r → pooled anchor → ★L_nce)
+*Figure M1. memv2 computation graph at a masked robot decision \(t\). The observation is blacked before the frozen Qwen encoder; `SparseKeyMemoryFusion` reads \(M_{t-1}\) through top-2 key matching, whitens the residual so it cannot carry maturity statistics, and pays the pacemaker off through one explicit time-tap token. All three losses consume `policy_tokens` — the DiT's own conditioning tensor — closing the two-consumer trap: \(L_{act}\) on every step, \(L_{rec}\) through the zero-init `mem_cond_adapter` into the reused `vj_predictor` against frozen `video_clean` teacher latents on masked steps only, and \(L_{nce}\) on the pre-gate residual. Causal current evidence (action markers \(Z_t\)) is written to \(M_t\) only after the prediction tensors are formed; masked steps do not write in phase A, while the decision clock always ticks.*
 
-write: update_mask_t = update_mask & ~masked   (no black-frame writes, phase A)
-       count_mask_t  = update_mask             (★ decision clock always ticks)
+Precise fusion arithmetic (reference for implementation):
+
+```text
+q     = qk_proj(LN(embodied))                        [B,32,128]
+attn  = top2-softmax(q · key_norm(state.keys)ᵀ / √128)   (learnable temp, floor)
+r     = out_proj(attn · value_proj(state.working))   [B,32,2048]
+r̂     = LayerNorm_no_affine(r)                       whitened: no norm/maturity carrier
+g_c   = σ(gate_mlp([proj64(r̂); max score; top1−top2 margin; attn entropy]))
+tap   = time_mlp(sinusoid64(log(1+steps)))           [B,1,2048]
+policy_tokens = [embodied + tanh(γ_c)·(g_c ⊙ r̂) ; tap]   [B,33,2048]
+
+write: update_mask_t = update_mask & ~masked         (no black-frame writes, phase A)
+       count_mask_t  = update_mask                   (★ decision clock always ticks)
        working ← convex gated update (unchanged)
        ★keys  ← (1−ḡ)·prev_keys + ḡ·tanh(key_proj(context))   (bound to write source)
 ```
