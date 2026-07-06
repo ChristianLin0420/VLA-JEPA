@@ -16,16 +16,20 @@ warnings.filterwarnings("ignore")
 from torch.utils.tensorboard import SummaryWriter
 
 import argparse
+import dataclasses
+import hashlib
 import json
 import os
 import sys
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Tuple
 
 import numpy as np
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 import yaml
 from accelerate import Accelerator
 from accelerate.logging import get_logger
@@ -87,6 +91,88 @@ def _migration_missing_prefixes(cfg):
             f"got allow_unexpected_prefixes={unexpected}"
         )
     return tuple(migration.get("allow_missing_prefixes", []))
+
+
+def _stable_id(value) -> int:
+    """Process-stable 63-bit hash for cross-rank metadata comparison."""
+    digest = hashlib.sha256(repr(value).encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big") & 0x7FFFFFFFFFFFFFFF
+
+
+def _all_gather_list(tensor):
+    """Every rank's copy of ``tensor`` (equal shapes required), rank-ordered."""
+    gathered = [torch.empty_like(tensor) for _ in range(dist.get_world_size())]
+    dist.all_gather(gathered, tensor.contiguous())
+    return gathered
+
+
+class EpisodicNCEQueue:
+    """Cross-rank FIFO of detached InfoNCE targets with episode/task metadata.
+
+    Current positives (detached) are gathered across ranks and enqueued
+    before the loss, so same-step cross-rank targets act as negatives.
+    Same-task different-episode entries are the hard negatives and enter the
+    denominator automatically; entries from the anchor's own episode are
+    masked out as false negatives.
+    """
+
+    def __init__(self, size: int = 256, temperature: float = 0.07):
+        self.size = int(size)
+        self.temperature = float(temperature)
+        self.embeddings = None
+        self.tasks = None
+        self.episodes = None
+
+    def _enqueue(self, embeddings, tasks, episodes):
+        if self.embeddings is None:
+            self.embeddings, self.tasks, self.episodes = embeddings, tasks, episodes
+        else:
+            self.embeddings = torch.cat((self.embeddings, embeddings))
+            self.tasks = torch.cat((self.tasks, tasks))
+            self.episodes = torch.cat((self.episodes, episodes))
+        if self.embeddings.shape[0] > self.size:
+            self.embeddings = self.embeddings[-self.size:]
+            self.tasks = self.tasks[-self.size:]
+            self.episodes = self.episodes[-self.size:]
+
+    def loss(self, anchors, positives, task_ids, episode_ids):
+        """Return (InfoNCE loss, scalar diagnostics) for [N, D] unit anchors."""
+        if anchors.ndim != 2 or anchors.shape != positives.shape:
+            raise ValueError("anchors and positives must both have shape [N, D]")
+        candidates = positives.detach()
+        candidate_tasks, candidate_episodes = task_ids, episode_ids
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            candidates = torch.cat(_all_gather_list(candidates))
+            candidate_tasks = torch.cat(_all_gather_list(task_ids))
+            candidate_episodes = torch.cat(_all_gather_list(episode_ids))
+        self._enqueue(candidates, candidate_tasks, candidate_episodes)
+
+        positive_logit = (anchors * positives).sum(dim=-1, keepdim=True)
+        negative_logits = anchors @ self.embeddings.t()
+        false_negative = self.episodes[None, :] == episode_ids[:, None]
+        negative_logits = negative_logits.masked_fill(false_negative, float("-inf"))
+        logits = torch.cat((positive_logit, negative_logits), dim=1) / self.temperature
+        targets = torch.zeros(anchors.shape[0], dtype=torch.long, device=anchors.device)
+        loss = F.cross_entropy(logits, targets)
+
+        diagnostics = {}
+        with torch.no_grad():
+            rows = (~false_negative).any(dim=1)
+            if bool(rows.any()):
+                hardest = negative_logits.max(dim=1).values
+                diagnostics["nce/acc"] = float(
+                    (positive_logit.squeeze(1) > hardest)[rows].float().mean()
+                )
+            same_task = ~false_negative & (self.tasks[None, :] == task_ids[:, None])
+            rows_same = same_task.any(dim=1)
+            if bool(rows_same.any()):
+                hardest_same = negative_logits.masked_fill(
+                    ~same_task, float("-inf")
+                ).max(dim=1).values
+                diagnostics["nce/same_task_acc"] = float(
+                    (positive_logit.squeeze(1) > hardest_same)[rows_same].float().mean()
+                )
+        return loss, diagnostics
 
 
 def setup_directories(cfg) -> Path:
@@ -169,6 +255,16 @@ class VLAMTrainer(TrainerUtils):
         )
         self.processed_decisions = 0
 
+        self.segment_length = segment_length
+        self.rec_loss_weight = float(_cfg_get(cfg, "trainer.rec_loss_weight", 0.0))
+        self.nce_loss_weight = float(_cfg_get(cfg, "trainer.nce_loss_weight", 0.0))
+        self.mask_ramp_steps = int(_cfg_get(cfg, "trainer.mask_ramp_steps", 0))
+        self.memory_mask_rate = float(
+            _cfg_get(cfg, "datasets.vla_data.memory_mask_rate", 0.0)
+        )
+        self._nce_queue = EpisodicNCEQueue() if self.nce_loss_weight else None
+        self._meters_due = False
+
         self.jepa_log_interval = int(_cfg_get(cfg, "trainer.jepa_log_interval", 25))
         self.jepa_figure_interval = int(_cfg_get(cfg, "trainer.jepa_figure_interval", 250))
         self.ckpt_interval = int(_cfg_get(cfg, "trainer.ckpt_interval", _cfg_get(cfg, "trainer.save_interval", 1000)))
@@ -218,6 +314,7 @@ class VLAMTrainer(TrainerUtils):
                 )
             )
         self.accelerator.register_for_checkpointing(self.lr_scheduler)
+        self._configure_mask_schedule()
 
         self.checkpoint_dir = os.path.join(self.config.output_dir, "checkpoints")
         os.makedirs(self.checkpoint_dir, exist_ok=True)
@@ -225,6 +322,32 @@ class VLAMTrainer(TrainerUtils):
         self._init_wandb()
         self.stopper = GracefulStopper(grace_seconds=self.grace_seconds)
         self._maybe_resume()
+
+    def _configure_mask_schedule(self):
+        """Push blind-decision masking knobs to the segment dataset.
+
+        Worker-state inspection: the VLA dataloader forks non-persistent
+        workers at each epoch's ``iter()``, and every worker snapshots the
+        dataset object at fork — the same mechanism ``set_epoch`` relies on.
+        A per-step mutable attribute would therefore go stale inside an
+        epoch, so every schedule input set here is static and
+        ``sample_segment`` derives the linearly ramped rate itself from the
+        (epoch, index) sample ordinal, which also keeps mask plans
+        deterministic under requeue/resume.
+        """
+        if self.memory_mask_rate <= 0.0:
+            return
+        dataset = getattr(self.vla_train_dataloader, "dataset", None)
+        if dataset is None or not callable(getattr(dataset, "sample_segment", None)):
+            raise ValueError(
+                "datasets.vla_data.memory_mask_rate requires the contiguous-segment VLA dataset"
+            )
+        dataset.memory_mask_rate = self.memory_mask_rate
+        dataset.memory_mask_max_per_segment = int(
+            _cfg_get(self.config, "datasets.vla_data.memory_mask_max_per_segment", 1)
+        )
+        # One outer step consumes total_batch_size segments across all ranks.
+        dataset.memory_mask_ramp_samples = self.mask_ramp_steps * self.total_batch_size
 
     def _wandb_run_id(self):
         exp = _cfg_get(self.config, "experiment_id", self.config.run_id)
@@ -377,6 +500,12 @@ class VLAMTrainer(TrainerUtils):
             do_jepa = bool(self.wandb_logger.enabled and step_to_complete % self.jepa_log_interval == 0)
             do_fig = bool(self.wandb_logger.enabled and step_to_complete % self.jepa_figure_interval == 0)
             self._capture = do_jepa or do_fig
+            # Meter cadence is static config + step count, so every rank
+            # agrees and the cross-rank state exchange inside cannot skew.
+            self._meters_due = bool(
+                self.memory_mask_rate > 0.0
+                and step_to_complete % int(self.config.trainer.logging_frequency) == 0
+            )
 
             t0 = time.perf_counter()
             batch_vla, batch_vlm = self._get_next_batch()
@@ -431,7 +560,11 @@ class VLAMTrainer(TrainerUtils):
                         module.capture_diagnostics = bool(getattr(self, "_capture", False))
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 output_dict = self.model(batch_vla)  # __call__ -> DDP grad sync hooks
-                total_loss = sum(output_dict.values())
+            nce_anchor = output_dict.pop("nce_anchor", None)
+            nce_positive = output_dict.pop("nce_positive", None)
+            total_loss, nce_loss, nce_metrics = self._aggregate_vla_losses(
+                output_dict, nce_anchor, nce_positive, batch_vla
+            )
             self.accelerator.backward(total_loss)
             if self._unwrapped is not None:
                 self._unwrapped.capture_jepa = False  # don't let the video pass overwrite
@@ -441,11 +574,14 @@ class VLAMTrainer(TrainerUtils):
                     log_dict["opt/grad_norm_vla"] = float(gn)
                 except Exception:
                     pass
+            # Cache robot-pass memory scalars now: the meter passes and the
+            # video pass below call forward(), which resets the diagnostics.
+            memory_metrics = self._collect_memory_metrics()
+            if self._meters_due:
+                # Counterfactual passes must see pre-update weights.
+                memory_metrics.update(self._memv2_meters(batch_vla, output_dict))
             self.optimizer.step()
             self.lr_scheduler.step()
-            # Cache robot-pass memory scalars now: the video pass below calls
-            # forward() on non-robot batches, which resets last_memory_diagnostics.
-            memory_metrics = self._collect_memory_metrics()
 
             vlm_output = None
             vlm_loss = None
@@ -463,6 +599,9 @@ class VLAMTrainer(TrainerUtils):
 
         for k, v in output_dict.items():
             log_dict[f"loss/vla_{k}"] = v.item()
+        if nce_loss is not None:
+            log_dict["loss/vla_nce_loss"] = float(nce_loss.item())
+            log_dict.update(nce_metrics)
         if vlm_output is not None:
             for k, v in vlm_output.items():
                 log_dict[f"loss/vlm_{k}"] = v.item()
@@ -500,6 +639,157 @@ class VLAMTrainer(TrainerUtils):
                 elif key == "per_slot_delta_norm":
                     metrics[f"memory/{key}"] = float(value.float().mean().item())
         return metrics
+
+    def _aggregate_vla_losses(self, losses, nce_anchor, nce_positive, batch_vla):
+        """memv2 loss assembly.
+
+        With the default-zero weights this reduces exactly to memv1's plain
+        sum over the model's loss dict; ``rec_loss`` is trainer-weighted and
+        the InfoNCE term is computed here from the model's per-step
+        anchor/positive tensors.
+        """
+        total = sum(value for key, value in losses.items() if key != "rec_loss")
+        if "rec_loss" in losses and self.rec_loss_weight:
+            total = total + self.rec_loss_weight * losses["rec_loss"]
+        nce_loss, nce_metrics = None, {}
+        if self.nce_loss_weight and nce_anchor is not None and nce_positive is not None:
+            anchors = nce_anchor.reshape(-1, nce_anchor.shape[-1]).float()
+            positives = nce_positive.reshape(-1, nce_positive.shape[-1]).float()
+            task_ids, episode_ids = self._segment_metadata_ids(
+                batch_vla, anchors.shape[0], anchors.device
+            )
+            nce_loss, nce_metrics = self._nce_queue.loss(
+                anchors, positives, task_ids, episode_ids
+            )
+            total = total + self.nce_loss_weight * nce_loss
+        return total, nce_loss, nce_metrics
+
+    @staticmethod
+    def _segment_metadata_ids(batch_vla, count, device):
+        """Per-anchor (task, episode) ids, tiled to match step-major anchors."""
+        if not batch_vla or count % len(batch_vla) != 0:
+            raise ValueError(
+                f"cannot align {count} NCE anchors with {len(batch_vla)} segments"
+            )
+        tasks, episodes = [], []
+        for segment in batch_vla:
+            dataset_id = str(segment.get("dataset_id", ""))
+            first_step = next(step for step in segment["steps"] if step is not None)
+            tasks.append(_stable_id((dataset_id, str(first_step.get("lang", "")))))
+            episodes.append(_stable_id((dataset_id, int(segment.get("episode_id", -1)))))
+        repeats = count // len(batch_vla)
+        task_ids = torch.tensor(tasks, dtype=torch.int64, device=device)
+        episode_ids = torch.tensor(episodes, dtype=torch.int64, device=device)
+        return task_ids.repeat(repeats), episode_ids.repeat(repeats)
+
+    def _memv2_meters(self, batch_vla, live_losses):
+        """Δbypass/Δforeign no-backward counterfactual passes (design §5).
+
+        Reruns the unwrapped model on the live batch before the optimizer
+        step: once with the fusion forced to bypass, once with the states
+        seen by the last K (= segment_length) memory reads replaced by a
+        maturity-matched foreign episode's — the neighbouring rank's under
+        DDP, the neighbouring batch row when world_size == 1, skipped when
+        neither exists.  Diagnostics capture is forced off so the live-pass
+        scalars collected just before are not clobbered; the local write
+        chain is untouched (foreign content enters at read time only).
+        """
+        model = self._unwrapped
+        memory = getattr(model, "memory_module", None)
+        fusion = getattr(model, "policy_memory_fusion", None)
+        if memory is None or fusion is None:
+            return {}
+        memory.capture_diagnostics = False
+        fusion.capture_diagnostics = False
+
+        meters = {}
+        recorded = []
+        bound_read = memory.read
+        bound_fusion = fusion.forward
+
+        def recording_read(source_tokens, state, **kwargs):
+            recorded.append(state.detach())
+            return bound_read(source_tokens, state, **kwargs)
+
+        def bypass_forward(*args, **kwargs):
+            kwargs["bypass"] = True
+            return bound_fusion(*args, **kwargs)
+
+        autocast = (
+            torch.autocast("cuda", dtype=torch.bfloat16)
+            if torch.cuda.is_available()
+            else nullcontext()
+        )
+        with torch.no_grad():
+            memory.read = recording_read
+            fusion.forward = bypass_forward
+            try:
+                with autocast:
+                    bypassed = model(batch_vla)
+            finally:
+                del memory.read
+                del fusion.forward
+            self._meter_deltas(meters, "bypass", live_losses, bypassed)
+
+            foreign = self._foreign_read_states(recorded)
+            if foreign is None:
+                return meters
+            foreign_working, foreign_keys = foreign
+            first_foreign_call = len(recorded) - foreign_working.shape[0]
+            calls = {"seen": 0}
+
+            def foreign_read(source_tokens, state, **kwargs):
+                position = calls["seen"] - first_foreign_call
+                calls["seen"] += 1
+                if 0 <= position < foreign_working.shape[0]:
+                    state = dataclasses.replace(
+                        state,
+                        working=foreign_working[position],
+                        keys=(
+                            foreign_keys[position]
+                            if foreign_keys is not None
+                            else state.keys
+                        ),
+                    )
+                return bound_read(source_tokens, state, **kwargs)
+
+            memory.read = foreign_read
+            try:
+                with autocast:
+                    foreigned = model(batch_vla)
+            finally:
+                del memory.read
+            self._meter_deltas(meters, "foreign", live_losses, foreigned)
+        return meters
+
+    def _foreign_read_states(self, recorded):
+        """Foreign (working, keys) for the last K supervised reads, or None."""
+        if len(recorded) < self.segment_length:
+            return None
+        supervised = recorded[-self.segment_length:]
+        working = torch.stack([state.working for state in supervised])
+        keys = (
+            torch.stack([state.keys for state in supervised])
+            if supervised[0].keys is not None
+            else None
+        )
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        if world_size > 1:
+            neighbor = (dist.get_rank() + 1) % world_size
+            working = _all_gather_list(working)[neighbor]
+            keys = _all_gather_list(keys)[neighbor] if keys is not None else None
+        elif working.shape[1] > 1:
+            working = working.roll(1, dims=1)
+            keys = keys.roll(1, dims=1) if keys is not None else None
+        else:
+            return None
+        return working, keys
+
+    @staticmethod
+    def _meter_deltas(meters, mode, live, counterfactual):
+        for key, name in (("rec_loss", "rec"), ("action_loss", "act")):
+            if key in live and key in counterfactual:
+                meters[f"meters/delta_{mode}_{name}"] = float(counterfactual[key]) - float(live[key])
 
     def _log_metrics(self, metrics):
         if self.completed_steps % self.config.trainer.logging_frequency != 0:

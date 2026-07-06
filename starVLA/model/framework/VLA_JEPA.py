@@ -28,7 +28,12 @@ from starVLA.model.framework.base_framework import baseframework
 from starVLA.model.modules.vlm import get_vlm_model
 from starVLA.model.modules.action_model.GR00T_ActionHeader import get_action_model, FlowmatchingActionHead
 from starVLA.model.modules.world_model.vj2_predictor import VisionTransformerPredictorAC
-from starVLA.model.modules.memory import MemoryState, RecurrentMemory, ResidualMemoryFusion
+from starVLA.model.modules.memory import (
+    MemoryState,
+    RecurrentMemory,
+    ResidualMemoryFusion,
+    SparseKeyMemoryFusion,
+)
 from starVLA.training.trainer_utils.trainer_tools import resize_images
 from starVLA.model.tools import FRAMEWORK_REGISTRY
 
@@ -40,6 +45,50 @@ class QwenTokenBundle:
     last_hidden: torch.Tensor
     action_tokens: torch.Tensor
     embodied_action_tokens: Optional[torch.Tensor]
+
+
+class _ScaledGradient(torch.autograd.Function):
+    """Identity in the forward pass; scales the gradient by ``alpha``."""
+
+    @staticmethod
+    def forward(ctx, tokens: torch.Tensor, alpha: float) -> torch.Tensor:
+        ctx.alpha = float(alpha)
+        return tokens.view_as(tokens)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        return grad_output * ctx.alpha, None
+
+
+def _scale_grad(tokens: torch.Tensor, alpha: float) -> torch.Tensor:
+    return _ScaledGradient.apply(tokens, alpha)
+
+
+class MemoryConditioningAdapter(nn.Module):
+    """Map fused policy tokens onto predictor-compatible conditioning tokens.
+
+    A learned linear mixer over the token dimension followed by a low-rank
+    residual channel map whose up-projection is zero-initialized, so the
+    adapter is exactly the token mixer at initialization.
+    """
+
+    def __init__(
+        self,
+        num_input_tokens: int,
+        num_output_tokens: int,
+        dim: int,
+        rank: int = 256,
+    ) -> None:
+        super().__init__()
+        self.token_mixer = nn.Linear(num_input_tokens, num_output_tokens)
+        self.channel_down = nn.Linear(dim, rank)
+        self.channel_up = nn.Linear(rank, dim)
+        nn.init.zeros_(self.channel_up.weight)
+        nn.init.zeros_(self.channel_up.bias)
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        mixed = self.token_mixer(tokens.transpose(1, 2)).transpose(1, 2)
+        return mixed + self.channel_up(self.channel_down(mixed))
 
 @FRAMEWORK_REGISTRY.register("VLA_JEPA")
 class VLA_JEPA(baseframework):
@@ -119,6 +168,13 @@ class VLA_JEPA(baseframework):
         self.last_jepa_tensors = None
         self.jepa_num_views = 2
 
+        self.expected_action_token_count = (
+            self.config.framework.vj2_model.num_frames // tubelet_size - 1
+        ) * self.config.framework.vj2_model.num_action_tokens_per_timestep
+        self.expected_embodied_token_count = int(
+            self.config.framework.vj2_model.num_embodied_action_tokens_per_instruction
+        )
+
         # Missing memory configuration remains exactly checkpoint-compatible with
         # the legacy model: no learned memory module is constructed unless enabled.
         memory_cfg = self.config.framework.get("memory", {})
@@ -128,20 +184,71 @@ class VLA_JEPA(baseframework):
         self.policy_memory_fusion = None
         self.last_memory_diagnostics = None
         self.last_qwen_cache = None
+        self._rec_condition_source = "policy_tokens"
         if self.memory_enabled:
-            short_cfg = memory_cfg.get("short_term", {})
-            action_cfg = memory_cfg.get("action_conditioning", {})
-            if not bool(short_cfg.get("enabled", True)):
-                raise ValueError("Phase-1 memory requires framework.memory.short_term.enabled=true")
-            if not bool(action_cfg.get("enabled", True)):
-                raise ValueError("Phase-1 memory requires framework.memory.action_conditioning.enabled=true")
-            if bool(memory_cfg.get("long_term", {}).get("enabled", False)):
-                raise NotImplementedError("long-term associative memory is a Phase-2 feature")
-            if bool(memory_cfg.get("world_model_conditioning", {}).get("enabled", False)):
-                raise NotImplementedError("world-model memory conditioning is a Phase-3 feature")
+            self._build_memory_modules(memory_cfg)
 
-            hidden_dim = int(self.qwen_vl_interface.model.config.hidden_size)
-            memory_dim = int(short_cfg.get("dim", 512))
+    def _build_memory_modules(self, memory_cfg) -> None:
+        short_cfg = memory_cfg.get("short_term", {})
+        action_cfg = memory_cfg.get("action_conditioning", {})
+        if not bool(short_cfg.get("enabled", True)):
+            raise ValueError("Phase-1 memory requires framework.memory.short_term.enabled=true")
+        if not bool(action_cfg.get("enabled", True)):
+            raise ValueError("Phase-1 memory requires framework.memory.action_conditioning.enabled=true")
+        if bool(memory_cfg.get("long_term", {}).get("enabled", False)):
+            raise NotImplementedError("long-term associative memory is a Phase-2 feature")
+        if bool(memory_cfg.get("world_model_conditioning", {}).get("enabled", False)):
+            raise NotImplementedError("world-model memory conditioning is a Phase-3 feature")
+
+        hidden_dim = int(self.qwen_vl_interface.model.config.hidden_size)
+        memory_dim = int(short_cfg.get("dim", 512))
+        if self.memory_schema_version >= 2:
+            num_slots = int(short_cfg.get("num_slots", 8))
+            key_dim = int(short_cfg.get("key_dim", 128))
+            self.memory_module = RecurrentMemory(
+                source_dim=hidden_dim,
+                num_slots=num_slots,
+                memory_dim=memory_dim,
+                num_heads=int(short_cfg.get("num_heads", 8)),
+                update_gate_init=float(short_cfg.get("update_gate_init", 0.1)),
+                key_dim=key_dim,
+                use_keys=True,
+            )
+            self.policy_memory_fusion = SparseKeyMemoryFusion(
+                consumer_dim=hidden_dim,
+                memory_dim=memory_dim,
+                key_dim=key_dim,
+                num_slots=num_slots,
+            )
+            predictor_dim = int(self.vj_encoder.config.hidden_size) * 2
+            self.wm_mask_token = nn.Parameter(torch.empty(predictor_dim))
+            nn.init.normal_(self.wm_mask_token, mean=0.0, std=0.02)
+            # Pre-registered consumer-tie A/B: the private-decoder arm conditions
+            # reconstruction on detached action markers instead of policy tokens.
+            self._rec_condition_source = str(
+                memory_cfg.get("rec_condition_source", "policy_tokens")
+            )
+            if self._rec_condition_source not in ("policy_tokens", "detached_action_tokens"):
+                raise ValueError(
+                    f"unsupported rec_condition_source: {self._rec_condition_source}"
+                )
+            adapter_input_tokens = (
+                self.expected_embodied_token_count + 1
+                if self._rec_condition_source == "policy_tokens"
+                else self.expected_action_token_count
+            )
+            self.mem_cond_adapter = MemoryConditioningAdapter(
+                num_input_tokens=adapter_input_tokens,
+                num_output_tokens=self.expected_action_token_count,
+                dim=hidden_dim,
+            )
+            self.nce_head_h = nn.Sequential(
+                nn.Linear(hidden_dim, 256), nn.GELU(), nn.Linear(256, 256)
+            )
+            self.nce_head_g = nn.Sequential(
+                nn.Linear(predictor_dim, 256), nn.GELU(), nn.Linear(256, 256)
+            )
+        else:
             self.memory_module = RecurrentMemory(
                 source_dim=hidden_dim,
                 num_slots=int(short_cfg.get("num_slots", 8)),
@@ -159,13 +266,6 @@ class VLA_JEPA(baseframework):
                 dropout=float(action_cfg.get("dropout", 0.0)),
                 gate_init=gate_init,
             )
-
-        self.expected_action_token_count = (
-            self.config.framework.vj2_model.num_frames // tubelet_size - 1
-        ) * self.config.framework.vj2_model.num_action_tokens_per_timestep
-        self.expected_embodied_token_count = int(
-            self.config.framework.vj2_model.num_embodied_action_tokens_per_instruction
-        )
 
     def _maybe_capture_jepa(self, predicted_states, gt_states, input_states, action_tokens):
         """Stash detached predictor tensors for representation analysis (logging steps only).
@@ -282,11 +382,12 @@ class VLA_JEPA(baseframework):
                 )
         return QwenTokenBundle(last_hidden, action_tokens, embodied)
 
-    def _compute_world_loss(
+    def _encode_video_latents(
         self,
         batch_videos: List[np.ndarray],
-        action_tokens: torch.Tensor,
-    ) -> torch.Tensor:
+        reference: torch.Tensor,
+    ) -> Tuple[torch.Tensor, int, int]:
+        """Frozen-teacher V-JEPA latents for a batch of multi-view clips."""
         videos = np.stack(batch_videos).transpose(0, 1, 2, 5, 3, 4)
         batch_size, num_views, num_frames, channels, height, width = videos.shape
         videos = videos.reshape(batch_size * num_views, num_frames, channels, height, width)
@@ -297,18 +398,64 @@ class VLA_JEPA(baseframework):
             for i in range(batch_size * num_views)
         ]
         input_videos = torch.cat(processed, dim=0)
-        with self._autocast_context(action_tokens, torch.bfloat16):
+        with self._autocast_context(reference, torch.bfloat16):
             with torch.no_grad():
                 video_embeddings = self.vj_encoder.get_vision_features(pixel_values_videos=input_videos)
                 video_embeddings = torch.cat(torch.chunk(video_embeddings, chunks=num_views, dim=0), dim=2)
-            latent_frames = num_frames // self.vj_encoder.config.tubelet_size
-            tokens_per_frame = video_embeddings.shape[1] // latent_frames
+        latent_frames = num_frames // self.vj_encoder.config.tubelet_size
+        tokens_per_frame = video_embeddings.shape[1] // latent_frames
+        return video_embeddings, tokens_per_frame, latent_frames
+
+    def _compute_world_loss(
+        self,
+        batch_videos: List[np.ndarray],
+        action_tokens: torch.Tensor,
+    ) -> torch.Tensor:
+        video_embeddings, tokens_per_frame, latent_frames = self._encode_video_latents(
+            batch_videos, action_tokens
+        )
+        with self._autocast_context(action_tokens, torch.bfloat16):
             input_states = video_embeddings[:, : tokens_per_frame * (latent_frames - 1), :]
             gt_states = video_embeddings[:, tokens_per_frame:, :]
             predicted_states = self.vj_predictor(input_states, action_tokens)
             world_loss = F.l1_loss(predicted_states, gt_states, reduction="mean")
         self._maybe_capture_jepa(predicted_states, gt_states, input_states, action_tokens)
         return world_loss
+
+    def _compute_recon_loss(
+        self,
+        batch_videos_clean: List[np.ndarray],
+        policy_tokens: torch.Tensor,
+        action_tokens: torch.Tensor,
+    ) -> torch.Tensor:
+        """Masked latent reconstruction decoded through the policy's conditioning tensor."""
+        alpha = float(self.config.trainer.get("mask_grad_alpha", 0.1))
+        video_embeddings, tokens_per_frame, latent_frames = self._encode_video_latents(
+            batch_videos_clean, policy_tokens
+        )
+        with self._autocast_context(policy_tokens, torch.bfloat16):
+            gt_states = video_embeddings[:, tokens_per_frame:, :]
+            input_states = self.wm_mask_token[None, None, :].expand(
+                gt_states.shape[0], tokens_per_frame * (latent_frames - 1), -1
+            )
+            if self._rec_condition_source == "detached_action_tokens":
+                cond_input = action_tokens.detach()
+            else:
+                cond_input = _scale_grad(policy_tokens, alpha)
+            conditioning = self.mem_cond_adapter(cond_input)
+            predicted_states = self.vj_predictor(input_states, conditioning)
+            return F.l1_loss(predicted_states, gt_states, reduction="mean")
+
+    @staticmethod
+    def _black_step_inputs(examples: List[dict]) -> List[dict]:
+        """Blacked shallow copies of robot samples; the originals stay intact."""
+        blacked = []
+        for example in examples:
+            masked = dict(example)
+            masked["image"] = [Image.new(image.mode, image.size) for image in example["image"]]
+            masked["video"] = np.zeros_like(example["video"])
+            blacked.append(masked)
+        return blacked
 
     def _compute_action_loss(
         self,
@@ -345,15 +492,21 @@ class VLA_JEPA(baseframework):
         include_action_loss: bool = True,
         include_world_loss: bool = True,
         fusion_bypass: bool = False,
+        masked: bool = False,
     ) -> Tuple[Dict[str, torch.Tensor], Optional[MemoryState], Dict[str, torch.Tensor]]:
         if not examples:
             raise ValueError("examples must contain at least one sample")
         has_actions = "action" in examples[0]
         if any(("action" in example) != has_actions for example in examples):
             raise ValueError("a decision batch cannot mix robot and video-only samples")
+        if masked and (self.memory_schema_version < 2 or not has_actions):
+            raise ValueError(
+                "masked decisions require robot samples and framework.memory.schema_version >= 2"
+            )
 
-        images = [example["image"] for example in examples]
-        instructions = [example["lang"] for example in examples]
+        inputs = self._black_step_inputs(examples) if masked else examples
+        images = [example["image"] for example in inputs]
+        instructions = [example["lang"] for example in inputs]
         prompt = (
             self.config.datasets.vla_data.get("CoT_prompt", "")
             if has_actions
@@ -389,16 +542,22 @@ class VLA_JEPA(baseframework):
             state_before = self.memory_module.reset_state(state_before, reset_mask)
             memory_read = self.memory_module.read(qwen.action_tokens, state_before, read_mask=active_mask)
             diagnostics.update(memory_read.diagnostics)
-            policy_tokens = self.policy_memory_fusion(
-                policy_tokens, memory_read.tokens, bypass=fusion_bypass
-            )
-            diagnostics["policy_gate"] = torch.tanh(self.policy_memory_fusion.gate).detach()
+            if self.memory_schema_version >= 2:
+                policy_tokens = self.policy_memory_fusion(
+                    policy_tokens, state_before, bypass=fusion_bypass
+                )
+                diagnostics["policy_gate"] = torch.tanh(self.policy_memory_fusion.gamma_c).detach()
+            else:
+                policy_tokens = self.policy_memory_fusion(
+                    policy_tokens, memory_read.tokens, bypass=fusion_bypass
+                )
+                diagnostics["policy_gate"] = torch.tanh(self.policy_memory_fusion.gate).detach()
 
         losses: Dict[str, torch.Tensor] = {}
         scaled_world_loss = None
-        if include_world_loss:
+        if include_world_loss and not masked:
             world_loss = self._compute_world_loss(
-                [example["video"] for example in examples], qwen.action_tokens
+                [example["video"] for example in inputs], qwen.action_tokens
             )
             scaled_world_loss = world_loss if not has_actions else world_loss * 0.1
 
@@ -412,12 +571,26 @@ class VLA_JEPA(baseframework):
             )
         if scaled_world_loss is not None:
             losses["wm_loss"] = scaled_world_loss
+        if masked:
+            losses["rec_loss"] = self._compute_recon_loss(
+                [example["video_clean"] for example in examples],
+                policy_tokens,
+                qwen.action_tokens,
+            )
 
         state_after = state_before
         # The writer is deliberately invoked only after all requested prediction/loss
         # tensors have been formed.  It consumes current Qwen markers, never targets.
         if self.memory_enabled and has_actions:
-            state_after = self.memory_module.write(qwen.action_tokens, state_before, update_mask=update_mask)
+            if self.memory_schema_version >= 2:
+                write_mask = torch.zeros_like(update_mask) if masked else update_mask
+                state_after = self.memory_module.write(
+                    qwen.action_tokens, state_before, update_mask=write_mask, count_mask=update_mask
+                )
+            else:
+                state_after = self.memory_module.write(
+                    qwen.action_tokens, state_before, update_mask=update_mask
+                )
         return losses, state_after, diagnostics
 
     def forward(self, examples: List[dict] = None, **kwargs) -> Dict[str, torch.Tensor]:
@@ -444,13 +617,25 @@ class VLA_JEPA(baseframework):
         memory_state = self.memory_module.init_state(batch_size, device=memory_device)
         action_losses: List[torch.Tensor] = []
         world_losses: List[torch.Tensor] = []
+        recon_losses: List[torch.Tensor] = []
+        nce_anchors: List[torch.Tensor] = []
         last_diagnostics: Dict[str, torch.Tensor] = {}
         include_robot_world = bool(self.config.trainer.get("robot_world_model_loss", True))
         bptt_steps = max(1, int(self.config.trainer.get("memory_bptt_steps", 4)))
         detach_burn_in = bool(self.config.trainer.get("memory_detach_burn_in", True))
         supervised_in_window = 0
+        supervised_index = 0
         entered_supervised = False
         had_burn_in_update = False
+
+        mask_plans = [
+            np.asarray(segment["mask_plan"], dtype=bool) if segment.get("mask_plan") is not None else None
+            for segment in segments
+        ]
+        if self.memory_schema_version < 2 and any(
+            plan is not None and bool(plan.any()) for plan in mask_plans
+        ):
+            raise ValueError("mask_plan requires framework.memory.schema_version >= 2")
 
         carriers = []
         for segment in segments:
@@ -493,7 +678,18 @@ class VLA_JEPA(baseframework):
                 raise ValueError(
                     "Phase-1 action loss is scalar; every row must be valid at supervised timesteps"
                 )
+            masked = False
             if supervised:
+                flags = [
+                    bool(plan[supervised_index]) if plan is not None else False
+                    for plan in mask_plans
+                ]
+                if any(flags) and not all(flags):
+                    raise ValueError(
+                        "mask_plan must agree across batch rows at each supervised decision"
+                    )
+                masked = flags[0]
+                supervised_index += 1
                 if not entered_supervised and detach_burn_in and had_burn_in_update:
                     memory_state = memory_state.detach()
                 elif supervised_in_window >= bptt_steps:
@@ -508,12 +704,25 @@ class VLA_JEPA(baseframework):
                 update_mask=update_mask,
                 include_action_loss=supervised,
                 include_world_loss=supervised and include_robot_world,
+                masked=masked,
             )
             if supervised:
                 supervised_in_window += 1
                 action_losses.append(losses["action_loss"])
                 if "wm_loss" in losses:
                     world_losses.append(losses["wm_loss"])
+                if "rec_loss" in losses:
+                    recon_losses.append(losses["rec_loss"])
+                if (
+                    self.memory_schema_version >= 2
+                    and self.policy_memory_fusion.last_residual is not None
+                ):
+                    nce_anchors.append(
+                        F.normalize(
+                            self.nce_head_h(self.policy_memory_fusion.last_residual.mean(dim=1)),
+                            dim=-1,
+                        )
+                    )
             elif bool(update_mask.any()):
                 had_burn_in_update = True
 
@@ -522,10 +731,37 @@ class VLA_JEPA(baseframework):
         output = {"action_loss": torch.stack(action_losses).mean()}
         if world_losses:
             output["wm_loss"] = torch.stack(world_losses).mean()
+        if recon_losses:
+            output["rec_loss"] = torch.stack(recon_losses).mean()
+        if nce_anchors:
+            positive = self._nce_positive(segments, nce_anchors[0])
+            output["nce_anchor"] = torch.cat(nce_anchors, dim=0)
+            output["nce_positive"] = positive.repeat(len(nce_anchors), 1)
         self.last_memory_diagnostics = {
             key: value.detach() for key, value in last_diagnostics.items()
         } if last_diagnostics else None
         return output
+
+    def _nce_positive(self, segments: List[dict], reference: torch.Tensor) -> torch.Tensor:
+        """Frozen-teacher positive from one unmasked past decision per row.
+
+        The source is the decision four before the first supervised decision
+        when the burn-in reaches that far, else the row's earliest valid
+        decision; both are structurally unmasked.
+        """
+        sources = []
+        for segment in segments:
+            valid = np.asarray(segment["sequence_valid"], dtype=bool)
+            first_supervised = int(np.flatnonzero(np.asarray(segment["loss_mask"], dtype=bool))[0])
+            source = first_supervised - 4
+            if source < 0 or not valid[source]:
+                source = int(np.flatnonzero(valid)[0])
+            sources.append(segment["steps"][source])
+        latents, tokens_per_frame, _ = self._encode_video_latents(
+            [example["video"] for example in sources], reference
+        )
+        pooled = latents[:, tokens_per_frame:, :].mean(dim=1)
+        return F.normalize(self.nce_head_g(pooled), dim=-1)
 
     @torch.inference_mode()
     def predict_action(
@@ -577,7 +813,10 @@ class VLA_JEPA(baseframework):
             state_before = self.memory_module.reset_state(state_before, reset)
             memory_read = self.memory_module.read(qwen.action_tokens, state_before)
             diagnostics.update(memory_read.diagnostics)
-            embodied = self.policy_memory_fusion(embodied, memory_read.tokens)
+            if self.memory_schema_version >= 2:
+                embodied = self.policy_memory_fusion(embodied, state_before)
+            else:
+                embodied = self.policy_memory_fusion(embodied, memory_read.tokens)
 
         proprio = (
             torch.as_tensor(np.array(state), device=embodied.device, dtype=embodied.dtype)

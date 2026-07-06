@@ -26,6 +26,8 @@ class RecurrentMemory(nn.Module):
         update_gate_init: float = 0.1,
         dropout: float = 0.0,
         init_std: float = 0.02,
+        key_dim: int = 128,
+        use_keys: bool = False,
     ) -> None:
         super().__init__()
         if source_dim <= 0 or memory_dim <= 0 or num_slots <= 0:
@@ -36,11 +38,15 @@ class RecurrentMemory(nn.Module):
             raise ValueError("update_gate_init must lie strictly between zero and one")
         if not 0.0 <= dropout < 1.0:
             raise ValueError("dropout must lie in [0, 1)")
+        if use_keys and key_dim <= 0:
+            raise ValueError("key_dim must be positive when use_keys is set")
 
         self.source_dim = int(source_dim)
         self.memory_dim = int(memory_dim)
         self.num_slots = int(num_slots)
         self.num_heads = int(num_heads)
+        self.key_dim = int(key_dim)
+        self.use_keys = bool(use_keys)
 
         self.initial_slots = nn.Parameter(torch.empty(num_slots, memory_dim, dtype=torch.float32))
         self.slot_ids = nn.Parameter(torch.empty(num_slots, memory_dim, dtype=torch.float32))
@@ -55,6 +61,19 @@ class RecurrentMemory(nn.Module):
         )
         self.update_gate = nn.Linear(2 * memory_dim, memory_dim)
         self.candidate_projection = nn.Linear(memory_dim, memory_dim)
+
+        # Schema-2 content keys.  Created under a forked RNG so a seeded
+        # use_keys=True module keeps bit-identical base parameters to memv1;
+        # key parameters are (re)initialized last in `_reset_parameters`.
+        if self.use_keys:
+            with torch.random.fork_rng(devices=[]):
+                self.initial_keys = nn.Parameter(
+                    torch.empty(num_slots, self.key_dim, dtype=torch.float32)
+                )
+                self.key_projection = nn.Linear(memory_dim, self.key_dim)
+        else:
+            self.initial_keys = None
+            self.key_projection = None
 
         # Diagnostics side-channel (mirrors the framework's `capture_jepa`
         # pattern): read()/write() populate the attributes below only while
@@ -82,6 +101,11 @@ class RecurrentMemory(nn.Module):
         nn.init.zeros_(self.update_gate.weight)
         gate_logit = math.log(update_gate_init / (1.0 - update_gate_init))
         nn.init.constant_(self.update_gate.bias, gate_logit)
+
+        if self.use_keys:
+            nn.init.normal_(self.initial_keys, mean=0.0, std=init_std)
+            nn.init.xavier_uniform_(self.key_projection.weight)
+            nn.init.zeros_(self.key_projection.bias)
 
     @property
     def device(self) -> torch.device:
@@ -113,6 +137,10 @@ class RecurrentMemory(nn.Module):
             raise ValueError(
                 f"memory state is on {state.working.device}, but module parameters are on {self.device}"
             )
+        if self.use_keys:
+            expected_keys = (state.batch_size, self.num_slots, self.key_dim)
+            if state.keys is None or state.keys.shape != expected_keys:
+                raise ValueError(f"keys must have shape {expected_keys} when use_keys is set")
 
     def _validate_source(self, source_tokens: torch.Tensor, state: MemoryState) -> None:
         if not isinstance(source_tokens, torch.Tensor) or source_tokens.ndim != 3:
@@ -154,11 +182,16 @@ class RecurrentMemory(nn.Module):
         learned = self.initial_slots.to(dtype=torch.float32).unsqueeze(0).expand(batch_size, -1, -1)
         working = learned.clone()
         working = torch.where(valid[:, None, None], working, torch.zeros_like(working))
+        keys = None
+        if self.use_keys:
+            keys = self.initial_keys.to(dtype=torch.float32).unsqueeze(0).expand(batch_size, -1, -1).clone()
+            keys = torch.where(valid[:, None, None], keys, torch.zeros_like(keys))
         return MemoryState(
             working=working,
             episodic=None,
             steps=torch.zeros(batch_size, device=device, dtype=torch.int64),
             valid=valid.clone(),
+            keys=keys,
         )
 
     def reset_state(
@@ -202,11 +235,18 @@ class RecurrentMemory(nn.Module):
             episodic = torch.where(reset[:, None, None], torch.zeros_like(episodic), episodic)
             episodic = torch.where(valid[:, None, None], episodic, torch.zeros_like(episodic))
 
+        keys = state.keys
+        if self.use_keys:
+            initial_keys = self.initial_keys.to(dtype=torch.float32).unsqueeze(0).expand(state.batch_size, -1, -1)
+            keys = torch.where(reset[:, None, None], initial_keys, state.keys)
+            keys = torch.where(valid[:, None, None], keys, torch.zeros_like(keys))
+
         return MemoryState(
             working=working.clone(),
             episodic=episodic.clone() if episodic is not None else None,
             steps=steps.clone(),
             valid=valid.clone(),
+            keys=keys.clone() if keys is not None else None,
         )
 
     def read(
@@ -250,8 +290,13 @@ class RecurrentMemory(nn.Module):
         source_tokens: torch.Tensor,
         state: MemoryState,
         update_mask: Optional[torch.Tensor] = None,
+        count_mask: Optional[torch.Tensor] = None,
     ) -> MemoryState:
-        """Write current safe source tokens into a new FP32 working state."""
+        """Write current safe source tokens into a new FP32 working state.
+
+        ``count_mask`` decouples the decision clock from slot updates; when
+        omitted, ``steps`` follows the update semantics (memv1 behavior).
+        """
 
         self._validate_state(state)
         self._validate_source(source_tokens, state)
@@ -261,6 +306,15 @@ class RecurrentMemory(nn.Module):
             active = self._validate_mask(
                 update_mask,
                 name="update_mask",
+                batch_size=state.batch_size,
+                device=state.working.device,
+            ) & state.valid
+        if count_mask is None:
+            counting = active
+        else:
+            counting = self._validate_mask(
+                count_mask,
+                name="count_mask",
                 batch_size=state.batch_size,
                 device=state.working.device,
             ) & state.valid
@@ -286,7 +340,14 @@ class RecurrentMemory(nn.Module):
             proposed = (1.0 - gate) * previous + gate * candidate
 
             working = torch.where(active[:, None, None], proposed, previous)
-            steps = state.steps + active.to(dtype=torch.int64)
+            steps = state.steps + counting.to(dtype=torch.int64)
+
+            keys = state.keys
+            if self.use_keys:
+                gate_mean = gate.mean(dim=-1, keepdim=True)
+                key_candidate = torch.tanh(self.key_projection(context))
+                proposed_keys = (1.0 - gate_mean) * state.keys + gate_mean * key_candidate
+                keys = torch.where(active[:, None, None], proposed_keys, state.keys)
 
         if self.capture_diagnostics:
             gate_values = gate.detach().reshape(-1)
@@ -311,4 +372,5 @@ class RecurrentMemory(nn.Module):
             episodic=state.episodic,
             steps=steps,
             valid=state.valid,
+            keys=keys,
         )

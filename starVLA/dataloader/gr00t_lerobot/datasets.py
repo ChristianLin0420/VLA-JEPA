@@ -1714,6 +1714,42 @@ class LeRobotMixtureDataset(Dataset):
         episode_id = int(catalog["trajectory_ids"][trajectory_index])
         return dataset, catalog, trajectory_index, episode_id, supervised_start
 
+    # Blind-decision masking knobs (memv2).  Deliberately plain class
+    # attributes: the trainer assigns them once before dataloader workers
+    # fork (see VLAMTrainer._configure_mask_schedule), and the defaults
+    # reproduce memv1 exactly — no masking, no extra sample keys.
+    memory_mask_rate = 0.0
+    memory_mask_max_per_segment = 1
+    memory_mask_ramp_samples = 0
+
+    def _sample_mask_plan(self, index: int) -> np.ndarray:
+        """Deterministic blind-decision plan over the K supervised decisions.
+
+        Drawn from a dedicated child stream keyed like the decode-retry
+        stream, so segment selection is bit-identical with masking on or
+        off.  The first supervised decision is never masked and burn-in
+        positions are outside the plan by construction.  The linear ramp is
+        derived here from the global sample ordinal because dataloader
+        workers snapshot the dataset at fork time.
+        """
+
+        effective_epoch = self.epoch if self.mode == "train" else 0
+        rate = float(self.memory_mask_rate)
+        if self.memory_mask_ramp_samples > 0:
+            ordinal = effective_epoch * len(self) + int(index)
+            rate *= min(1.0, ordinal / float(self.memory_mask_ramp_samples))
+        rng = np.random.default_rng(
+            safe_hash(("mask-v1", effective_epoch, int(index), self.seed))
+        )
+        plan = np.zeros(self.segment_length, dtype=np.bool_)
+        budget = int(self.memory_mask_max_per_segment)
+        for position in range(1, self.segment_length):
+            # Draw before the budget check so per-position draws do not
+            # depend on the configured cap.
+            if rng.random() < rate and int(plan.sum()) < budget:
+                plan[position] = True
+        return plan
+
     def sample_segment(self, index: int, retry_attempt: int = 0) -> dict:
         """Return one fixed-size burn-in + supervised segment.
 
@@ -1780,7 +1816,7 @@ class LeRobotMixtureDataset(Dataset):
         if len(steps) != total_length:
             raise AssertionError("internal error: segment payload has wrong length")
 
-        return {
+        segment = {
             "steps": steps,
             "dataset_id": str(dataset.dataset_name),
             "episode_id": episode_id,
@@ -1792,6 +1828,15 @@ class LeRobotMixtureDataset(Dataset):
             "loss_mask": loss_mask,
             "update_mask": update_mask,
         }
+        if self.memory_mask_rate > 0.0:
+            mask_plan = self._sample_mask_plan(index)
+            for offset in np.flatnonzero(mask_plan):
+                masked_step = steps[burn_in + int(offset)]
+                # Clean copy for the reconstruction teacher; blacking itself
+                # happens in the model, the dataloader only flags.
+                masked_step["video_clean"] = masked_step["video"].copy()
+            segment["mask_plan"] = mask_plan
+        return segment
 
     def sample_step(self, index: int) -> tuple[LeRobotSingleDataset, int, int]:
         """Sample a single step from the dataset."""

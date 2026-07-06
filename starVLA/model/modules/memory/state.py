@@ -24,12 +24,15 @@ class MemoryState:
             dtype ``torch.int64``.
         valid: Whether each row represents an active, non-padding episode,
             shape ``[B]`` and dtype ``torch.bool``.
+        keys: Optional per-slot content keys ``[B, S, Dk]`` in FP32 (schema 2).
+            ``None`` under schema 1.
     """
 
     working: torch.Tensor
     episodic: Optional[torch.Tensor]
     steps: torch.Tensor
     valid: torch.Tensor
+    keys: Optional[torch.Tensor] = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.working, torch.Tensor) or self.working.ndim != 3:
@@ -56,9 +59,19 @@ class MemoryState:
             if self.episodic.dtype != torch.float32:
                 raise TypeError(f"episodic must be float32, got {self.episodic.dtype}")
 
+        if self.keys is not None:
+            if not isinstance(self.keys, torch.Tensor) or self.keys.ndim != 3:
+                raise ValueError("keys must be None or a tensor with shape [B, S, Dk]")
+            if self.keys.shape[0] != batch_size:
+                raise ValueError("keys and working must have the same batch size")
+            if self.keys.dtype != torch.float32:
+                raise TypeError(f"keys must be float32, got {self.keys.dtype}")
+
         tensors = [self.steps, self.valid]
         if self.episodic is not None:
             tensors.append(self.episodic)
+        if self.keys is not None:
+            tensors.append(self.keys)
         if any(t.device != self.working.device for t in tensors):
             raise ValueError("all MemoryState tensors must be on the same device")
 
@@ -74,6 +87,7 @@ class MemoryState:
             episodic=self.episodic.detach() if self.episodic is not None else None,
             steps=self.steps.detach(),
             valid=self.valid.detach(),
+            keys=self.keys.detach() if self.keys is not None else None,
         )
 
     def to(self, *, device: torch.device) -> "MemoryState":
@@ -84,6 +98,7 @@ class MemoryState:
             episodic=self.episodic.to(device=device) if self.episodic is not None else None,
             steps=self.steps.to(device=device),
             valid=self.valid.to(device=device),
+            keys=self.keys.to(device=device) if self.keys is not None else None,
         )
 
 

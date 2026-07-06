@@ -168,4 +168,38 @@ DATASET_NAMED_MIXTURES = {
         ("mikasa_intercept_grab_fast_vla_v0", 0.0833333, "mikasa_robo"),
     ],
 
+    # memv2 stage-1 mixture, per the G0 demand-audit verdict: vanilla LIBERO
+    # carries ~zero manufacturable episode-specific demand (R2 gap <= 0 on all
+    # four suites), so half the draw mass is content-demanding data.
+    # LIBERO 4x1.0 = 4.0; LIBERO-Mem 2.0; MIKASA anchors 21 x 2/21 = 2.0
+    # -> demand fraction (libero_mem + mikasa) = 4/8 = 50%.
+    "memv2_stage1_mix": [
+        ("libero_object_no_noops_1.0.0_lerobot", 1.0, "libero_franka"),
+        ("libero_goal_no_noops_1.0.0_lerobot", 1.0, "libero_franka"),
+        ("libero_spatial_no_noops_1.0.0_lerobot", 1.0, "libero_franka"),
+        ("libero_10_no_noops_1.0.0_lerobot", 1.0, "libero_franka"),
+        ("libero_mem_1.0.0_lerobot", 2.0, "libero_franka"),
+        ("mikasa_shell_game_shuffle_touch_vla_v0", 0.0952381, "mikasa_robo"),
+        ("mikasa_shell_game_shuffle_touch_long_vla_v0", 0.0952381, "mikasa_robo"),
+        ("mikasa_shell_game_shuffle_color_lamp_touch_vla_v0", 0.0952381, "mikasa_robo"),
+        ("mikasa_remember_color_3_long_vla_v0", 0.0952381, "mikasa_robo"),
+        ("mikasa_remember_color_5_long_vla_v0", 0.0952381, "mikasa_robo"),
+        ("mikasa_remember_color_9_long_vla_v0", 0.0952381, "mikasa_robo"),
+        ("mikasa_take_it_back_vla_v0", 0.0952381, "mikasa_robo"),
+        ("mikasa_chain_of_colors_3_vla_v0", 0.0952381, "mikasa_robo"),
+        ("mikasa_chain_of_colors_5_vla_v0", 0.0952381, "mikasa_robo"),
+        ("mikasa_chain_of_colors_7_vla_v0", 0.0952381, "mikasa_robo"),
+        ("mikasa_seq_of_colors_5_vla_v0", 0.0952381, "mikasa_robo"),
+        ("mikasa_bunch_of_colors_5_vla_v0", 0.0952381, "mikasa_robo"),
+        ("mikasa_gather_and_recall_3_vla_v0", 0.0952381, "mikasa_robo"),
+        ("mikasa_gather_and_recall_5_vla_v0", 0.0952381, "mikasa_robo"),
+        ("mikasa_remember_shape_5_long_vla_v0", 0.0952381, "mikasa_robo"),
+        ("mikasa_remember_shape_and_color_3x3_long_vla_v0", 0.0952381, "mikasa_robo"),
+        ("mikasa_batteries_checker_easy_3_vla_v0", 0.0952381, "mikasa_robo"),
+        ("mikasa_blink_count_button_press_medium_vla_v0", 0.0952381, "mikasa_robo"),
+        ("mikasa_timed_transfer_medium_vla_v0", 0.0952381, "mikasa_robo"),
+        ("mikasa_trace_shape_medium_vla_v0", 0.0952381, "mikasa_robo"),
+        ("mikasa_intercept_grab_fast_vla_v0", 0.0952381, "mikasa_robo"),
+    ],
+
 }
