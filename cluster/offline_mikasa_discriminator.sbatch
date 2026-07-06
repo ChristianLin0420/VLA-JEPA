@@ -26,7 +26,7 @@ PY=/lustre/fsw/portfolios/edgeai/users/chrislin/miniconda3/envs/VLA_JEPA/bin/pyt
 FT_RUN=/lustre/fsw/portfolios/edgeai/users/chrislin/vlajepa_runs/vlajepa_memv1_mikasa_ft
 PRE_CKPT=/lustre/fsw/portfolios/edgeai/users/chrislin/vlajepa_runs/vlajepa_memv1_cotrain/checkpoints/VLA-JEPA-memv1-live-step_100000.pt
 DATA_ROOT=/lustre/fsw/portfolios/edgeai/users/chrislin/vlajepa_stage/datasets/lerobot
-ANCHORS=(mikasa_shell_game_touch_vla_v0 mikasa_remember_color9_long_vla_v0 mikasa_take_it_back_vla_v0 mikasa_chain_of_colors7_vla_v0)
+ANCHORS=(mikasa_shell_game_shuffle_touch_vla_v0 mikasa_remember_color_9_long_vla_v0 mikasa_take_it_back_vla_v0 mikasa_chain_of_colors_7_vla_v0)
 OUT_ROOT=results/offline/mikasa_disc
 MAX_EPISODES="${MAX_EPISODES:-40}"
 mkdir -p "$OUT_ROOT"
