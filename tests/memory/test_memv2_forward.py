@@ -391,7 +391,7 @@ class ConstructionTest(unittest.TestCase):
             }
         )
 
-    def _constructed(self, schema_version):
+    def _constructed(self, schema_version, memory_cfg=None):
         model = _bare_model(_config())
         model.qwen_vl_interface = SimpleNamespace(
             model=SimpleNamespace(config=SimpleNamespace(hidden_size=HIDDEN))
@@ -403,7 +403,7 @@ class ConstructionTest(unittest.TestCase):
         model.memory_schema_version = schema_version
         model.memory_module = None
         model.policy_memory_fusion = None
-        model._build_memory_modules(self._memory_cfg(schema_version))
+        model._build_memory_modules(memory_cfg or self._memory_cfg(schema_version))
         return model
 
     def test_schema_one_builds_bit_identical_memv1_module_tree(self):
@@ -449,6 +449,16 @@ class ConstructionTest(unittest.TestCase):
         )
         self.assertEqual(model.nce_head_h[-1].out_features, 256)
         self.assertEqual(model.nce_head_g[0].in_features, TEACHER_DIM)
+        # Absent config key defaults to the closed gate.
+        self.assertEqual(float(model.policy_memory_fusion.gamma_c), 0.0)
+
+    def test_schema_two_threads_content_gate_init(self):
+        cfg = self._memory_cfg(schema_version=2)
+        cfg.action_conditioning.content_gate_init = 0.05
+        model = self._constructed(schema_version=2, memory_cfg=cfg)
+        self.assertEqual(
+            float(model.policy_memory_fusion.gamma_c), float(torch.tensor(0.05))
+        )
 
 
 class PredictActionTest(unittest.TestCase):

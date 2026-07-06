@@ -8,7 +8,11 @@ from omegaconf import OmegaConf
 from torch import nn
 
 import starVLA.training.train_vlajepa_cotrain as cotrain
-from starVLA.model.modules.memory import RecurrentMemory, ResidualMemoryFusion
+from starVLA.model.modules.memory import (
+    RecurrentMemory,
+    ResidualMemoryFusion,
+    SparseKeyMemoryFusion,
+)
 
 
 def _unit(rows):
@@ -33,17 +37,38 @@ def _fake_segment(dataset_id, episode_id, lang):
 
 
 class _StubSegmentModel(nn.Module):
-    """Minimal read -> fuse -> write unroll exposing the meter contract."""
+    """Minimal read -> fuse -> write unroll exposing the meter contract.
 
-    def __init__(self, steps=3):
+    ``schema2=True`` mirrors the memv2 topology: keyed memory plus a
+    SparseKeyMemoryFusion that consumes the pre-write MemoryState directly
+    (the read output feeds nothing downstream), with an opened content gate.
+    Segments may carry a per-step boolean ``mask_plan``; ``rec_loss`` is then
+    computed from the fused tokens of the masked steps only, mirroring the
+    real masked-step threading.  Without a mask_plan every step contributes
+    (the legacy stub behaviour).  ``read_state_overrides`` maps step index to
+    a full replacement MemoryState for explicit foreign counterfactuals.
+    """
+
+    def __init__(self, steps=3, schema2=False):
         super().__init__()
         torch.manual_seed(0)
-        self.memory_module = RecurrentMemory(
-            source_dim=6, memory_dim=4, num_slots=2, num_heads=2, update_gate_init=0.3
-        )
-        self.policy_memory_fusion = ResidualMemoryFusion(
-            consumer_dim=6, memory_dim=4, bottleneck_dim=4, num_heads=2, gate_init=0.8
-        )
+        self.schema2 = schema2
+        if schema2:
+            self.memory_module = RecurrentMemory(
+                source_dim=6, memory_dim=4, num_slots=2, num_heads=2,
+                update_gate_init=0.3, use_keys=True, key_dim=4,
+            )
+            self.policy_memory_fusion = SparseKeyMemoryFusion(
+                consumer_dim=6, memory_dim=4, key_dim=4, num_slots=2,
+                content_gate_init=0.5,
+            )
+        else:
+            self.memory_module = RecurrentMemory(
+                source_dim=6, memory_dim=4, num_slots=2, num_heads=2, update_gate_init=0.3
+            )
+            self.policy_memory_fusion = ResidualMemoryFusion(
+                consumer_dim=6, memory_dim=4, bottleneck_dim=4, num_heads=2, gate_init=0.8
+            )
         self.steps = steps
         self.force_bypass = False
         self.read_state_overrides = {}
@@ -51,30 +76,42 @@ class _StubSegmentModel(nn.Module):
 
     def forward(self, segments):
         tokens = torch.stack([segment["tokens"] for segment in segments])
+        mask_plan = segments[0].get("mask_plan")
+        if mask_plan is None:
+            mask_plan = [True] * self.steps
         state = self.memory_module.init_state(len(segments), torch.device("cpu"))
         fused_steps = []
+        rec_terms = []
         self.read_states = []
         for t in range(self.steps):
             source = tokens[:, t]
             self.read_states.append(state.detach())
-            read_state = state
-            override = self.read_state_overrides.get(t)
-            if override is not None:
-                read_state = dataclasses.replace(state, working=override)
+            read_state = self.read_state_overrides.get(t)
+            if read_state is None:
+                read_state = state
             read = self.memory_module.read(source, read_state)
             fused = self.policy_memory_fusion(
-                source, read.tokens, bypass=self.force_bypass
+                source,
+                read_state if self.schema2 else read.tokens,
+                bypass=self.force_bypass,
             )
             fused_steps.append(fused)
+            if mask_plan[t]:
+                rec_terms.append(fused.square().mean())
             state = self.memory_module.write(source, state)
-        stacked = torch.stack(fused_steps)
-        return {"action_loss": stacked.abs().mean(), "rec_loss": stacked.square().mean()}
+        losses = {"action_loss": torch.stack(fused_steps).abs().mean()}
+        if rec_terms:
+            losses["rec_loss"] = torch.stack(rec_terms).mean()
+        return losses
 
 
-def _stub_batch(batch_size=2, steps=3, tokens_per_step=2):
+def _stub_batch(batch_size=2, steps=3, tokens_per_step=2, mask_plan=None):
     generator = torch.Generator().manual_seed(11)
     return [
-        {"tokens": torch.randn(steps, tokens_per_step, 6, generator=generator)}
+        {
+            "tokens": torch.randn(steps, tokens_per_step, 6, generator=generator),
+            **({"mask_plan": list(mask_plan)} if mask_plan is not None else {}),
+        }
         for _ in range(batch_size)
     ]
 
@@ -240,7 +277,10 @@ class Memv2MetersTest(unittest.TestCase):
             model.force_bypass = False
 
             model.read_state_overrides = {
-                t: recorded[t].working.roll(1, dims=0) for t in (1, 2)
+                t: dataclasses.replace(
+                    recorded[t], working=recorded[t].working.roll(1, dims=0)
+                )
+                for t in (1, 2)
             }
             expected_foreign = model(batch)
             model.read_state_overrides = {}
@@ -297,6 +337,62 @@ class Memv2MetersTest(unittest.TestCase):
         trainer = _bare_trainer(segment_length=2)
         trainer._unwrapped = nn.Linear(2, 2)
         self.assertEqual(trainer._memv2_meters([], {}), {})
+
+    def test_schema2_masked_step_fires_bypass_and_foreign_rec_deltas(self):
+        """memv2.1 regression: rec deltas must be live on masked segments.
+
+        The stage-1 bug: the foreign swap was applied only inside memory.read
+        while the schema-2 fusion consumes the state directly, so
+        delta_foreign_rec was identically zero.
+        """
+        model = _StubSegmentModel(schema2=True)
+        trainer = _bare_trainer(segment_length=2)
+        trainer._unwrapped = model
+        batch = _stub_batch(batch_size=2, mask_plan=[False, False, True])
+
+        with torch.no_grad():
+            live = model(batch)
+            recorded = list(model.read_states)
+
+            model.force_bypass = True
+            expected_bypass = model(batch)
+            model.force_bypass = False
+
+            model.read_state_overrides = {
+                t: dataclasses.replace(
+                    recorded[t],
+                    working=recorded[t].working.roll(1, dims=0),
+                    keys=recorded[t].keys.roll(1, dims=0),
+                )
+                for t in (1, 2)
+            }
+            expected_foreign = model(batch)
+            model.read_state_overrides = {}
+
+        meters = trainer._memv2_meters(batch, live)
+        self.assertIn("rec_loss", live)
+        for mode, expected in (("bypass", expected_bypass), ("foreign", expected_foreign)):
+            delta = meters[f"meters/delta_{mode}_rec"]
+            self.assertNotEqual(delta, 0.0)
+            self.assertAlmostEqual(
+                delta, float(expected["rec_loss"]) - float(live["rec_loss"]), places=6
+            )
+        self.assertNotIn("read", vars(model.memory_module))
+        self.assertNotIn("forward", vars(model.policy_memory_fusion))
+
+    def test_schema2_unmasked_batch_emits_action_deltas_only(self):
+        model = _StubSegmentModel(schema2=True)
+        trainer = _bare_trainer(segment_length=2)
+        trainer._unwrapped = model
+        batch = _stub_batch(batch_size=2, mask_plan=[False, False, False])
+        with torch.no_grad():
+            live = model(batch)
+        self.assertNotIn("rec_loss", live)
+        meters = trainer._memv2_meters(batch, live)
+        self.assertEqual(
+            set(meters),
+            {"meters/delta_bypass_act", "meters/delta_foreign_act"},
+        )
 
 
 class MaskScheduleConfigTest(unittest.TestCase):

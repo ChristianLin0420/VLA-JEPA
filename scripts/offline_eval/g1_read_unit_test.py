@@ -51,7 +51,14 @@ DEFAULT_DATA_ROOT = "/lustre/fsw/portfolios/edgeai/users/chrislin/vlajepa_stage/
 
 
 class ReconPath(NamedTuple):
-    """The trainable recon circuit plus the frozen decoder it drives."""
+    """The trainable recon circuit plus the frozen decoder it drives.
+
+    ``condition_source`` mirrors the model's ``_rec_condition_source``: with
+    ``policy_tokens`` the adapter consumes the fused read (consumer + tap);
+    with ``detached_action_tokens`` (privdec) the adapter consumes
+    ``num_condition_tokens`` action-marker tokens and never sees the fusion,
+    so the blind stand-in is a zero action-token block of that arity.
+    """
 
     fusion: nn.Module
     adapter: nn.Module
@@ -60,6 +67,8 @@ class ReconPath(NamedTuple):
     num_consumer_tokens: int
     consumer_dim: int
     device: torch.device
+    condition_source: str = "policy_tokens"
+    num_condition_tokens: int = 0
 
     def trainable_parameters(self) -> List[nn.Parameter]:
         params = list(self.fusion.parameters()) + list(self.adapter.parameters())
@@ -89,17 +98,26 @@ def recon_losses(path: ReconPath, state: MemoryState, targets: torch.Tensor,
     """Per-decision L1 recon loss [B] through the policy read (contract arithmetic)."""
 
     batch_size, num_latents = targets.shape[0], targets.shape[1]
-    consumer = torch.zeros(
-        batch_size, path.num_consumer_tokens, path.consumer_dim,
-        dtype=torch.float32, device=path.device,
-    )
     autocast = (
         torch.autocast("cuda", torch.bfloat16) if path.device.type == "cuda"
         else torch.autocast("cpu", enabled=False)
     )
     with autocast:
-        policy_tokens = path.fusion(consumer, state, bypass=bypass)
-        conditioning = path.adapter(policy_tokens)
+        if path.condition_source == "detached_action_tokens":
+            # Private decoder (_compute_recon_loss): conditioning comes from
+            # detached action markers, never from the fused read.  Cached
+            # action tokens are sighted, so the stand-in is zeros too.
+            cond_input = torch.zeros(
+                batch_size, path.num_condition_tokens, path.consumer_dim,
+                dtype=torch.float32, device=path.device,
+            )
+        else:
+            consumer = torch.zeros(
+                batch_size, path.num_consumer_tokens, path.consumer_dim,
+                dtype=torch.float32, device=path.device,
+            )
+            cond_input = path.fusion(consumer, state, bypass=bypass)
+        conditioning = path.adapter(cond_input)
         mask_tokens = (
             path.mask_token.to(torch.float32)[None, None, :].expand(batch_size, num_latents, -1)
         )
@@ -335,14 +353,26 @@ def run(args) -> None:
     model.policy_memory_fusion.float()
     for param in model.parameters():
         param.requires_grad = False
+    # The adapter's arity is checkpoint-dependent: policy_tokens checkpoints
+    # take the fused read (embodied tokens + 1 tap), privdec checkpoints take
+    # the action-marker tokens.  Read both from the model, never from config.
+    condition_source = str(getattr(model, "_rec_condition_source", "policy_tokens"))
+    adapter_in_tokens = int(model.mem_cond_adapter.token_mixer.in_features)
+    if condition_source == "detached_action_tokens":
+        print(
+            f"[privdec] rec conditions on {adapter_in_tokens} zero action-token "
+            "stand-ins; the fused read does not enter the recon path"
+        )
     path = ReconPath(
         fusion=model.policy_memory_fusion,
         adapter=model.mem_cond_adapter,
         mask_token=model.wm_mask_token,
         predictor=model.vj_predictor,
-        num_consumer_tokens=int(model.expected_embodied_token_count),
+        num_consumer_tokens=adapter_in_tokens - 1,  # fusion appends one tap token
         consumer_dim=int(model.policy_memory_fusion.consumer_dim),
         device=device,
+        condition_source=condition_source,
+        num_condition_tokens=adapter_in_tokens,
     )
     for param in path.trainable_parameters():
         param.requires_grad = True
@@ -469,6 +499,28 @@ def run_smoke(args) -> None:
             ])
     train_pool, eval_pool = build_pools(caches, trajectories, targets)
     result = run_gate(path, train_pool, eval_pool, args)
+
+    # Privdec conditioning contract: the adapter takes zero action-token
+    # stand-ins (5 here) and the fused read is out of the recon path, so the
+    # live/foreign/bypass conditions must coincide exactly.  The adapter arity
+    # deliberately differs from consumer+tap (5 vs 9), mirroring the real
+    # 24-vs-33 mismatch that crashed the pre-fix script on privdec checkpoints.
+    print("--- privdec arm (detached_action_tokens) ---")
+    privdec_path = ReconPath(
+        fusion=path.fusion,
+        adapter=_TokenMixer(5, 6),
+        mask_token=nn.Parameter(torch.zeros(dim)),
+        predictor=path.predictor,
+        num_consumer_tokens=8,
+        consumer_dim=dim,
+        device=torch.device("cpu"),
+        condition_source="detached_action_tokens",
+        num_condition_tokens=5,
+    )
+    privdec_args = argparse.Namespace(**{**vars(args), "out": None})
+    privdec = run_gate(privdec_path, train_pool, eval_pool, privdec_args)
+    assert privdec["foreign_gap"] == 0.0, "privdec recon must not see memory state"
+    assert privdec["delta_bypass"] == 0.0, "privdec recon must not see the fusion"
     print(f"smoke OK: {result['train_decisions']} train / {result['eval_decisions']} eval decisions")
 
 

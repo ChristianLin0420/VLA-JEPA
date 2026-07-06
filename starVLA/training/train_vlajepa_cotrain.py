@@ -40,6 +40,7 @@ from transformers import AutoProcessor, get_scheduler
 
 from starVLA.dataloader import build_dataloader
 from starVLA.model.framework import build_framework
+from starVLA.model.modules.memory import MemoryState
 from starVLA.training.trainer_utils.trainer_tools import (
     TrainerUtils,
     build_param_lr_groups,
@@ -690,9 +691,13 @@ class VLAMTrainer(TrainerUtils):
         seen by the last K (= segment_length) memory reads replaced by a
         maturity-matched foreign episode's — the neighbouring rank's under
         DDP, the neighbouring batch row when world_size == 1, skipped when
-        neither exists.  Diagnostics capture is forced off so the live-pass
-        scalars collected just before are not clobbered; the local write
-        chain is untouched (foreign content enters at read time only).
+        neither exists.  The foreign swap is applied at BOTH consumers of the
+        pre-write state: memory.read and the fusion (the schema-2 fusion takes
+        the state directly, so a read-only swap never reaches the policy or
+        rec conditioning — the memv2 stage-1 delta_foreign_rec ≡ 0 bug).
+        Diagnostics capture is forced off so the live-pass scalars collected
+        just before are not clobbered; the local write chain is untouched
+        (foreign content enters at read time only).
         """
         model = self._unwrapped
         memory = getattr(model, "memory_module", None)
@@ -737,6 +742,7 @@ class VLAMTrainer(TrainerUtils):
             foreign_working, foreign_keys = foreign
             first_foreign_call = len(recorded) - foreign_working.shape[0]
             calls = {"seen": 0}
+            current = {"state": None}
 
             def foreign_read(source_tokens, state, **kwargs):
                 position = calls["seen"] - first_foreign_call
@@ -751,14 +757,28 @@ class VLAMTrainer(TrainerUtils):
                             else state.keys
                         ),
                     )
+                current["state"] = state
                 return bound_read(source_tokens, state, **kwargs)
 
+            def foreign_fusion(consumer_tokens, memory_arg, *args, **kwargs):
+                # The schema-2 fusion consumes the pre-write MemoryState
+                # directly, not the read's output tokens, so the swap made
+                # inside memory.read never reaches it: re-apply it here.
+                # Read and fusion run in lockstep once per decision, so the
+                # latest read's state is exactly this call's state.  Schema-1
+                # fusion receives read tokens (a Tensor) and is untouched.
+                if isinstance(memory_arg, MemoryState) and current["state"] is not None:
+                    memory_arg = current["state"]
+                return bound_fusion(consumer_tokens, memory_arg, *args, **kwargs)
+
             memory.read = foreign_read
+            fusion.forward = foreign_fusion
             try:
                 with autocast:
                     foreigned = model(batch_vla)
             finally:
                 del memory.read
+                del fusion.forward
             self._meter_deltas(meters, "foreign", live_losses, foreigned)
         return meters
 

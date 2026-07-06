@@ -129,6 +129,45 @@ class SparseKeyMemoryFusionTest(unittest.TestCase):
             output = self.fusion(self.consumer, self.state)
         self.assertTrue(torch.equal(output[:, :NUM_TOKENS], self.consumer))
 
+    def test_content_gate_init_default_is_bit_identical_to_explicit_zero(self):
+        torch.manual_seed(11)
+        explicit = SparseKeyMemoryFusion(
+            consumer_dim=CONSUMER_DIM,
+            memory_dim=MEMORY_DIM,
+            key_dim=KEY_DIM,
+            num_slots=NUM_SLOTS,
+            content_gate_init=0.0,
+        )
+        for key, value in self.fusion.state_dict().items():
+            self.assertTrue(torch.equal(value, explicit.state_dict()[key]), key)
+        with torch.no_grad():
+            default_out = self.fusion(self.consumer, self.state)
+            explicit_out = explicit(self.consumer, self.state)
+        self.assertTrue(torch.equal(default_out, explicit_out))
+
+    def test_content_gate_init_opens_a_tanh_scaled_content_term(self):
+        torch.manual_seed(11)
+        fusion = SparseKeyMemoryFusion(
+            consumer_dim=CONSUMER_DIM,
+            memory_dim=MEMORY_DIM,
+            key_dim=KEY_DIM,
+            num_slots=NUM_SLOTS,
+            content_gate_init=0.05,
+        )
+        self.assertEqual(float(fusion.gamma_c), float(torch.tensor(0.05)))
+        self.assertAlmostEqual(float(torch.tanh(fusion.gamma_c)), 0.05, places=4)
+        with torch.no_grad():
+            opened = fusion(self.consumer, self.state)
+            content_05 = opened[:, :NUM_TOKENS] - self.consumer
+            self.assertGreater(float(content_05.norm()), 0.0)
+            # Same weights at gamma_c = 1: the content term must scale exactly
+            # by tanh(gamma_c), i.e. ~ the init value for small inits.
+            fusion.gamma_c.fill_(1.0)
+            content_1 = fusion(self.consumer, self.state)[:, :NUM_TOKENS] - self.consumer
+        torch.testing.assert_close(
+            content_05, content_1 * (math.tanh(0.05) / math.tanh(1.0)), atol=1.0e-6, rtol=1.0e-5
+        )
+
     def test_validation_and_defaults_stay_below_parameter_cap(self):
         with self.assertRaises(ValueError):
             SparseKeyMemoryFusion(consumer_dim=CONSUMER_DIM, num_slots=1)

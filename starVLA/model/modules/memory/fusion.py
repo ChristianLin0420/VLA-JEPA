@@ -141,6 +141,7 @@ class SparseKeyMemoryFusion(nn.Module):
         memory_dim: int = 512,
         key_dim: int = 128,
         num_slots: int = 8,
+        content_gate_init: float = 0.0,
     ) -> None:
         super().__init__()
         if consumer_dim <= 0 or memory_dim <= 0 or key_dim <= 0:
@@ -162,7 +163,9 @@ class SparseKeyMemoryFusion(nn.Module):
         self.gate_input_proj = nn.Linear(consumer_dim, 64)
         self.gate_mlp = nn.Sequential(nn.Linear(64 + 3, 64), nn.GELU(), nn.Linear(64, 1))
         self.time_mlp = nn.Sequential(nn.Linear(64, 256), nn.GELU(), nn.Linear(256, consumer_dim))
-        self.gamma_c = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
+        # gamma_c is initialized to content_gate_init directly: tanh(x) ~= x for
+        # the small openings used here, so the effective gate starts at ~ the value.
+        self.gamma_c = nn.Parameter(torch.tensor(float(content_gate_init), dtype=torch.float32))
 
         inv_freq = torch.exp(-math.log(10_000.0) * torch.arange(32, dtype=torch.float32) / 32.0)
         self.register_buffer("time_inv_freq", inv_freq, persistent=False)
