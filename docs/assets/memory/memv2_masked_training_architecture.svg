@@ -79,7 +79,7 @@
 
   <!-- Memory bridge group -->
   <rect x="340" y="384" width="890" height="426" rx="12" class="group"/>
-  <text x="360" y="410" class="group-label">MEMORY BRIDGE &#8212; SPARSE-KEY FUSION (MEMV2)</text>
+  <text x="360" y="410" class="group-label">MEMORY BRIDGE (MEMV2)</text>
 
   <rect x="360" y="434" width="230" height="120" rx="10" class="box teal"/>
   <text x="475" y="464" class="label">State M_(t&#8722;1)</text>
@@ -124,9 +124,9 @@
   <text x="790" y="740" class="label" style="font-size:16px">Write (after prediction)</text>
   <text x="790" y="762" class="small">gated convex update + &#9733; key update</text>
   <text x="790" y="783" class="tiny">masked t: no write (phase A) &#183; count always ticks</text>
-  <path d="M460 336 V755 H660" class="edge"/>
-  <text x="540" y="746" class="edge-label">action markers Z_t [B, 24, 2048]</text>
-  <path d="M475 554 V712 H620 H660" class="mem-edge" opacity="0.85"/>
+  <path d="M460 336 V780 H660" class="edge"/>
+  <text x="540" y="771" class="edge-label">action markers Z_t [B, 24, 2048]</text>
+  <path d="M475 554 V730 H660" class="mem-edge" opacity="0.85"/>
 
   <rect x="990" y="712" width="210" height="86" rx="10" class="box teal"/>
   <text x="1095" y="744" class="label">State M_t</text>
@@ -180,7 +180,7 @@
   <text x="1380" y="620" class="label" style="font-size:15px">sg(vj_enc(video_clean))</text>
   <text x="1380" y="644" class="small">frozen teacher targets</text>
   <text x="1380" y="665" class="tiny">[B, 768, 2048] &#183; no-grad</text>
-  <path d="M270 422 H310 V636 H1290" class="dependency"/>
+  <path d="M270 422 H310 V824 H1250 V636 H1290" class="dependency"/>
   <path d="M1470 636 H1575 V542" class="dependency"/>
 
   <!-- Legend -->
