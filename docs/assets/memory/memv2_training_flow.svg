@@ -1,0 +1,254 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1240" viewBox="0 0 1800 1240" role="img" aria-labelledby="title desc">
+  <title id="title">memv2 training flow: data-model integration and per-loss computation</title>
+  <desc id="desc">One training segment: the sampler emits burn-in and supervised decisions with a mask plan; burn-in builds memory state without loss; an unmasked decision pays the action loss and the world loss; a masked decision pays the action loss, the masked reconstruction loss through the policy tokens, and the episodic InfoNCE loss on the pre-gate residual; one backward spans all supervised decisions and one optimizer step follows.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8.5" refY="3.5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L9,3.5 L0,7 Z" fill="#334155"/>
+    </marker>
+    <marker id="arrowTeal" markerWidth="10" markerHeight="10" refX="8.5" refY="3.5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L9,3.5 L0,7 Z" fill="#3A7D78"/>
+    </marker>
+    <marker id="arrowAmber" markerWidth="10" markerHeight="10" refX="8.5" refY="3.5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L9,3.5 L0,7 Z" fill="#C98B2E"/>
+    </marker>
+    <filter id="softShadow" x="-15%" y="-15%" width="130%" height="140%">
+      <feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#0F172A" flood-opacity="0.10"/>
+    </filter>
+    <style>
+      .title { font: 700 28px Helvetica, Arial, sans-serif; fill: #16324F; }
+      .subtitle { font: 400 15px Helvetica, Arial, sans-serif; fill: #5B6573; }
+      .group { fill: #F8FAFC; stroke: #CBD5E1; stroke-width: 1.2; stroke-dasharray: 6 5; }
+      .group-label { font: 700 14px Helvetica, Arial, sans-serif; letter-spacing: 1.2px; fill: #64748B; }
+      .col-label { font: 700 15px Helvetica, Arial, sans-serif; letter-spacing: 0.8px; fill: #16324F; text-anchor: middle; }
+      .box { stroke-width: 1.6; filter: url(#softShadow); }
+      .blue { fill: #EAF2F8; stroke: #2F6690; }
+      .teal { fill: #E8F4F2; stroke: #3A7D78; }
+      .amber { fill: #FFF4E1; stroke: #C98B2E; }
+      .gray { fill: #F1F5F9; stroke: #64748B; }
+      .white { fill: #FFFFFF; stroke: #94A3B8; }
+      .label { font: 700 18px Helvetica, Arial, sans-serif; fill: #16324F; text-anchor: middle; }
+      .label16 { font: 700 16px Helvetica, Arial, sans-serif; fill: #16324F; text-anchor: middle; }
+      .label14 { font: 700 14px Helvetica, Arial, sans-serif; fill: #16324F; text-anchor: middle; }
+      .small { font: 400 14px Helvetica, Arial, sans-serif; fill: #475569; text-anchor: middle; }
+      .tiny { font: 400 12px Helvetica, Arial, sans-serif; fill: #64748B; text-anchor: middle; }
+      .edge { fill: none; stroke: #334155; stroke-width: 1.8; marker-end: url(#arrow); }
+      .mem-edge { fill: none; stroke: #3A7D78; stroke-width: 2.2; marker-end: url(#arrowTeal); }
+      .dependency { fill: none; stroke: #C98B2E; stroke-width: 1.7; stroke-dasharray: 6 5; marker-end: url(#arrowAmber); }
+      .teal-dep { fill: none; stroke: #3A7D78; stroke-width: 1.7; stroke-dasharray: 6 5; marker-end: url(#arrowTeal); }
+      .edge-label { font: 600 12px Helvetica, Arial, sans-serif; fill: #475569; text-anchor: middle; }
+      .badge { fill: #FFFFFF; stroke-width: 1.1; }
+      .badge-text { font: 700 10px Helvetica, Arial, sans-serif; letter-spacing: 0.6px; text-anchor: middle; }
+    </style>
+  </defs>
+
+  <rect x="0" y="0" width="1800" height="1240" fill="#FFFFFF"/>
+  <text x="900" y="42" class="title" text-anchor="middle">memv2 Training Flow: One Segment, Four Losses</text>
+  <text x="900" y="68" class="subtitle" text-anchor="middle">Burn-in builds state without loss; an unmasked decision pays L_act + L_wm; a masked decision pays L_act + L_rec + L_nce; one backward spans the supervised segment</text>
+
+  <!-- GROUP A: data and segment sampling -->
+  <rect x="40" y="92" width="1720" height="200" rx="12" class="group"/>
+  <text x="60" y="116" class="group-label">DATA &#183; SEGMENT SAMPLING</text>
+
+  <rect x="60" y="132" width="220" height="130" rx="10" class="box gray"/>
+  <text x="170" y="164" class="label16">LeRobot episode</text>
+  <text x="170" y="188" class="small">images &#183; actions &#183; language</text>
+  <text x="170" y="210" class="tiny">robot corpora</text>
+  <text x="170" y="228" class="tiny">(+ video corpora in stage V)</text>
+
+  <rect x="330" y="132" width="250" height="130" rx="10" class="box white"/>
+  <text x="455" y="164" class="label16">sample_segment</text>
+  <text x="455" y="188" class="small">burn-in 8 + supervised 4</text>
+  <text x="455" y="209" class="small">stride 7 &#183; same episode</text>
+  <text x="455" y="230" class="tiny">mask_plan deterministic per (epoch, index, seed)</text>
+  <path d="M280 197 H330" class="edge"/>
+
+  <rect x="620" y="132" width="250" height="130" rx="10" class="box gray"/>
+  <text x="745" y="164" class="label16">burn-in b1..b8</text>
+  <text x="745" y="188" class="small">state build-up only</text>
+  <text x="745" y="209" class="tiny">never masked &#183; no loss</text>
+  <text x="745" y="228" class="tiny">detached at boundary</text>
+  <path d="M580 175 H620" class="edge"/>
+
+  <rect x="900" y="132" width="300" height="130" rx="10" class="box blue"/>
+  <text x="1050" y="164" class="label16">supervised t0..t3</text>
+  <text x="1050" y="188" class="small">mask_plan e.g. [ &#8211;, &#9646;, &#8211;, &#8211; ]</text>
+  <text x="1050" y="209" class="tiny">first supervised decision always unmasked</text>
+  <text x="1050" y="228" class="tiny">expert chunks a_t [7,7] on every decision</text>
+  <path d="M455 262 V278 H1050 V266" class="edge"/>
+
+  <rect x="1230" y="132" width="250" height="130" rx="10" class="box gray"/>
+  <text x="1355" y="164" class="label16">video_clean (masked t)</text>
+  <text x="1355" y="188" class="small">teacher targets only</text>
+  <text x="1355" y="209" class="tiny">never a model input</text>
+  <text x="1355" y="228" class="tiny">frozen vj_encoder consumes it</text>
+  <path d="M1200 197 H1230" class="edge"/>
+
+  <rect x="1510" y="132" width="230" height="130" rx="10" class="box white"/>
+  <text x="1625" y="164" class="label16">segment metadata</text>
+  <text x="1625" y="188" class="small">episode id &#183; task key</text>
+  <text x="1625" y="209" class="tiny">L_nce same-task negatives</text>
+  <text x="1625" y="228" class="tiny">foreign-swap meter pairing</text>
+  <path d="M1480 197 H1510" class="edge"/>
+
+  <!-- GROUP B: recurrent unroll -->
+  <rect x="40" y="320" width="1720" height="660" rx="12" class="group"/>
+  <text x="60" y="344" class="group-label">RECURRENT UNROLL &#8212; ONE SEGMENT, ONE BACKWARD (BPTT-4)</text>
+  <path d="M1050 262 V320" class="edge"/>
+
+  <!-- Col 0: burn-in -->
+  <rect x="70" y="380" width="230" height="160" rx="10" class="box gray"/>
+  <text x="185" y="412" class="label16">burn-in unroll &#215;8</text>
+  <text x="185" y="436" class="small">Qwen &#8594; write only</text>
+  <text x="185" y="457" class="tiny">no losses &#183; no masking</text>
+  <text x="185" y="476" class="tiny">state detached at boundary</text>
+  <text x="185" y="510" class="tiny">reconstructs mid-episode state</text>
+  <path d="M185 540 V945 H230" class="mem-edge"/>
+
+  <!-- Col 1: unmasked decision t0 -->
+  <text x="555" y="366" class="col-label">DECISION t0 &#8212; UNMASKED</text>
+  <rect x="360" y="372" width="180" height="56" rx="10" class="box blue"/>
+  <text x="450" y="396" class="label16">obs o_t0</text>
+  <text x="450" y="416" class="tiny">clean frames</text>
+  <path d="M450 428 V462" class="edge"/>
+
+  <rect x="360" y="462" width="180" height="60" rx="10" class="box blue"/>
+  <text x="450" y="487" class="label16">Qwen3-VL (frozen)</text>
+  <text x="450" y="509" class="tiny">E_t0 [32] &#183; Z_t0 [24]</text>
+  <path d="M450 522 V552" class="edge"/>
+
+  <rect x="340" y="552" width="220" height="74" rx="10" class="box teal"/>
+  <text x="450" y="581" class="label16">SparseKeyFusion</text>
+  <text x="450" y="603" class="tiny">read M &#183; whiten r&#770; &#183; time tap</text>
+  <path d="M450 626 V656" class="edge"/>
+
+  <rect x="340" y="656" width="220" height="56" rx="10" class="box white"/>
+  <text x="450" y="680" class="label16">policy_tokens t0</text>
+  <text x="450" y="700" class="tiny">[B, 33, 2048]</text>
+  <path d="M450 712 V746" class="edge"/>
+
+  <rect x="340" y="746" width="200" height="56" rx="10" class="box amber"/>
+  <text x="440" y="770" class="label16">DiT head</text>
+  <text x="440" y="790" class="tiny">flow matching</text>
+  <path d="M440 802 V832" class="edge"/>
+
+  <rect x="340" y="832" width="200" height="48" rx="10" class="box amber"/>
+  <text x="440" y="852" class="label16">L_act(t0) &#215;1.0</text>
+  <text x="440" y="870" class="tiny">vs expert chunk a_t0</text>
+
+  <path d="M540 492 H690 V656" class="edge"/>
+  <rect x="600" y="656" width="180" height="74" rx="10" class="box blue"/>
+  <text x="690" y="684" class="label16">vj_predictor</text>
+  <text x="690" y="705" class="tiny">input_states + Z_t0</text>
+  <text x="690" y="721" class="tiny">(unchanged wm path)</text>
+  <path d="M690 730 V760" class="edge"/>
+
+  <rect x="596" y="760" width="180" height="48" rx="10" class="box amber"/>
+  <text x="686" y="780" class="label16">L_wm &#215;0.1</text>
+  <text x="686" y="798" class="tiny">L1, unmasked steps</text>
+  <text x="686" y="824" class="tiny">vs sg(vj_enc(video_t0))</text>
+
+  <!-- Col 2: masked decision t1 -->
+  <text x="1095" y="366" class="col-label">DECISION t1 &#8212; MASKED</text>
+  <rect x="820" y="372" width="200" height="56" rx="10" class="box blue"/>
+  <rect x="930" y="360" width="80" height="18" rx="8" class="badge" stroke="#C98B2E"/>
+  <text x="970" y="373" class="badge-text" fill="#C98B2E">BLACKED</text>
+  <text x="920" y="396" class="label16">obs o_t1 = &#9646;</text>
+  <text x="920" y="416" class="tiny">both views black</text>
+  <path d="M920 428 V462" class="edge"/>
+
+  <rect x="820" y="462" width="200" height="60" rx="10" class="box blue"/>
+  <text x="920" y="487" class="label16">Qwen3-VL (frozen)</text>
+  <text x="920" y="509" class="tiny">E_t1 blind &#183; Z_t1 blind</text>
+  <path d="M920 522 V552" class="edge"/>
+
+  <rect x="800" y="552" width="240" height="74" rx="10" class="box teal"/>
+  <text x="920" y="581" class="label16">SparseKeyFusion</text>
+  <text x="920" y="603" class="tiny">read M_t0 (keys) &#183; whiten &#183; tap</text>
+  <path d="M920 626 V656" class="edge"/>
+
+  <rect x="800" y="656" width="240" height="56" rx="10" class="box white"/>
+  <text x="920" y="680" class="label16">policy_tokens t1</text>
+  <text x="920" y="700" class="tiny">only route for episode content</text>
+
+  <path d="M885 712 V746" class="edge"/>
+  <rect x="800" y="746" width="170" height="56" rx="10" class="box amber"/>
+  <text x="885" y="770" class="label16">DiT head</text>
+  <text x="885" y="790" class="tiny">blind BC</text>
+  <path d="M885 802 V832" class="edge"/>
+  <rect x="800" y="832" width="170" height="48" rx="10" class="box amber"/>
+  <text x="885" y="852" class="label16">L_act(t1) &#215;1.0</text>
+  <text x="885" y="870" class="tiny">expert chunk still supervises</text>
+
+  <path d="M1000 712 H1110 V746" class="edge"/>
+  <rect x="1000" y="746" width="220" height="56" rx="10" class="box teal"/>
+  <text x="1110" y="768" class="label14">mem_cond_adapter (&#945;=0.1)</text>
+  <text x="1110" y="786" class="label14">&#8594; vj_predictor(mask token)</text>
+  <path d="M1110 802 V832" class="edge"/>
+  <rect x="1000" y="832" width="220" height="48" rx="10" class="box amber"/>
+  <text x="1110" y="852" class="label16">L_rec &#215;0.2&#8211;0.5</text>
+  <text x="1110" y="870" class="tiny">masked steps only</text>
+  <text x="1110" y="896" class="tiny">vs sg(vj_enc(video_clean_t1))</text>
+
+  <path d="M1040 589 H1320 V746" class="teal-dep"/>
+  <text x="1180" y="580" class="edge-label">pre-gate residual r</text>
+  <rect x="1250" y="746" width="140" height="56" rx="10" class="box teal"/>
+  <text x="1320" y="770" class="label14">h(pool(r))</text>
+  <text x="1320" y="790" class="tiny">anchor, d=256</text>
+  <path d="M1320 802 V832" class="edge"/>
+  <rect x="1250" y="832" width="140" height="48" rx="10" class="box teal"/>
+  <text x="1320" y="852" class="label16">L_nce &#215;0.2</text>
+  <text x="1320" y="870" class="tiny">robot steps</text>
+  <text x="1320" y="896" class="tiny">vs g(pool(gt_(t&#8722;&#916;)))</text>
+  <text x="1320" y="912" class="tiny">+ queue negatives</text>
+
+  <!-- Col 3 placeholder -->
+  <rect x="1450" y="552" width="280" height="160" rx="10" class="group"/>
+  <text x="1590" y="600" class="label16">t2 &#8230; t3</text>
+  <text x="1590" y="628" class="small">unroll identically per mask_plan</text>
+  <text x="1590" y="652" class="tiny">one backward spans all four</text>
+  <text x="1590" y="670" class="tiny">supervised decisions (BPTT-4)</text>
+
+  <!-- Memory rail -->
+  <rect x="230" y="920" width="150" height="50" rx="10" class="box teal"/>
+  <text x="305" y="941" class="label14">M (burn-in)</text>
+  <text x="305" y="959" class="tiny">detached</text>
+  <path d="M305 920 V589 H340" class="mem-edge"/>
+  <text x="305" y="740" class="edge-label" transform="rotate(-90 292 740)">read M_(t0&#8722;1)</text>
+
+  <path d="M560 600 H580 V906 H740 V920" class="mem-edge"/>
+  <text x="640" y="898" class="edge-label">write Z_t0 &#8594; M_t0 (+ keys)</text>
+  <rect x="720" y="920" width="130" height="50" rx="10" class="box teal"/>
+  <text x="785" y="941" class="label14">M_t0</text>
+  <text x="785" y="959" class="tiny">post-write</text>
+  <path d="M780 920 V589 H800" class="mem-edge"/>
+
+  <path d="M850 945 H1150" class="mem-edge"/>
+  <text x="1000" y="936" class="edge-label">no write (phase A) &#183; count ticks</text>
+  <rect x="1150" y="920" width="150" height="50" rx="10" class="box teal"/>
+  <text x="1225" y="941" class="label14">M_t1 = M_t0</text>
+  <text x="1225" y="959" class="tiny">steps +1</text>
+  <path d="M1300 945 H1400" class="mem-edge"/>
+  <text x="1360" y="936" class="edge-label">to t2 &#8230;</text>
+
+  <!-- GROUP C: loss aggregation -->
+  <rect x="40" y="1008" width="1720" height="140" rx="12" class="group"/>
+  <text x="60" y="1032" class="group-label">LOSS AGGREGATION &#183; OPTIMIZER</text>
+
+  <rect x="480" y="1048" width="640" height="76" rx="10" class="box white"/>
+  <text x="800" y="1080" class="label16">L_total = L_act + 0.1&#183;L_wm (unmasked) + &#955;_rec&#183;L_rec (masked) + 0.2&#183;L_nce</text>
+  <text x="800" y="1106" class="tiny">&#955;_rec: 0.5 stage-1 &#8594; 0.2 co-train &#183; L_wm and L_rec are mutually exclusive per decision &#183; mean over valid supervised decisions</text>
+  <path d="M900 980 V1048" class="edge"/>
+
+  <rect x="1180" y="1048" width="320" height="76" rx="10" class="box amber"/>
+  <text x="1340" y="1080" class="label16">optimizer step</text>
+  <text x="1340" y="1106" class="tiny">one per segment &#183; no recurrent graph across steps</text>
+  <path d="M1120 1086 H1180" class="edge"/>
+
+  <rect x="60" y="1048" width="360" height="76" rx="10" class="box teal"/>
+  <text x="240" y="1080" class="label16">meters: &#916;bypass &#183; &#916;foreign</text>
+  <text x="240" y="1106" class="tiny">no-backward eval passes &#183; the content-read emergence curve</text>
+  <path d="M480 1086 H420" class="teal-dep"/>
+
+  <!-- Legend -->
+  <text x="60" y="1196" class="tiny" text-anchor="start">solid = tensor flow &#183; teal = memory state and memory-directed losses &#183; dashed teal = pre-gate residual and meters &#183; sg(&#183;) = stop-gradient frozen teacher &#183; &#9646; = masked (blacked) decision &#183; gradients reach writes at t&#8722;1 through the in-segment memory chain</text>
+</svg>

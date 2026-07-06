@@ -105,9 +105,11 @@ Sharp retrieval is top-2 softmax with learnable temperature (entmax15 as an alte
 
 **Serving:** `MEMORY_MODE` gains `tap_only` and `content_only` (each channel force-zeroed), mapping one-to-one onto the gate split so the H1–H7 harness can measure each channel causally; `keys` ride the existing session `MemoryState`.
 
----
+### 3.4 Training flow — how data and model integrate per loss term
 
-## 4. Three-stage recipe
+![memv2 training flow across one segment: the sampler emits burn-in plus supervised decisions with a mask plan; burn-in builds memory state without loss; an unmasked decision pays the action loss and world loss; a masked decision pays the action loss, the masked reconstruction loss through policy_tokens, and the episodic InfoNCE loss on the pre-gate residual; one backward spans the supervised segment and one optimizer step follows](assets/memory/memv2_training_flow.svg)
+
+*Figure M2. One training segment end to end. `sample_segment` emits eight burn-in decisions (state build-up only, never masked, detached at the boundary) and four supervised decisions with a deterministic `mask_plan`; `video_clean` and episode metadata ride the sample for teacher targets and NCE pairing. The unroll shows where each loss is computed: an **unmasked** decision \(t_0\) pays \(L_{act}\) (DiT vs the expert chunk) and \(L_{wm}\times0.1\) (unchanged predictor path vs `sg(vj_enc(video))`); a **masked** decision \(t_1\) reads \(M_{t_0}\) through the sparse-key fusion and pays \(L_{act}\) (blind BC — the expert chunk still supervises), \(L_{rec}\) (adapter + mask-token predictor decoding `policy_tokens` against `sg(vj_enc(video_clean))`, α=0.1 grad-scale), and \(L_{nce}\) (pre-gate residual anchor vs the episode's own past targets with same-task queue negatives). The teal rail is the memory chain: burn-in state (detached) → read at \(t_0\) → write \(Z_{t_0}\) (+keys) → read at \(t_1\) → pass-through (no write in phase A, decision count ticks). \(L_{wm}\) and \(L_{rec}\) are mutually exclusive per decision; all terms sum into one backward and one optimizer step per segment, and the Δbypass/Δforeign meters run as no-backward evaluation passes beside it.*
 
 | | **Stage V — video (20K)** | **Stage 1 — robot (10K)** | **Co-train (100K)** |
 |---|---|---|---|
