@@ -189,5 +189,42 @@ class SparseKeyMemoryFusionTest(unittest.TestCase):
         self.assertLess(parameter_count, 10_000_000)
 
 
+
+
+class ContentGateFixedTest(unittest.TestCase):
+    def test_fixed_gate_is_unclosable(self):
+        torch.manual_seed(3)
+        fusion = SparseKeyMemoryFusion(
+            consumer_dim=CONSUMER_DIM,
+            memory_dim=MEMORY_DIM,
+            key_dim=KEY_DIM,
+            num_slots=NUM_SLOTS,
+            content_gate_init=0.05,
+            content_gate_fixed=True,
+        )
+        self.assertNotIsInstance(fusion.gamma_c, torch.nn.Parameter)
+        self.assertFalse(fusion.gamma_c.requires_grad)
+        state = _make_state()
+        consumer = torch.randn(2, NUM_TOKENS, CONSUMER_DIM)
+        out = fusion(consumer, state)
+        whitened = F.layer_norm(fusion.last_residual, (CONSUMER_DIM,))
+        expected = consumer + torch.tanh(fusion.gamma_c) * whitened
+        torch.testing.assert_close(out[:, :NUM_TOKENS, :], expected)
+
+    def test_default_state_dict_unchanged(self):
+        torch.manual_seed(3)
+        a = SparseKeyMemoryFusion(
+            consumer_dim=CONSUMER_DIM, memory_dim=MEMORY_DIM, key_dim=KEY_DIM, num_slots=NUM_SLOTS
+        )
+        torch.manual_seed(3)
+        b = SparseKeyMemoryFusion(
+            consumer_dim=CONSUMER_DIM, memory_dim=MEMORY_DIM, key_dim=KEY_DIM,
+            num_slots=NUM_SLOTS, content_gate_fixed=False,
+        )
+        self.assertEqual(list(a.state_dict()), list(b.state_dict()))
+        for va, vb in zip(a.state_dict().values(), b.state_dict().values()):
+            torch.testing.assert_close(va, vb)
+
+
 if __name__ == "__main__":
     unittest.main()

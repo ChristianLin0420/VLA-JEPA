@@ -142,6 +142,7 @@ class SparseKeyMemoryFusion(nn.Module):
         key_dim: int = 128,
         num_slots: int = 8,
         content_gate_init: float = 0.0,
+        content_gate_fixed: bool = False,
     ) -> None:
         super().__init__()
         if consumer_dim <= 0 or memory_dim <= 0 or key_dim <= 0:
@@ -165,7 +166,17 @@ class SparseKeyMemoryFusion(nn.Module):
         self.time_mlp = nn.Sequential(nn.Linear(64, 256), nn.GELU(), nn.Linear(256, consumer_dim))
         # gamma_c is initialized to content_gate_init directly: tanh(x) ~= x for
         # the small openings used here, so the effective gate starts at ~ the value.
-        self.gamma_c = nn.Parameter(torch.tensor(float(content_gate_init), dtype=torch.float32))
+        # content_gate_fixed makes the valve unclosable: g_c == 1 and gamma_c is a
+        # non-trainable buffer, so no gradient path can suppress the injection.
+        self.content_gate_fixed = bool(content_gate_fixed)
+        if self.content_gate_fixed:
+            self.register_buffer(
+                "gamma_c", torch.tensor(float(content_gate_init), dtype=torch.float32)
+            )
+        else:
+            self.gamma_c = nn.Parameter(
+                torch.tensor(float(content_gate_init), dtype=torch.float32)
+            )
 
         inv_freq = torch.exp(-math.log(10_000.0) * torch.arange(32, dtype=torch.float32) / 32.0)
         self.register_buffer("time_inv_freq", inv_freq, persistent=False)
@@ -259,7 +270,10 @@ class SparseKeyMemoryFusion(nn.Module):
             gate_features = torch.cat(
                 (self.gate_input_proj(whitened.mean(dim=1)), max_score, margin, entropy), dim=-1
             )
-            content_gate = torch.sigmoid(self.gate_mlp(gate_features)).unsqueeze(-1)
+            if self.content_gate_fixed:
+                content_gate = whitened.new_ones(whitened.shape[0], 1, 1)
+            else:
+                content_gate = torch.sigmoid(self.gate_mlp(gate_features)).unsqueeze(-1)
             content = torch.tanh(self.gamma_c) * self.residual_scale * (content_gate * whitened)
             tap = self._time_tap(state.steps)
 

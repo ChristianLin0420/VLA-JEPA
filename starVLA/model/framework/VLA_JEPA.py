@@ -220,6 +220,7 @@ class VLA_JEPA(baseframework):
                 key_dim=key_dim,
                 num_slots=num_slots,
                 content_gate_init=float(action_cfg.get("content_gate_init", 0.0)),
+                content_gate_fixed=bool(action_cfg.get("content_gate_fixed", False)),
             )
             predictor_dim = int(self.vj_encoder.config.hidden_size) * 2
             self.wm_mask_token = nn.Parameter(torch.empty(predictor_dim))
