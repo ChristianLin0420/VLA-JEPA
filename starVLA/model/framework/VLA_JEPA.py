@@ -222,6 +222,11 @@ class VLA_JEPA(baseframework):
                 content_gate_init=float(action_cfg.get("content_gate_init", 0.0)),
                 content_gate_fixed=bool(action_cfg.get("content_gate_fixed", False)),
             )
+            # D2 diagnosis: at the default amplitude the content contrast is below
+            # bf16 training arithmetic; content_scale lifts the fixed injection.
+            self.policy_memory_fusion.residual_scale = float(
+                action_cfg.get("content_scale", 1.0)
+            )
             predictor_dim = int(self.vj_encoder.config.hidden_size) * 2
             self.wm_mask_token = nn.Parameter(torch.empty(predictor_dim))
             nn.init.normal_(self.wm_mask_token, mean=0.0, std=0.02)
