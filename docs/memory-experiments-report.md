@@ -232,3 +232,186 @@ demand at moderate dose; the failure locus is the read pathway; and current
 VLA evaluation practice (Markovian suites) cannot detect any of this.* The
 audit toolkit + three-benchmark floor table + the pre/post discriminator are
 the contributions. Read-path redesign is the follow-up work.
+
+---
+
+# Chapter 3 — memv2: masked-reconstruction training and the amplitude ladder (2026-07-06 → 07-07)
+
+Chapter 2 ended with the read pathway as prime suspect. Chapter 3 is the
+read-path redesign, run to its pre-registered endpoint: a new fusion module,
+two new losses that *require* content, a demand-bearing data mixture, four
+training rounds that surgically eliminated every trainability excuse
+(gate init → gate evasion → gate welded open → amplitude 5×), and a final
+n=96 paired discriminator. Design doc: `docs/memory-v2-training-framework.md`
+(Figures M1/M2). Implementation: commits `c041481` → `827cbc5` on `memexp`
+(61+ new unit tests, all green; schema_version 2 checkpoints).
+
+## 14. Design: manufacture demand, then supervise the read
+
+Four components, each closing a hole Chapters 1–2 identified:
+
+- **Masked-decision training** — at most one supervised decision per segment
+  is served black frames; the policy must act from memory at that decision.
+- **L_rec (masked latent reconstruction)** — the policy tokens at a masked
+  decision are decoded (zero-init `mem_cond_adapter` → reused, frozen-target
+  `vj_predictor` with a learned `wm_mask_token`) against the frozen
+  `vj_encoder` embedding of the *clean* frame. Direct gradient pressure to
+  route episode content through the policy stream.
+- **L_nce (episodic InfoNCE)** — pre-gate memory residual must identify its
+  own episode against same-task negatives (FIFO queue 256).
+- **SparseKeyMemoryFusion** — content-addressed read: 8 content keys,
+  top-2 softmax routing, whitened residual (LayerNorm without affine),
+  separate content gate `g_c`, plus an explicit time-tap token
+  (log(1+steps)) so the pacemaker signal has a *dedicated channel* and no
+  longer needs to occupy the content pathway.
+- **privdec A/B control** — a twin run whose reconstruction is conditioned
+  on detached action tokens instead of policy tokens
+  (`rec_condition_source`), so every content meter has a
+  cannot-possibly-read control arm.
+
+**G0 demand audit (pre-registered gate):** ridge/GroupKFold decodability of
+expert actions from (task × phase) templates on vanilla LIBERO leaves no
+residual demand a memory could serve — vanilla LIBERO has **zero
+manufacturable demand**, so stage-1 uses `memv2_stage1_mix`: 4 LIBERO suites
+×1.0 + `libero_mem` ×2.0 + 21 MIKASA anchors ×0.0952 (≈50 % of samples
+demand-bearing).
+
+## 15. Four training rounds — the gate/valve/amplitude causal chain
+
+All rounds: 10K steps, 8×H100, paired main/privdec arms, online
+Δforeign/Δbypass meters (foreign = donor-episode state swap re-applied at
+the fusion call after the schema-2 wiring bug was found and regression-tested).
+
+| round | intervention | injection ratio | outcome |
+|---|---|---|---|
+| memv2 | as designed (zero-init gate) | ≈ 0 | content reaches the pre-gate residual (NCE top-1 22 %, slot correlation 0.995→0.30) but tanh γ settles at −0.005 — **the gate never opens**; all discriminators null |
+| memv2.1 | `content_gate_init` 0.05, mask-grad α 1.0 | 0.0018 → 0.0004 | the optimizer **evades via the other valve**: learned g_c closes over training — and only in the main (shared-conditioning) arm; privdec g_c stays open |
+| memv2.2 | `content_gate_fixed` (g_c ≡ 1, γ_c frozen buffer) | 0.004 | unclosable valve, still null → diagnostics D1/D2 below: amplitude, not routing |
+| memv2.3 | `content_scale` 5.0 ("loud memory") | **0.335** | first sustained arm-specific online signal: Δforeign_rec tail-20 mean **+3.4×10⁻⁴** (main) vs **≡ 0.0** (privdec control); G4 passed; plateaued below the 10⁻³ strong-pass bar |
+
+The ladder is causally clean: each round removed exactly one degree of
+freedom the optimizer had used to avoid reading content, and the meters
+confirmed the removal worked (injection 0 → 0.0004 → 0.004 → 0.335).
+
+## 16. Diagnostics D1–D3 (memv2.2 null autopsy)
+
+- **D1 — L_rec vs template floor** (n=150 masked decisions): model L_rec
+  1.6135 vs leave-one-out per-dataset template floor 1.6152 (global-mean
+  floor 1.637). **The reconstruction objective is solved to within 0.002 of
+  what task-generic templates achieve with zero episode content.** L_rec
+  trained a reconstruction pathway; it never *needed* the episode.
+- **D2 — decoder conditioning probe**: the decoder is live at unit gain
+  (mem_cond_adapter weights healthy, mask token trained), but at
+  memv2.2's 0.4 % injection the live-vs-foreign loss contrast is ≈ 4×10⁻⁶ —
+  **below bf16 training arithmetic**. Motivated content_scale 5.0.
+- **D3 — masked-demand audit at the exact masked depths** (7 corpora,
+  2,319 episodes, 55K masked-depth rows, ridge/GroupKFold-by-episode):
+  mixture-weighted, init-layout + burn-in features add **−0.024 R²** beyond
+  (task × phase) — *net zero long-range-recoverable demand at the positions
+  the mask supervises*. On `libero_mem` (the dominant demand corpus,
+  weight 2.0): layout/burn-in **−0.036**, but the always-sighted *previous
+  decision* **+0.124** — the manufactured demand is satisfiable from the
+  adjacent sighted decision (`memory_mask_max_per_segment=1` guarantees a
+  1-step buffer), not from memory. Genuine recoverable demand exists only in
+  a few short-horizon MIKASA anchors (shell_game +0.149, chain_of_colors
+  +0.062, take_it_back +0.059), which are ≈5 % of the mixture. **The masking
+  scheme leaks a local shortcut and the mixture's demand was mislabeled** —
+  jointly, this fully explains D1's template-floor result.
+
+## 17. Endpoint — fwdseq foreign discriminator, n=96 paired episodes
+
+Data-level foreign burn-in splice through `forward_sequence` (paired RNG:
+identical mask plans in both arms), 4 MIKASA anchor corpora × 24 episodes,
+step_10000 checkpoints:
+
+| arm | gap_rec (foreign−live) | p (one-sided) | gap_act | p |
+|---|---|---|---|---|
+| **main** | **+4.6×10⁻⁶** [−7.5×10⁻⁶, +1.6×10⁻⁵] | **0.22** | −4.5×10⁻⁵ | 0.84 |
+| privdec (control) | ≡ 0 (exact) | 1.0 | −3.2×10⁻⁵ | 0.56 |
+
+Three readings:
+
+1. **The endpoint is null.** The CI's upper bound (+1.6×10⁻⁵) excludes the
+   online training-time effect (+3.4×10⁻⁴) by ~20×. The content-dependence
+   the online meter measured on training-lattice batches **does not
+   transfer to natural sequential inference on the same corpora** — it was
+   an overfit association to specific reconstruction targets (train-episode
+   memorization) and/or specific to the 8-decision lattice state
+   distribution, not a generalizing content read.
+2. **The instrument is valid**: privdec gap_rec is *exactly* zero (its
+   reconstruction path cannot see the swapped state), and per-dataset gaps
+   in the main arm are largest where burn-in is longest — the splice
+   mechanics work; there is simply no effect to detect.
+3. gap_act is null in both arms: even at 33 % injection, swapping in a
+   different episode's memory does not measurably change **actions**.
+
+## 18. Closed-loop battery — step_10000 (memv2.3 main arm)
+
+| eval | result | reference |
+|---|---|---|
+| MIKASA anchors live (4×50) | **0/200** | zero-shot floor 0/200; T-FT 1/200 |
+| MIKASA anchors bypass (4×50) | 0/200 | — |
+| LIBERO-Mem live (10×20) | **0/200** | zero-shot floor 0/200 |
+| LIBERO regression (10/goal/object/spatial, 100 each) | **0 / 21 / 16 / 9 %** | memv1-100K: 47/78/88/91; T-FT mid-point: 22/56/69/60 |
+
+Behavioral acquisition on the memory benchmarks did not emerge at this dose
+(consistent with the T-FT threshold finding), and the loud-memory
+configuration is **behaviorally destructive on vanilla LIBERO**: forcing a
+fixed 33 % injection of (content-empty) whitened residual into the policy
+stream, under a 50 %-demand mixture for only 10K steps, collapsed baseline
+competence well below even the naive-mixture forgetting seen in T-FT.
+Confounded (steps 10K vs 100K, mixture, amplitude — no matched control at
+scale 1.0), but the direction is unambiguous: the amplitude needed to make
+content *arithmetically visible* to the trainer is an amplitude the policy
+cannot tolerate.
+
+## 19. Verdict and interpretation
+
+The memv2 program removed, one round at a time, every mechanism by which the
+optimizer had avoided reading memory content — gate init, gate evasion,
+amplitude — while adding direct reconstruction supervision, an episodic
+contrastive loss, content-addressed routing, a dedicated time channel, and
+data where content demonstrably matters. The result:
+
+1. **Storage is again confirmed** (NCE identifies episodes; slots
+   decorrelate) — as in memv1.
+2. **The reconstruction objective is satisfiable without episode content**
+   (D1: template floor), because the masking scheme leaks a local shortcut
+   and the mixture's demand was mislabeled (D3: net-zero long-range
+   recoverable demand at masked depths; the sighted adjacent decision
+   carries all the usable signal) — so L_rec supervised a pathway without
+   ever forcing content through it.
+3. **When content is made loud enough to matter arithmetically (0.335
+   injection), training-set content-dependence appears but does not
+   generalize** (online +3.4×10⁻⁴ → endpoint null at 20× tighter CI), and
+   the amplitude itself destroys the policy (LIBERO 0/21/16/9).
+4. The pacemaker interpretation survives its strongest challenge yet:
+   with time given a dedicated tap and content given keys, routing, losses,
+   demand, and amplitude, **behaviorally-read episodic content still does
+   not form under behavior cloning at this scale.**
+
+## 20. Updated recommendation
+
+The Chapter 13 arc is now stronger, not weaker: the paper gains a
+constructive chapter — *"we redesigned the read path and the objective to
+force content-reading, eliminated every trainability failure mode
+identified by our own instruments, and the null survived"* — plus two
+transferable methodological findings: (a) masked-reconstruction auxiliary
+losses for memory are template-soluble unless the mask schedule blocks
+local interpolation (mask *runs* of decisions, not singletons); (b) online
+content meters on training batches can show sustained arm-specific signals
+that are pure train-set memorization — endpoint discrimination on held-out
+rollouts is mandatory.
+
+Remaining escalations, in order of information-per-GPU-hour:
+1. **Fix the D3 leak**: contiguous masked runs (2–3 decisions,
+   `memory_mask_max_per_segment` > 1) so reconstruction cannot be
+   interpolated, and **reweight the mixture to the anchors D3 certifies as
+   demand-bearing at masked depths** (shell_game/chain_of_colors/
+   take_it_back — currently ≈5 % of samples) — the two memv2 design flaws
+   the diagnostics actually convicted.
+2. Longer training at moderate scale (1.5–2×, not 5×) with the fwdseq
+   endpoint as the tracked metric — 10K steps never showed behavioral
+   acquisition on any arm of any round.
+3. Otherwise: ship the paper as the completed two-arc anatomy
+   (pacemaker + the redesign null); the instruments are the contribution.
