@@ -156,6 +156,7 @@ def _state_payload(state: MemoryState, decision_index: int) -> dict:
         "episodic": state.episodic.detach().cpu() if state.episodic is not None else None,
         "steps": state.steps.detach().cpu(),
         "valid": state.valid.detach().cpu(),
+        "keys": state.keys.detach().cpu() if state.keys is not None else None,
         "decision_index": decision_index,
     }
 
@@ -165,11 +166,13 @@ def _load_memory_state(path: Path, device: torch.device) -> MemoryState:
     if isinstance(payload, MemoryState):
         return payload.detach().to(device=device)
     episodic = payload.get("episodic")
+    keys = payload.get("keys")
     return MemoryState(
         working=payload["working"].to(device=device, dtype=torch.float32),
         episodic=episodic.to(device=device, dtype=torch.float32) if episodic is not None else None,
         steps=payload["steps"].to(device=device),
         valid=payload["valid"].to(device=device),
+        keys=keys.to(device=device, dtype=torch.float32) if keys is not None else None,
     )
 
 
