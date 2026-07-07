@@ -216,7 +216,9 @@ def load_model(cfg, ckpt: str, device):
     return model.to(device).eval()
 
 
-def run_pair(model, live_segment: dict, foreign_segment: dict, seg_seed: int, device) -> dict:
+def run_pair(
+    model, live_segment: dict, foreign_segment: dict, seg_seed: int, device, fp32: bool = False
+) -> dict:
     """Both forward_sequence passes, identically seeded; returns the 4 losses."""
     import torch
     from contextlib import nullcontext
@@ -228,7 +230,7 @@ def run_pair(model, live_segment: dict, foreign_segment: dict, seg_seed: int, de
             torch.cuda.manual_seed_all(seg_seed)
         autocast = (
             torch.autocast("cuda", dtype=torch.bfloat16)
-            if device.type == "cuda"
+            if device.type == "cuda" and not fp32
             else nullcontext()
         )
         with torch.no_grad(), autocast:
@@ -277,6 +279,11 @@ def run(args) -> None:
 
     print(f"loading model: config={args.config} ckpt={args.ckpt}", flush=True)
     model = load_model(cfg, args.ckpt, device)
+    if args.content_scale is not None:
+        # D2' amplitude probe: measure the live/foreign contrast at a
+        # candidate injection amplitude without retraining.
+        model.policy_memory_fusion.residual_scale = float(args.content_scale)
+        print(f"content_scale override: residual_scale={args.content_scale}", flush=True)
 
     records = []
     for dataset_name in dataset_names:
@@ -292,7 +299,7 @@ def run(args) -> None:
             foreign = splice_foreign(live["segment"], donor["segment"], burn_in)
             seg_seed = stable_seed("fwdseq-fwd-v1", args.seed, dataset_name, live["index"])
             started = time.perf_counter()
-            record = run_pair(model, live["segment"], foreign, seg_seed, device)
+            record = run_pair(model, live["segment"], foreign, seg_seed, device, fp32=args.fp32)
             record.update(
                 dataset=dataset_name,
                 index=live["index"],
@@ -335,6 +342,8 @@ def run(args) -> None:
         "ckpt": str(args.ckpt),
         "seed": args.seed,
         "min_burn_in": args.min_burn_in,
+        "content_scale": args.content_scale,
+        "fp32": bool(args.fp32),
         "n": len(records),
         "rec": rec_stats,
         "act": act_stats,
@@ -460,6 +469,10 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--robot-type", type=str, default="mikasa_robo")
     parser.add_argument("--data-root", type=str, default=None,
                         help="override cfg.datasets.vla_data.data_root_dir")
+    parser.add_argument("--content-scale", type=float, default=None,
+                        help="override policy_memory_fusion.residual_scale (D2' amplitude probe)")
+    parser.add_argument("--fp32", action="store_true",
+                        help="run forward passes in fp32 (no bf16 autocast)")
     parser.add_argument("--min-burn-in", type=int, default=1,
                         help="minimum valid burn-in decisions; pairs are matched on the exact count")
     parser.add_argument("--bootstrap", type=int, default=10000)

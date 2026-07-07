@@ -440,7 +440,19 @@ class VLA_JEPA(baseframework):
         video_embeddings, tokens_per_frame, latent_frames = self._encode_video_latents(
             batch_videos_clean, policy_tokens
         )
-        with self._autocast_context(policy_tokens, torch.bfloat16):
+        # D2 (memv2.2): under bf16 the live-vs-foreign loss contrast at unit
+        # content amplitude sits below the training arithmetic; the fp32
+        # branch lowers that floor ~250x so moderate amplitudes stay
+        # trainable.  Weights are fp32 masters either way — only the
+        # activations change.
+        rec_fp32 = bool(self.config.trainer.get("rec_loss_fp32", False))
+        if rec_fp32 and policy_tokens.is_cuda:
+            # nullcontext would leave the trainer's outer bf16 autocast
+            # active and silently re-demote the branch.
+            rec_context = torch.autocast("cuda", enabled=False)
+        else:
+            rec_context = self._autocast_context(policy_tokens, torch.bfloat16)
+        with rec_context:
             gt_states = video_embeddings[:, tokens_per_frame:, :]
             input_states = self.wm_mask_token[None, None, :].expand(
                 gt_states.shape[0], tokens_per_frame * (latent_frames - 1), -1
@@ -449,6 +461,10 @@ class VLA_JEPA(baseframework):
                 cond_input = action_tokens.detach()
             else:
                 cond_input = _scale_grad(policy_tokens, alpha)
+            if rec_fp32:
+                gt_states = gt_states.float()
+                input_states = input_states.float()
+                cond_input = cond_input.float()
             conditioning = self.mem_cond_adapter(cond_input)
             predicted_states = self.vj_predictor(input_states, conditioning)
             return F.l1_loss(predicted_states, gt_states, reduction="mean")

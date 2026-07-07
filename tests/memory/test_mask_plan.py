@@ -164,6 +164,64 @@ class MaskPlanTest(unittest.TestCase):
             if step is not None:
                 self.assertNotIn("video_clean", step)
 
+    def test_run_masking_emits_one_contiguous_run_sparing_position_zero(self):
+        mixture = _make_mixture(mask_rate=1.0, mask_cap=2, segment_length=4)
+        mixture.memory_mask_run_len = 2
+        starts = set()
+        for index in range(128):
+            plan = mixture._sample_mask_plan(index)
+            self.assertEqual(plan.shape, (4,))
+            self.assertFalse(bool(plan[0]))
+            self.assertEqual(int(plan.sum()), 2)
+            run = np.flatnonzero(plan)
+            self.assertEqual(int(run[1] - run[0]), 1)
+            starts.add(int(run[0]))
+        self.assertEqual(starts, {1, 2})
+
+    def test_run_masking_respects_rate(self):
+        mixture = _make_mixture(mask_rate=0.25, mask_cap=2, segment_length=4)
+        mixture.memory_mask_run_len = 2
+        masked = sum(
+            bool(mixture._sample_mask_plan(i).any()) for i in range(1000)
+        )
+        self.assertAlmostEqual(masked / 1000.0, 0.25, delta=0.05)
+
+    def test_run_masking_is_deterministic(self):
+        first = _make_mixture(mask_rate=0.5, mask_cap=2, segment_length=4)
+        second = _make_mixture(mask_rate=0.5, mask_cap=2, segment_length=4)
+        first.memory_mask_run_len = 2
+        second.memory_mask_run_len = 2
+        self.assertEqual(
+            [first._sample_mask_plan(i).tolist() for i in range(64)],
+            [second._sample_mask_plan(i).tolist() for i in range(64)],
+        )
+
+    def test_run_longer_than_maskable_window_never_masks(self):
+        mixture = _make_mixture(mask_rate=1.0, mask_cap=4, segment_length=4)
+        mixture.memory_mask_run_len = 4
+        for index in range(32):
+            self.assertFalse(bool(mixture._sample_mask_plan(index).any()))
+
+    def test_run_masking_default_is_legacy_singleton_path(self):
+        self.assertEqual(LeRobotMixtureDataset.memory_mask_run_len, 1)
+        mixture = _make_mixture(mask_rate=1.0, mask_cap=1)
+        for index in range(32):
+            self.assertEqual(int(mixture._sample_mask_plan(index).sum()), 1)
+
+    def test_video_clean_rides_both_positions_of_a_run(self):
+        mixture = _make_mixture(mask_rate=1.0, mask_cap=2, segment_length=4)
+        mixture.memory_mask_run_len = 2
+        sample = mixture.sample_segment(3)
+        plan = sample["mask_plan"]
+        self.assertEqual(int(plan.sum()), 2)
+        burn_in = 3
+        for offset, masked in enumerate(plan):
+            step = sample["steps"][burn_in + offset]
+            if masked:
+                np.testing.assert_array_equal(step["video_clean"], step["video"])
+            else:
+                self.assertNotIn("video_clean", step)
+
     def test_linear_ramp_scales_rate_with_sample_ordinal(self):
         ramped = _make_mixture(mask_rate=0.9, mask_cap=3, ramp_samples=40)
         unramped = _make_mixture(mask_rate=0.9, mask_cap=3)

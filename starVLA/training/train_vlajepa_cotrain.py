@@ -347,6 +347,14 @@ class VLAMTrainer(TrainerUtils):
         dataset.memory_mask_max_per_segment = int(
             _cfg_get(self.config, "datasets.vla_data.memory_mask_max_per_segment", 1)
         )
+        dataset.memory_mask_run_len = int(
+            _cfg_get(self.config, "datasets.vla_data.memory_mask_run_len", 1)
+        )
+        if dataset.memory_mask_run_len > dataset.memory_mask_max_per_segment:
+            raise ValueError(
+                "memory_mask_run_len exceeds memory_mask_max_per_segment; "
+                "raise the cap to match the run length"
+            )
         # One outer step consumes total_batch_size segments across all ranks.
         dataset.memory_mask_ramp_samples = self.mask_ramp_steps * self.total_batch_size
 

@@ -202,4 +202,33 @@ DATASET_NAMED_MIXTURES = {
         ("mikasa_intercept_grab_fast_vla_v0", 0.0952381, "mikasa_robo"),
     ],
 
+    # memv2.4: only corpora certified demand-bearing by the D3 masked-depth
+    # audit (gap >= +0.04 R2 beyond task x phase at the supervised masked
+    # positions; docs/memory-v2p4-certified-demand-plan.md gate C0).  The
+    # "long"-retention variants and libero_mem all fail the audit — their
+    # demand is not recoverable within the burn-in horizon.  Effective
+    # fractions (weight x frames): vanilla LIBERO 34% (competence anchor),
+    # libero_mem 20%, certified anchors 47%.
+    "memv2_stage2_mix": [
+        ("libero_object_no_noops_1.0.0_lerobot", 2.0, "libero_franka"),
+        ("libero_goal_no_noops_1.0.0_lerobot", 2.0, "libero_franka"),
+        ("libero_spatial_no_noops_1.0.0_lerobot", 2.0, "libero_franka"),
+        ("libero_10_no_noops_1.0.0_lerobot", 2.0, "libero_franka"),
+        ("libero_mem_1.0.0_lerobot", 1.0, "libero_franka"),
+        ("mikasa_shell_game_shuffle_color_lamp_touch_vla_v0", 1.0, "mikasa_robo"),
+        ("mikasa_gather_and_recall_5_vla_v0", 1.0, "mikasa_robo"),
+        ("mikasa_batteries_checker_easy_3_vla_v0", 1.0, "mikasa_robo"),
+        ("mikasa_gather_and_recall_3_vla_v0", 1.0, "mikasa_robo"),
+        ("mikasa_shell_game_shuffle_touch_vla_v0", 1.0, "mikasa_robo"),
+        ("mikasa_trace_shape_medium_vla_v0", 1.0, "mikasa_robo"),
+        ("mikasa_chain_of_colors_7_vla_v0", 1.0, "mikasa_robo"),
+        ("mikasa_bunch_of_colors_5_vla_v0", 1.0, "mikasa_robo"),
+        ("mikasa_blink_count_button_press_medium_vla_v0", 1.0, "mikasa_robo"),
+        ("mikasa_seq_of_colors_5_vla_v0", 1.0, "mikasa_robo"),
+        ("mikasa_chain_of_colors_5_vla_v0", 1.0, "mikasa_robo"),
+        ("mikasa_chain_of_colors_3_vla_v0", 1.0, "mikasa_robo"),
+        ("mikasa_take_it_back_vla_v0", 1.0, "mikasa_robo"),
+        ("mikasa_timed_transfer_medium_vla_v0", 1.0, "mikasa_robo"),
+    ],
+
 }

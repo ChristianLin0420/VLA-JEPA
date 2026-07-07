@@ -1,0 +1,195 @@
+run_id: vlajepa_memv2p4_stage1
+run_root_dir: /lustre/fsw/portfolios/edgeai/users/chrislin/vlajepa_runs
+experiment_id: E20260707-memv2p4-stage1
+seed: 42
+trackers: [json]
+is_debug: false
+
+wandb:
+  mode: online
+  project: vla-jepa
+  entity: crlc112358
+  group: vlajepa-memv2-stage1
+
+framework:
+  name: VLA_JEPA
+  qwenvl:
+    base_vlm: /lustre/fsw/portfolios/edgeai/users/chrislin/vlajepa_stage/models/Qwen3-VL-2B-Instruct
+    attn_implementation: sdpa
+    vl_hidden_dim: 2048
+  action_model:
+    action_model_type: DiT-B
+    action_hidden_dim: 1024
+    hidden_size: 1024
+    add_pos_embed: true
+    max_seq_len: 1024
+    action_dim: 7
+    state_dim: 8
+    future_action_window_size: 6
+    action_horizon: 7
+    past_action_window_size: 0
+    repeated_diffusion_steps: 4
+    noise_beta_alpha: 1.5
+    noise_beta_beta: 1.0
+    noise_s: 0.999
+    num_timestep_buckets: 1000
+    num_inference_timesteps: 4
+    num_target_vision_tokens: 32
+    diffusion_model_cfg:
+      cross_attention_dim: 2048
+      dropout: 0.2
+      final_dropout: true
+      interleave_self_attention: true
+      norm_type: ada_norm
+      num_layers: 16
+      output_dim: 1024
+      positional_embeddings: null
+  vj2_model:
+    base_encoder: /lustre/fsw/portfolios/edgeai/users/chrislin/vlajepa_stage/models/vjepa2-vitl-fpc64-256
+    depth: 12
+    num_heads: 8
+    special_action_token: "<|action_{}|>"
+    num_action_tokens_per_timestep: 8
+    embodied_action_token: "<|embodied_action|>"
+    num_embodied_action_tokens_per_instruction: 32
+    num_frames: 8
+  memory:
+    enabled: true
+    schema_version: 2
+    source: qwen_action_tokens_current_only
+    read_before_write: true
+    state_dtype: float32
+    action_conditioning:
+      enabled: true
+      mode: residual_cross_attention
+      bottleneck_dim: 512
+      dropout: 0.0
+      zero_init_gate: false
+      gate_init: 1.0e-03
+      content_gate_init: 1.0
+      content_gate_fixed: true
+      content_scale: 1.0
+    world_model_conditioning:
+      enabled: false
+      mode: residual_cross_attention
+      bottleneck_dim: 512
+      dropout: 0.0
+      zero_init_gate: true
+      gate_init: 0.0
+    short_term:
+      enabled: true
+      num_slots: 8
+      dim: 512
+      num_heads: 8
+      update: gated_cross_attention
+      update_gate_init: 0.1
+    long_term:
+      enabled: false
+      type: gated_delta
+      key_dim: 128
+      value_dim: 128
+      retention_half_life: 256
+  reduce_in_full_precision: true
+
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    data_root_dir: /lustre/fsw/portfolios/edgeai/users/chrislin/vlajepa_stage/datasets/lerobot
+    data_mix: memv2_stage2_mix
+    action_type: delta_qpos
+    CoT_prompt: "Your task is {instruction}. Infer the temporal dynamics from frames {actions} and produce the corresponding policy actions {e_actions}."
+    resolution_size: 224
+    video_resolution_size: 256
+    per_device_batch_size: 1
+    load_all_data_for_training: true
+    with_state: false
+    sample_mode: contiguous_segment
+    segment_length: 4
+    burn_in_max_decisions: 8
+    segment_stride: 7
+    require_same_trajectory: true
+    emit_episode_metadata: true
+    delete_pause_frame: false
+    memory_mask_rate: 0.25
+    memory_mask_max_per_segment: 2
+    memory_mask_run_len: 2
+  # Present for schema completeness. Stage 1 explicitly skips the video pass.
+  video_data:
+    dataset_py: video_datasets
+    video_dir: /lustre/fsw/portfolios/edgeai/users/chrislin/vlajepa_stage/datasets/ssv2/20bn-something-something-v2
+    text_file: /lustre/fsw/portfolios/edgeai/users/chrislin/vlajepa_stage/datasets/ssv2/labels_all.csv
+    CoT_prompt: "Your task is {instruction}. Infer the temporal dynamics of future frames {actions}."
+    extensions: [webm]
+    expected_video_count: 220847
+    expected_label_count: 193690
+    resolution_size: 224
+    video_resolution_size: 256
+    per_device_batch_size: 1
+
+trainer:
+  epochs: 100
+  # Preserve the effective repeat count used by the 100K parent checkpoint.
+  repeated_diffusion_steps: 4
+  max_train_steps: 10000
+  optimizer_steps_per_training_step: 1
+  robot_only: true
+  skip_video_pass: true
+  robot_world_model_loss: false
+  num_warmup_steps: 250
+  save_interval: 500
+  ckpt_interval: 500
+  keep_last_checkpoints: 2
+  eval_interval: 500
+  resume_from_latest: false
+  grace_seconds: 300
+  jepa_log_interval: 50
+  jepa_figure_interval: 500
+  memory_bptt_steps: 4
+  memory_detach_burn_in: true
+  memory_direct_context_dropout: 0.0
+  rec_loss_weight: 0.5
+  nce_loss_weight: 0.2
+  mask_grad_alpha: 1.0
+  rec_loss_fp32: true
+  mask_ramp_steps: 2000
+  pretrained_checkpoint: /lustre/fsw/portfolios/edgeai/users/chrislin/vlajepa_runs/vlajepa_memv1_video/final_model/pytorch_model.pt
+  checkpoint_migration:
+    enabled: true
+    strict: true
+    allow_missing_prefixes:
+      - memory_module.
+      - policy_memory_fusion.
+      - wm_mask_token
+      - mem_cond_adapter.
+      - nce_head_h.
+      - nce_head_g.
+    allow_unexpected_prefixes: []
+  learning_rate:
+    base: 1.0e-04
+    qwen_vl_interface: 1.0e-06
+    action_model: 1.0e-04
+    memory_module: 1.0e-04
+    policy_memory_fusion: 1.0e-04
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-06
+  freeze_modules: "qwen_vl_interface,vj_encoder,vj_predictor"
+  loss_scale:
+    vla: 1.0
+    vlm: 0.0
+  max_grad_norm: 1.0
+  warmup_ratio: 0.05
+  weight_decay: 0.0
+  logging_frequency: 10
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 1
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-08
+  is_resume: false
+  resume_epoch: null
+  resume_step: null
+  enable_gradient_checkpointing: true
+  enable_mixed_precision_training: true

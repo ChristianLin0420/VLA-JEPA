@@ -396,14 +396,15 @@ class Memv2MetersTest(unittest.TestCase):
 
 
 class MaskScheduleConfigTest(unittest.TestCase):
-    def _trainer(self, mask_rate, dataset):
+    def _trainer(self, mask_rate, dataset, run_len=None):
         trainer = object.__new__(cotrain.VLAMTrainer)
         trainer.memory_mask_rate = mask_rate
         trainer.mask_ramp_steps = 100
         trainer.total_batch_size = 8
-        trainer.config = OmegaConf.create(
-            {"datasets": {"vla_data": {"memory_mask_max_per_segment": 2}}}
-        )
+        vla_data = {"memory_mask_max_per_segment": 2}
+        if run_len is not None:
+            vla_data["memory_mask_run_len"] = run_len
+        trainer.config = OmegaConf.create({"datasets": {"vla_data": vla_data}})
         trainer.vla_train_dataloader = SimpleNamespace(dataset=dataset)
         return trainer
 
@@ -412,7 +413,18 @@ class MaskScheduleConfigTest(unittest.TestCase):
         self._trainer(0.25, dataset)._configure_mask_schedule()
         self.assertEqual(dataset.memory_mask_rate, 0.25)
         self.assertEqual(dataset.memory_mask_max_per_segment, 2)
+        self.assertEqual(dataset.memory_mask_run_len, 1)
         self.assertEqual(dataset.memory_mask_ramp_samples, 800)
+
+    def test_run_len_reaches_the_segment_dataset(self):
+        dataset = SimpleNamespace(sample_segment=lambda index: None)
+        self._trainer(0.25, dataset, run_len=2)._configure_mask_schedule()
+        self.assertEqual(dataset.memory_mask_run_len, 2)
+
+    def test_run_len_beyond_cap_fails_loudly(self):
+        dataset = SimpleNamespace(sample_segment=lambda index: None)
+        with self.assertRaisesRegex(ValueError, "memory_mask_run_len"):
+            self._trainer(0.25, dataset, run_len=3)._configure_mask_schedule()
 
     def test_zero_rate_is_a_memv1_no_op(self):
         dataset = SimpleNamespace()

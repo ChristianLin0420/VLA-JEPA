@@ -288,6 +288,30 @@ class ReconLossTest(unittest.TestCase):
         self.assertIsNone(markers.grad)
         self.assertEqual(model.mem_cond_adapter.token_mixer.in_features, ACTION_TOKENS)
 
+    def test_fp32_branch_upcasts_low_precision_conditioning(self):
+        # Without the explicit casts, bf16 activations meet fp32 adapter
+        # weights and the matmul raises; a finite fp32 loss proves the
+        # branch owns its precision end to end (memv2.4, diagnostic D2).
+        model = _build_model()
+        model.config.trainer["rec_loss_fp32"] = True
+        clip = _robot_step(24, with_clean=True)["video_clean"]
+        policy = torch.randn(1, EMBODIED_TOKENS + 1, HIDDEN).to(torch.bfloat16)
+        markers = torch.randn(1, ACTION_TOKENS, HIDDEN).to(torch.bfloat16)
+        loss = model._compute_recon_loss([clip], policy, markers)
+        self.assertEqual(loss.dtype, torch.float32)
+        self.assertTrue(bool(torch.isfinite(loss)))
+
+    def test_fp32_flag_off_preserves_existing_semantics(self):
+        clip = _robot_step(25, with_clean=True)["video_clean"]
+        policy = torch.randn(1, EMBODIED_TOKENS + 1, HIDDEN)
+        markers = torch.randn(1, ACTION_TOKENS, HIDDEN)
+        baseline = _build_model()._compute_recon_loss([clip], policy, markers)
+        flagged = _build_model()
+        flagged.config.trainer["rec_loss_fp32"] = True
+        torch.testing.assert_close(
+            flagged._compute_recon_loss([clip], policy, markers), baseline
+        )
+
 
 class ForwardOneMaskTest(unittest.TestCase):
     def test_masked_step_switches_losses_blacks_inputs_and_gates_write(self):

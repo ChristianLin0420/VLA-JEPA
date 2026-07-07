@@ -1721,6 +1721,7 @@ class LeRobotMixtureDataset(Dataset):
     memory_mask_rate = 0.0
     memory_mask_max_per_segment = 1
     memory_mask_ramp_samples = 0
+    memory_mask_run_len = 1
 
     def _sample_mask_plan(self, index: int) -> np.ndarray:
         """Deterministic blind-decision plan over the K supervised decisions.
@@ -1731,6 +1732,12 @@ class LeRobotMixtureDataset(Dataset):
         positions are outside the plan by construction.  The linear ramp is
         derived here from the global sample ordinal because dataloader
         workers snapshot the dataset at fork time.
+
+        ``memory_mask_run_len >= 2`` switches to contiguous-run masking
+        (memv2.4): with singleton masks every masked decision keeps a
+        sighted neighbour one stride away and the reconstruction target is
+        locally interpolable (diagnostic D3); a run's deeper positions
+        have no sighted neighbour at stride distance.
         """
 
         effective_epoch = self.epoch if self.mode == "train" else 0
@@ -1742,6 +1749,13 @@ class LeRobotMixtureDataset(Dataset):
             safe_hash(("mask-v1", effective_epoch, int(index), self.seed))
         )
         plan = np.zeros(self.segment_length, dtype=np.bool_)
+        run_len = int(self.memory_mask_run_len)
+        if run_len >= 2:
+            last_start = self.segment_length - run_len
+            if rng.random() < rate and last_start >= 1:
+                start = 1 + int(rng.integers(last_start))
+                plan[start : start + run_len] = True
+            return plan
         budget = int(self.memory_mask_max_per_segment)
         for position in range(1, self.segment_length):
             # Draw before the budget check so per-position draws do not
