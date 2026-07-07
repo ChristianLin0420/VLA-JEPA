@@ -415,3 +415,74 @@ Remaining escalations, in order of information-per-GPU-hour:
    acquisition on any arm of any round.
 3. Otherwise: ship the paper as the completed two-arc anatomy
    (pacemaker + the redesign null); the instruments are the contribution.
+
+## 21. memv2.4 — the certified-demand round (2026-07-07; pre-registered kill at G2)
+
+Escalation 1 was run to its gate, with every convicted flaw fixed *before*
+training (plan + gates pre-registered in
+`docs/memory-v2p4-certified-demand-plan.md`):
+
+- **Demand certified, not assumed** (gate C0): the D3 audit extended to all
+  21 MIKASA anchors; 14 certified (gap +0.04 → +0.43; every "long"-retention
+  variant and `libero_mem` failed — demand beyond the burn-in horizon is not
+  recoverable). `memv2_stage2_mix`: 34 % vanilla LIBERO / 20 % libero_mem /
+  **47 % certified demand** (vs ~5 % in memv2.3).
+- **Shortcut closed**: contiguous masked runs of 2 decisions
+  (`memory_mask_run_len 2`) — the deeper run position has no sighted
+  neighbour at stride distance.
+- **Arithmetic fixed at the root** (probe D2′): in fp32 the live/foreign
+  reconstruction contrast is measurable at the *original* amplitude
+  (+2.1×10⁻⁵, p=0.034, 24/24 pairs — invisible in bf16), so the loud-memory
+  hack was reverted: `content_scale 1.0` + `rec_loss_fp32`, injection back
+  to a benign 0.067.
+- **Endpoint-tracked**: an automated gate watcher exported every 2.5K-step
+  checkpoint and ran the held-out fwdseq discriminator + a LIBERO-goal
+  guardrail; the online meter was demoted to telemetry (the memv2.3 lesson).
+
+**Result — the cleanest null of the program.** Killed at G2
+(step ~7,600 of 10K), on three independent negatives:
+
+| instrument | step | main arm | control |
+|---|---|---|---|
+| fwdseq gap_rec (n=32) | 2,500 | −3.3×10⁻⁷ (p=0.55) | ≡ 0 |
+| fwdseq gap_rec (n=32, certified anchors) | 5,000 | +1.2×10⁻⁷ [−3.5, +6.2]×10⁻⁷ | ≡ 0 |
+| **fwdseq gap_rec (n=96, certified anchors)** | **7,500** | **−4.3×10⁻⁷ [−11.4, +2.7]×10⁻⁷ (p=0.89)** | **≡ 0** |
+| online Δforeign_rec (train batches) | 7,300 | −5.7×10⁻⁶ | ≡ 0 |
+| LIBERO-goal guardrail (200 eps) | 2,500 → 5,000 | 6 % → **1 %** (falling) | — |
+| L_rec | throughout | 1.645 — parked at the template floor | 1.643 |
+
+Three closures:
+
+1. **memv2.3's online signal is now fully explained.** At 1× amplitude with
+   fp32 measurement, the train-batch meter shows *nothing* (−5.7×10⁻⁶ vs
+   +3.4×10⁻⁴ at 5×) — the only content-dependence the program ever recorded
+   was an artifact of the destructive 0.335-injection regime: episode-
+   specific memorization made loud enough to see, never a read.
+2. **The template solution wins even on a level playing field.** With
+   demand certified present at the masked positions, the local shortcut
+   closed, and the contrast arithmetically visible in fp32, gradient
+   descent still drove L_rec to the task-template floor and left
+   reconstruction bit-for-bit independent of which episode's memory is
+   attached — to sub-microloss precision (the n=96 CI excludes any effect
+   above 2.7×10⁻⁷).
+3. **Masking hurts the policy it was meant to teach.** Run-masking a
+   quarter of segments starved/degraded BC competence (goal 6 %→1 % while
+   training), so the objective damages exactly what it cannot improve.
+
+## 22. Program verdict (final)
+
+Five training rounds (memv2 → 2.4), three diagnostics, two probes, and one
+demand audit later, every layer of the causal stack has been individually
+verified and the read still does not form: content is **stored** (probes,
+NCE), **demanded** (C0-certified corpora), **reachable** (welded-open gate,
+0.067–0.335 injection), **arithmetically visible** (fp32), **locally
+unshortcuttable** (contiguous masks), and **directly supervised** (L_rec on
+the policy stream) — and behaviour, reconstruction, and actions remain
+episode-invariant at the tightest resolution ever measured in this program.
+Under behaviour cloning at this scale, this architecture family does not
+learn to read episodic memory content. That is the paper's thesis, now with
+its constructive counterpart fully instrumented and honestly killed by its
+own pre-registered gates. Further rounds in this design space are not
+warranted; the residual escalations (RL or distillation pressure instead of
+BC, or architectures where the read is *forced* by construction rather than
+learned) are future-work material, not this paper.
