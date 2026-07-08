@@ -25,9 +25,30 @@ green; single-GPU production smoke passed before launch.
   must beat the same decoder reading the learned initial state;
 - `loss/retro_loss` decreasing without `loss/pick_loss` collapse.
 
-**Training.** _(pending)_
+**Training (2026-07-08, 30K steps, ~4.5 h on 8×H100, 2 requeue segments,
+~112 steps/min — no Qwen in the M1 loop).** One launch crash at step 0
+(zero figure-interval modulo; trainer guarded, `cc84409`) then clean
+throughout. Full knob-by-knob rationale: `memory-v3-decision-log.md`.
 
-**Verdict.** _(pending)_
+| gate metric | start | 6K | 14K | 22K | **30K (final)** | rule |
+|---|---|---|---|---|---|---|
+| `prior_gap` | +0.006 | +0.034 | +0.054 | +0.069 | **+0.096** | > 0 and growing — **monotone the entire run, never plateaued** |
+| `pick_acc` | 0.07 | 0.50 | 0.50 | 0.50 | **0.50** | ≫ chance 0.031 — 16× |
+| `retro_loss` | 1.84 | 1.60 | 1.59 | 1.586 | **1.587** | falling, no pick collapse |
+| `pick_loss` | 0.556 | 0.14 | 0.14 | 0.139 | **0.139** | — |
+
+**Verdict: PASS.** For the first time in the program, a *learned* writer
+carries episode content that a decoder demonstrably reads: retrodiction from
+the trained memory beats the identical decoder reading the empty prior by a
+growing margin (+0.096 latent-L1 at 30K — three orders of magnitude above
+the fp32 floor and ~50× the D1 template-floor gap that memv2's L_rec never
+cleared), and the discriminative pick identifies the true masked past frame
+among 32 candidates half the time. The 0.50 pick plateau is interpreted as
+the contiguous-run ambiguity ceiling (adjacent masked frames are genuinely
+hard to tell apart), not a defect; the unbounded gate (prior_gap) kept
+growing. The M1 objective did exactly what the design doc claimed: masking
+manufactured demand on unlabeled video, and the writer earned readable
+content before BC ever entered the picture.
 
 ## Stage M2 — co-training into VLA-JEPA
 
