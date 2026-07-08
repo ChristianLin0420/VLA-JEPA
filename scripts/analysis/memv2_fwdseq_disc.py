@@ -104,9 +104,10 @@ def build_mixture(cfg, data_root: str, dataset_name: str, robot_type: str):
     # sample_segment consumes these instance attributes (class defaults are the
     # no-mask memv1 behaviour).  rate=1.0 + cap=1 + ramp=0  =>  mask_plan is
     # all-False except supervised position 1, for every index.
-    mixture.memory_mask_rate = 1.0
-    mixture.memory_mask_max_per_segment = 1
-    mixture.memory_mask_ramp_samples = 0
+    if int(cfg.framework.memory.get("schema_version", 0)) != 3:
+        mixture.memory_mask_rate = 1.0
+        mixture.memory_mask_max_per_segment = 1
+        mixture.memory_mask_ramp_samples = 0
     return mixture
 
 
@@ -129,8 +130,8 @@ def sample_pool(mixture, burn_in: int, min_burn_in: int, target: int, rng) -> li
         if burn_count < min_burn_in:
             skipped_short += 1
             continue
-        plan = np.asarray(segment["mask_plan"], dtype=bool)
-        if int(plan.sum()) != 1 or not bool(plan[1]):
+        plan = np.asarray(segment.get("mask_plan", np.zeros(0)), dtype=bool)
+        if plan.size and (int(plan.sum()) != 1 or not bool(plan[1])):
             raise AssertionError(f"unexpected mask plan {plan.tolist()} at index {int(index)}")
         pool.append(
             {
@@ -235,9 +236,10 @@ def run_pair(
         )
         with torch.no_grad(), autocast:
             output = model.forward_sequence([segment])
-        if "rec_loss" not in output or "action_loss" not in output:
+        rec_value = output.get("rec_loss", output.get("retro_loss"))
+        if rec_value is None or "action_loss" not in output:
             raise AssertionError(f"missing losses in forward_sequence output: {sorted(output)}")
-        record[f"rec_{tag}"] = float(output["rec_loss"])
+        record[f"rec_{tag}"] = float(rec_value)
         record[f"act_{tag}"] = float(output["action_loss"])
     record["delta_rec"] = record["rec_foreign"] - record["rec_live"]
     record["delta_act"] = record["act_foreign"] - record["act_live"]
@@ -277,6 +279,9 @@ def run(args) -> None:
     dataset_names = [name.strip() for name in args.datasets.split(",") if name.strip()]
     quota = int(math.ceil(args.num_segments / len(dataset_names)))
 
+    if int(cfg.framework.memory.get("schema_version", 0)) == 3:
+        args.min_burn_in = max(int(args.min_burn_in), 5)
+        print(f"[schema3] min_burn_in floored to {args.min_burn_in}", flush=True)
     print(f"loading model: config={args.config} ckpt={args.ckpt}", flush=True)
     model = load_model(cfg, args.ckpt, device)
     if args.content_scale is not None:

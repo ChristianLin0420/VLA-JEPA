@@ -33,15 +33,21 @@ def main(args) -> None:
         # Runtime state and memory/fusion math are intentionally FP32 even when
         # the heavy backbone is served in BF16.
         vla.memory_module.float()
-        vla.policy_memory_fusion.float()
-        # Serving always reports per-decision diagnostics; both the write-side
-        # (memory_module) and read-side (fusion injection_ratio/read_attention)
-        # captures are gated behind these flags on the training path.
         vla.memory_module.capture_diagnostics = True
-        vla.policy_memory_fusion.capture_diagnostics = True
-        if memory_config.gate_scale is not None:
-            vla.policy_memory_fusion.residual_scale = memory_config.gate_scale
-            logging.info("MEMORY_GATE_SCALE=%s applied to fusion.residual_scale", memory_config.gate_scale)
+        # Schema 3 (memv3) has no fusion module: the read is native attention.
+        fusion = getattr(vla, "policy_memory_fusion", None)
+        if fusion is not None:
+            # Serving always reports per-decision diagnostics; both the
+            # write-side (memory_module) and read-side (fusion) captures are
+            # gated behind these flags on the training path.
+            fusion.float()
+            fusion.capture_diagnostics = True
+            if memory_config.gate_scale is not None:
+                fusion.residual_scale = memory_config.gate_scale
+                logging.info("MEMORY_GATE_SCALE=%s applied to fusion.residual_scale", memory_config.gate_scale)
+        if getattr(vla, "memory_schema_version", 0) == 3:
+            for module_name in ("retro_cond_proj", "memory_read_proj"):
+                getattr(vla, module_name).float()
 
     hostname = socket.gethostname()
     local_ip = socket.gethostbyname(hostname)
