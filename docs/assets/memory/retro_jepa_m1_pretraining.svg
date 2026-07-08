@@ -1,190 +1,106 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1680" height="1000" viewBox="0 0 1680 1000" role="img" aria-labelledby="title desc">
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="470" viewBox="0 0 1400 470" role="img" aria-labelledby="title">
   <title id="title">Retro-JEPA Stage M1: memory pretraining on actionless video</title>
-  <desc id="desc">Frames pass through the frozen V-JEPA2 encoder; a recurrent slot memory rolls causally over pooled latents; at a query anchor a masked set of past frames is retrodicted by the shared JEPA predictor conditioned on memory read tokens, against frozen latent targets, with an L1 retrodiction loss, a discriminative pick loss over same-task negatives, and a prior-advantage gate metric.</desc>
   <defs>
-    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8.5" refY="3.5" orient="auto" markerUnits="strokeWidth">
-      <path d="M0,0 L9,3.5 L0,7 Z" fill="#334155"/>
+    <marker id="ah" markerWidth="9" markerHeight="8" refX="7.5" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#333333"/>
     </marker>
-    <marker id="arrowTeal" markerWidth="10" markerHeight="10" refX="8.5" refY="3.5" orient="auto" markerUnits="strokeWidth">
-      <path d="M0,0 L9,3.5 L0,7 Z" fill="#3A7D78"/>
-    </marker>
-    <marker id="arrowAmber" markerWidth="10" markerHeight="10" refX="8.5" refY="3.5" orient="auto" markerUnits="strokeWidth">
-      <path d="M0,0 L9,3.5 L0,7 Z" fill="#C98B2E"/>
-    </marker>
-    <filter id="softShadow" x="-15%" y="-15%" width="130%" height="140%">
-      <feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#0F172A" flood-opacity="0.10"/>
-    </filter>
     <style>
-      .title { font: 700 28px Helvetica, Arial, sans-serif; fill: #16324F; }
-      .subtitle { font: 400 15px Helvetica, Arial, sans-serif; fill: #5B6573; }
-      .group { fill: #F8FAFC; stroke: #CBD5E1; stroke-width: 1.2; stroke-dasharray: 6 5; }
-      .group-label { font: 700 14px Helvetica, Arial, sans-serif; letter-spacing: 1.2px; fill: #64748B; }
-      .box { stroke-width: 1.6; filter: url(#softShadow); }
-      .blue { fill: #EAF2F8; stroke: #2F6690; }
-      .teal { fill: #E8F4F2; stroke: #3A7D78; }
-      .amber { fill: #FFF4E1; stroke: #C98B2E; }
-      .gray { fill: #F1F5F9; stroke: #64748B; }
-      .white { fill: #FFFFFF; stroke: #94A3B8; }
-      .label { font: 700 18px Helvetica, Arial, sans-serif; fill: #16324F; text-anchor: middle; }
-      .small { font: 400 14px Helvetica, Arial, sans-serif; fill: #475569; text-anchor: middle; }
-      .tiny { font: 400 12px Helvetica, Arial, sans-serif; fill: #64748B; text-anchor: middle; }
-      .edge { fill: none; stroke: #334155; stroke-width: 1.8; marker-end: url(#arrow); }
-      .mem-edge { fill: none; stroke: #3A7D78; stroke-width: 2.2; marker-end: url(#arrowTeal); }
-      .dependency { fill: none; stroke: #C98B2E; stroke-width: 1.7; stroke-dasharray: 6 5; marker-end: url(#arrowAmber); }
-      .edge-label { font: 600 12px Helvetica, Arial, sans-serif; fill: #475569; text-anchor: middle; }
-      .badge { fill: #FFFFFF; stroke-width: 1.1; }
-      .badge-text { font: 700 10px Helvetica, Arial, sans-serif; letter-spacing: 0.6px; text-anchor: middle; }
+      .mod   { font: 700 17px Helvetica, Arial, sans-serif; fill: #1B2A3A; text-anchor: middle; }
+      .sub   { font: 400 13px Helvetica, Arial, sans-serif; fill: #5B6573; text-anchor: middle; }
+      .mathm { font: italic 600 16px Georgia, 'Times New Roman', serif; fill: #1B2A3A; text-anchor: middle; }
+      .loss  { font: italic 700 16px Georgia, 'Times New Roman', serif; fill: #B4531B; }
+      .note  { font: 400 13px Helvetica, Arial, sans-serif; fill: #5B6573; }
+      .cap   { font: 700 15px Helvetica, Arial, sans-serif; fill: #1B2A3A; }
+      .frozen    { fill: #F0F3F7; stroke: #6B7A8D; stroke-width: 1.4; }
+      .trainable { fill: #FDEBD7; stroke: #C87B2E; stroke-width: 1.4; }
+      .flow  { fill: none; stroke: #333333; stroke-width: 1.6; marker-end: url(#ah); }
+      .sg    { fill: none; stroke: #6B7A8D; stroke-width: 1.4; stroke-dasharray: 5 4; marker-end: url(#ah); }
+      .tokv  { fill: #DCE9F5; stroke: #6B7A8D; stroke-width: 1; }
+      .tokm  { fill: #E7EAEE; stroke: #6B7A8D; stroke-width: 1; }
     </style>
   </defs>
 
-  <rect x="0" y="0" width="1680" height="1000" fill="#FFFFFF"/>
-  <text x="840" y="42" class="title" text-anchor="middle">Retro-JEPA &#183; Stage M1: Memory Pretraining on Actionless Video</text>
-  <text x="840" y="68" class="subtitle" text-anchor="middle">Masking manufactures demand on any video: the writer earns its content from retrodiction, before BC ever exists</text>
+  <rect x="0" y="0" width="1400" height="470" fill="#FFFFFF"/>
+  <text x="30" y="34" class="cap">Stage M1 &#183; memory pretraining on actionless video (SSv2 + DROID + robot corpora)</text>
 
-  <!-- INPUTS group -->
-  <rect x="40" y="100" width="260" height="270" rx="12" class="group"/>
-  <text x="60" y="126" class="group-label">INPUT VIDEO</text>
+  <!-- legend -->
+  <rect x="1122" y="20" width="16" height="16" class="frozen"/>
+  <text x="1146" y="33" class="note">frozen &#10052;</text>
+  <rect x="1230" y="20" width="16" height="16" class="trainable"/>
+  <text x="1254" y="33" class="note">trainable</text>
 
-  <rect x="60" y="142" width="220" height="100" rx="10" class="box white"/>
-  <text x="170" y="172" class="label" style="font-size:16px">frames x_1 &#8230; x_T</text>
-  <text x="170" y="196" class="small">T = 16 decision-frames</text>
-  <text x="170" y="218" class="tiny">SSv2 + DROID + robot corpora &#183; no actions, no language</text>
+  <!-- input frames -->
+  <rect x="40" y="122" width="96" height="70" rx="6" class="frozen" stroke-dasharray="0"/>
+  <rect x="52" y="134" width="96" height="70" rx="6" class="frozen"/>
+  <rect x="64" y="146" width="96" height="70" rx="6" fill="#FFFFFF" stroke="#6B7A8D" stroke-width="1.4"/>
+  <text x="112" y="186" class="mathm">x&#8321;&#8230;x_T</text>
+  <text x="112" y="240" class="sub">video frames</text>
 
-  <rect x="60" y="272" width="220" height="80" rx="10" class="box white"/>
-  <text x="170" y="300" class="small" style="font-weight:700">target bias: saliency</text>
-  <text x="170" y="320" class="tiny">&#8214;z_i &#8722; z_{i&#8722;1}&#8214; picks keyframe-like events</text>
-  <text x="170" y="338" class="tiny">(BPP coverage lesson, JEPA-native)</text>
+  <path d="M164 180 H206" class="flow"/>
 
-  <!-- FROZEN TEACHER group -->
-  <rect x="340" y="100" width="300" height="330" rx="12" class="group"/>
-  <text x="360" y="126" class="group-label">FROZEN TEACHER</text>
+  <!-- encoder -->
+  <rect x="206" y="140" width="150" height="80" rx="10" class="frozen"/>
+  <text x="281" y="174" class="mod">Encoder &#10052;</text>
+  <text x="281" y="198" class="sub">V-JEPA2 ViT-L</text>
 
-  <rect x="360" y="142" width="260" height="104" rx="10" class="box blue"/>
-  <rect x="524" y="150" width="76" height="20" rx="8" class="badge" stroke="#2F6690"/>
-  <text x="562" y="164" class="badge-text" fill="#2F6690">FROZEN</text>
-  <text x="490" y="180" class="label">vj_encoder</text>
-  <text x="490" y="204" class="small">V-JEPA2 ViT-L &#183; 24 blocks &#183; 3D-RoPE</text>
-  <text x="490" y="226" class="tiny">tubelet 2&#215;16&#215;16 &#183; two views concat on channels</text>
+  <path d="M356 180 H432" class="flow"/>
+  <text x="394" y="168" class="mathm">z&#8321;&#8230;z_T</text>
 
-  <rect x="360" y="286" width="260" height="104" rx="10" class="box white"/>
-  <text x="490" y="316" class="label" style="font-size:16px">latents z_i per frame</text>
-  <text x="490" y="340" class="small">[256 tok &#215; 2048] &#183; 4 latent frames / clip</text>
-  <text x="490" y="362" class="tiny">context, regression target, and writer source</text>
+  <!-- branch up to memory -->
+  <path d="M410 180 V100 H452" class="flow"/>
+  <text x="430" y="88" class="mathm">z&#772;_t</text>
 
-  <path d="M280 192 H360" class="edge"/>
-  <path d="M490 246 V286" class="edge"/>
+  <!-- memory -->
+  <rect x="452" y="60" width="212" height="80" rx="10" class="trainable"/>
+  <text x="558" y="94" class="mod">Memory  W</text>
+  <text x="558" y="118" class="sub">M_t = W(M_{t&#8722;1}, z&#772;_t) &#183; K=2 BPTT</text>
+  <path d="M664 84 C 694 84 694 116 664 116" class="flow"/>
 
-  <!-- WRITER group -->
-  <rect x="340" y="470" width="300" height="390" rx="12" class="group"/>
-  <text x="360" y="496" class="group-label">WRITER (LEARNED &#183; THE POINT OF M1)</text>
+  <path d="M664 100 H900 V140" class="flow"/>
+  <text x="790" y="88" class="mathm">R_t  (read tokens)</text>
 
-  <rect x="360" y="512" width="260" height="76" rx="10" class="box white"/>
-  <text x="490" y="540" class="label" style="font-size:16px">pooled source z&#772;_i</text>
-  <text x="490" y="564" class="tiny">VJ2 latents, not Qwen tokens &#8594; runs on pure video</text>
+  <!-- token row: retrodictor context -->
+  <rect x="452" y="169" width="22" height="22" class="tokv"/>
+  <rect x="479" y="169" width="22" height="22" class="tokm"/>
+  <line x1="479" y1="191" x2="501" y2="169" stroke="#6B7A8D" stroke-width="1"/>
+  <rect x="506" y="169" width="22" height="22" class="tokm"/>
+  <line x1="506" y1="191" x2="528" y2="169" stroke="#6B7A8D" stroke-width="1"/>
+  <rect x="533" y="169" width="22" height="22" class="tokv"/>
+  <rect x="560" y="169" width="22" height="22" class="tokv"/>
+  <rect x="587" y="169" width="22" height="22" class="tokm"/>
+  <line x1="587" y1="191" x2="609" y2="169" stroke="#6B7A8D" stroke-width="1"/>
+  <rect x="614" y="169" width="22" height="22" class="tokv"/>
+  <rect x="641" y="169" width="22" height="22" class="tokv"/>
+  <text x="580" y="222" class="sub">mask S: &#961; ~ U(0.3, 0.9), &#8805;1 memory-only target</text>
+  <text x="580" y="241" class="sub">(hatched = mask token; slot keeps 3D-RoPE time)</text>
 
-  <rect x="360" y="622" width="260" height="112" rx="10" class="box teal"/>
-  <rect x="380" y="630" width="128" height="20" rx="8" class="badge" stroke="#3A7D78"/>
-  <text x="444" y="644" class="badge-text" fill="#3A7D78">NON-DETACHED K=2</text>
-  <text x="490" y="668" class="label">RecurrentMemory</text>
-  <text x="490" y="692" class="small">M_i = W(M_{i&#8722;1}, z&#772;_i)</text>
-  <text x="490" y="714" class="tiny">8&#215;512 slots &#183; gated cross-attn update &#183; causal roll</text>
+  <path d="M668 180 H776" class="flow"/>
 
-  <rect x="360" y="768" width="260" height="72" rx="10" class="box teal"/>
-  <text x="490" y="796" class="label" style="font-size:16px">read head &#8594; R_t</text>
-  <text x="490" y="820" class="tiny">[8 read tokens &#215; 2048] at query anchor t</text>
+  <!-- predictor -->
+  <rect x="776" y="140" width="200" height="80" rx="10" class="trainable"/>
+  <text x="876" y="174" class="mod">Predictor</text>
+  <text x="876" y="198" class="sub">shared w/ world model &#183; bidir.</text>
 
-  <path d="M490 390 V512" class="edge"/>
-  <path d="M490 588 V622" class="mem-edge"/>
-  <path d="M620 678 C 660 678 660 640 620 640" class="mem-edge"/>
-  <text x="655" y="622" class="edge-label">recurrent</text>
-  <path d="M490 734 V768" class="mem-edge"/>
+  <path d="M976 180 H1044" class="flow"/>
+  <text x="1010" y="168" class="mathm">z&#770;_i</text>
 
-  <!-- RETRODICTION group -->
-  <rect x="680" y="100" width="460" height="760" rx="12" class="group"/>
-  <text x="700" y="126" class="group-label">RETRODICTION QUERY AT ANCHOR t</text>
+  <!-- sg targets path -->
+  <path d="M410 180 V310 H1044" class="sg"/>
+  <text x="700" y="300" class="note">sg(z_i)  &#8212;  frozen targets, no grad  &#10052;</text>
 
-  <rect x="700" y="142" width="420" height="120" rx="10" class="box amber"/>
-  <rect x="720" y="150" width="150" height="20" rx="8" class="badge" stroke="#C98B2E"/>
-  <text x="795" y="164" class="badge-text" fill="#C98B2E">MANUFACTURED DEMAND</text>
-  <text x="910" y="184" class="label" style="font-size:16px">mask set S &#8834; {1 &#8230; t&#8722;1}</text>
-  <text x="910" y="208" class="small">ratio &#961; ~ U(0.3, 0.9) &#183; saliency-biased targets</text>
-  <text x="910" y="230" class="tiny">&#8805;1 memory-only target: i&#8712;S with i&#8722;1, i+1 &#8712; S (MTM)</text>
-  <text x="910" y="248" class="tiny">no interpolation path &#8594; closes our D3 shortcut</text>
+  <!-- L_retro -->
+  <path d="M1052 192 V298" class="sg" marker-end="none"/>
+  <text x="1068" y="238" class="loss">&#8466;_retro = &#8214;z&#770;_i &#8722; sg(z_i)&#8214;&#8321;</text>
+  <text x="1070" y="260" class="note">L1 in latent space, fp32</text>
 
-  <rect x="700" y="296" width="420" height="122" rx="10" class="box white"/>
-  <text x="910" y="322" class="label" style="font-size:16px">retrodictor context</text>
-  <text x="910" y="346" class="small">visible i&#8713;S &#8594; true z_i tokens</text>
-  <text x="910" y="368" class="small">masked i&#8712;S &#8594; wm_mask_token at temporal slot i</text>
-  <text x="910" y="392" class="tiny">time identity is free: 3D-RoPE phases each slot &#8212; no &#916;t embedding</text>
+  <!-- L_pick -->
+  <path d="M1044 190 V362 H1074" class="flow"/>
+  <rect x="1080" y="352" width="20" height="20" class="tokv"/>
+  <rect x="1106" y="352" width="20" height="20" class="tokm"/>
+  <rect x="1132" y="352" width="20" height="20" class="tokm"/>
+  <text x="1164" y="368" class="loss" text-anchor="start">&#8466;_pick</text>
+  <text x="1164" y="388" class="note" text-anchor="start">InfoNCE vs same-task negatives</text>
 
-  <rect x="700" y="452" width="420" height="76" rx="10" class="box teal"/>
-  <text x="910" y="482" class="label" style="font-size:16px">retro_cond_adapter(R_t)</text>
-  <text x="910" y="506" class="tiny">8 conditioning slots per latent frame (mem_cond_adapter interface)</text>
-
-  <rect x="700" y="562" width="420" height="128" rx="10" class="box blue"/>
-  <rect x="720" y="570" width="142" height="20" rx="8" class="badge" stroke="#2F6690"/>
-  <text x="791" y="584" class="badge-text" fill="#2F6690">SHARED WEIGHTS</text>
-  <rect x="946" y="570" width="154" height="20" rx="8" class="badge" stroke="#C98B2E"/>
-  <text x="1023" y="584" class="badge-text" fill="#C98B2E">BIDIRECTIONAL MASK</text>
-  <text x="910" y="612" class="label">vj_predictor &#183; 12 ACBlocks</text>
-  <text x="910" y="636" class="small">predictor_embed 2048&#8594;1024 &#183; 8 heads &#183; proj &#8594;2048</text>
-  <text x="910" y="658" class="tiny">same blocks as the forward world loss; retrodiction passes a</text>
-  <text x="910" y="676" class="tiny">non-causal mask &#8212; a mask argument, not new parameters</text>
-
-  <rect x="700" y="724" width="420" height="76" rx="10" class="box white"/>
-  <text x="910" y="754" class="label" style="font-size:16px">z&#770;_i for every i &#8712; S</text>
-  <text x="910" y="778" class="tiny">[256 tok &#215; 2048] &#183; in the frozen encoder&#8217;s latent space</text>
-
-  <path d="M910 262 V296" class="edge"/>
-  <path d="M910 418 V452" class="edge"/>
-  <path d="M910 528 V562" class="edge"/>
-  <path d="M910 690 V724" class="edge"/>
-  <path d="M620 804 H668 C 690 804 690 490 700 490" class="mem-edge"/>
-  <text x="668" y="784" class="edge-label">R_t</text>
-
-  <!-- LOSSES group -->
-  <rect x="1180" y="100" width="460" height="640" rx="12" class="group"/>
-  <text x="1200" y="126" class="group-label">LOSSES &#183; GATE</text>
-
-  <rect x="1200" y="142" width="420" height="118" rx="10" class="box amber"/>
-  <rect x="1220" y="150" width="58" height="20" rx="8" class="badge" stroke="#C98B2E"/>
-  <text x="1249" y="164" class="badge-text" fill="#C98B2E">FP32</text>
-  <text x="1410" y="186" class="label">L_retro = &#8214;z&#770;_i &#8722; sg(z_i)&#8214;&#8321;</text>
-  <text x="1410" y="212" class="small">targets: frozen encoder latents &#8212; never pixels</text>
-  <text x="1410" y="236" class="tiny">fp32 branch clears the bf16 contrast floor (our D2)</text>
-
-  <rect x="1200" y="296" width="420" height="150" rx="10" class="box amber"/>
-  <text x="1410" y="326" class="label">L_pick = InfoNCE(pool(z&#770;_i))</text>
-  <text x="1410" y="352" class="small">positive: true z_i</text>
-  <text x="1410" y="374" class="small">negatives: same episode other i &#183; SAME-TASK</text>
-  <text x="1410" y="396" class="small">other episodes &#183; FIFO queue 256</text>
-  <text x="1410" y="424" class="tiny">a template cannot choose among same-task candidates (our D1)</text>
-
-  <rect x="1200" y="482" width="420" height="140" rx="10" class="box white" stroke-dasharray="6 5"/>
-  <text x="1410" y="512" class="label" style="font-size:16px">GATE metric (not a loss)</text>
-  <text x="1410" y="538" class="small">prior-advantage A = L_retro(M_prior) &#8722; L_retro(M_t)</text>
-  <text x="1410" y="562" class="tiny">same query, learned initial state swapped in for the memory</text>
-  <text x="1410" y="584" class="tiny">must be &gt; 0 and growing &#8212; the D1 autopsy instrument, live</text>
-  <text x="1410" y="604" class="tiny">M1 gate: pick-acc &gt; chance AND &gt; same-task-template baseline</text>
-
-  <rect x="1200" y="656" width="420" height="64" rx="10" class="box gray"/>
-  <text x="1410" y="682" class="small" style="font-weight:700">credit assignment</text>
-  <text x="1410" y="704" class="tiny">losses at anchor t reach the write at t&#8722;1 (non-detached K=2, muVLA)</text>
-
-  <path d="M1120 748 H1152 C 1170 748 1170 200 1200 200" class="edge"/>
-  <path d="M1120 762 H1160 C 1178 762 1178 370 1200 370" class="edge"/>
-  <path d="M620 330 H652 C 672 330 672 96 1240 96 C 1256 96 1256 142 1256 142" class="dependency"/>
-  <text x="930" y="90" class="edge-label" fill="#C98B2E">targets sg(z_i) &#183; frozen, stop-grad</text>
-
-  <!-- bottom strip -->
-  <rect x="40" y="880" width="1600" height="100" rx="12" class="group"/>
-  <text x="60" y="906" class="group-label">EVERY MEASURED memv2 FAILURE, CLOSED BY CONSTRUCTION</text>
-  <text x="240" y="934" class="small" style="font-weight:700">D1 template floor</text>
-  <text x="240" y="956" class="tiny">L_pick same-task negatives + prior-advantage gate</text>
-  <text x="640" y="934" class="small" style="font-weight:700">D3 interpolation shortcut</text>
-  <text x="640" y="956" class="tiny">memory-only mask targets (neighbors also masked)</text>
-  <text x="1040" y="934" class="small" style="font-weight:700">D2 bf16 arithmetic floor</text>
-  <text x="1040" y="956" class="tiny">fp32 retrodiction branch (already built)</text>
-  <text x="1440" y="934" class="small" style="font-weight:700">memv2.1 writer erasure</text>
-  <text x="1440" y="956" class="tiny">writer owns its objective &#8212; and keeps it in Stage M2</text>
+  <!-- gate -->
+  <text x="30" y="440" class="note">gate (metric, not a loss):  A = &#8466;_retro(M_prior) &#8722; &#8466;_retro(M_t)  must stay &gt; 0 and grow &#8212; episode content beyond the template floor</text>
 </svg>
