@@ -1,0 +1,194 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1680" height="1000" viewBox="0 0 1680 1000" role="img" aria-labelledby="title desc">
+  <title id="title">Retro-JEPA Stage M2: co-training the pretrained memory into VLA-JEPA</title>
+  <desc id="desc">The M1-pretrained writer rolls over burn-in decisions; memory read tokens join the policy tokens in the DiT action expert's native cross-attention; the retrodiction and pick losses stay on during behavior cloning to prevent content erasure; the black-frame act-blind masking of memv2 is removed; a warmup freezes the writer, then joint training with non-detached K=2 under the pre-registered gate ladder.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8.5" refY="3.5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L9,3.5 L0,7 Z" fill="#334155"/>
+    </marker>
+    <marker id="arrowTeal" markerWidth="10" markerHeight="10" refX="8.5" refY="3.5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L9,3.5 L0,7 Z" fill="#3A7D78"/>
+    </marker>
+    <marker id="arrowAmber" markerWidth="10" markerHeight="10" refX="8.5" refY="3.5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L9,3.5 L0,7 Z" fill="#C98B2E"/>
+    </marker>
+    <filter id="softShadow" x="-15%" y="-15%" width="130%" height="140%">
+      <feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#0F172A" flood-opacity="0.10"/>
+    </filter>
+    <style>
+      .title { font: 700 28px Helvetica, Arial, sans-serif; fill: #16324F; }
+      .subtitle { font: 400 15px Helvetica, Arial, sans-serif; fill: #5B6573; }
+      .group { fill: #F8FAFC; stroke: #CBD5E1; stroke-width: 1.2; stroke-dasharray: 6 5; }
+      .group-label { font: 700 14px Helvetica, Arial, sans-serif; letter-spacing: 1.2px; fill: #64748B; }
+      .box { stroke-width: 1.6; filter: url(#softShadow); }
+      .blue { fill: #EAF2F8; stroke: #2F6690; }
+      .teal { fill: #E8F4F2; stroke: #3A7D78; }
+      .amber { fill: #FFF4E1; stroke: #C98B2E; }
+      .gray { fill: #F1F5F9; stroke: #64748B; }
+      .white { fill: #FFFFFF; stroke: #94A3B8; }
+      .label { font: 700 18px Helvetica, Arial, sans-serif; fill: #16324F; text-anchor: middle; }
+      .small { font: 400 14px Helvetica, Arial, sans-serif; fill: #475569; text-anchor: middle; }
+      .tiny { font: 400 12px Helvetica, Arial, sans-serif; fill: #64748B; text-anchor: middle; }
+      .edge { fill: none; stroke: #334155; stroke-width: 1.8; marker-end: url(#arrow); }
+      .mem-edge { fill: none; stroke: #3A7D78; stroke-width: 2.2; marker-end: url(#arrowTeal); }
+      .dependency { fill: none; stroke: #C98B2E; stroke-width: 1.7; stroke-dasharray: 6 5; marker-end: url(#arrowAmber); }
+      .edge-label { font: 600 12px Helvetica, Arial, sans-serif; fill: #475569; text-anchor: middle; }
+      .badge { fill: #FFFFFF; stroke-width: 1.1; }
+      .badge-text { font: 700 10px Helvetica, Arial, sans-serif; letter-spacing: 0.6px; text-anchor: middle; }
+    </style>
+  </defs>
+
+  <rect x="0" y="0" width="1680" height="1000" fill="#FFFFFF"/>
+  <text x="840" y="42" class="title" text-anchor="middle">Retro-JEPA &#183; Stage M2: Co-Training the Pretrained Memory into VLA-JEPA</text>
+  <text x="840" y="68" class="subtitle" text-anchor="middle">BC meets a memory that already contains readable content; the retrodiction objective never turns off, so BC can never erase it</text>
+
+  <!-- INPUTS group -->
+  <rect x="40" y="100" width="260" height="470" rx="12" class="group"/>
+  <text x="60" y="126" class="group-label">INPUTS (SEGMENT LATTICE)</text>
+
+  <rect x="60" y="142" width="220" height="96" rx="10" class="box white"/>
+  <text x="170" y="170" class="label" style="font-size:16px">burn-in window</text>
+  <text x="170" y="194" class="small">decisions 1 &#8230; 8 &#183; memory rolls</text>
+  <text x="170" y="216" class="tiny">no loss &#183; also the retrodiction past</text>
+
+  <rect x="60" y="268" width="220" height="96" rx="10" class="box white"/>
+  <text x="170" y="296" class="label" style="font-size:16px">supervised window</text>
+  <text x="170" y="320" class="small">decisions 9 &#8230; 12 (K=4)</text>
+  <text x="170" y="342" class="tiny">clean frames &#183; both camera views</text>
+
+  <rect x="60" y="394" width="220" height="72" rx="10" class="box white"/>
+  <text x="170" y="422" class="label" style="font-size:16px">language instruction</text>
+  <text x="170" y="446" class="tiny">CoT prompt with action-token slots</text>
+
+  <rect x="60" y="490" width="220" height="66" rx="10" class="box gray"/>
+  <text x="170" y="516" class="small" style="font-weight:700">data: memv2_stage2_mix</text>
+  <text x="170" y="538" class="tiny">34% LIBERO &#183; 20% libero_mem &#183; 47% certified anchors</text>
+
+  <!-- FROZEN BACKBONES group -->
+  <rect x="340" y="100" width="300" height="470" rx="12" class="group"/>
+  <text x="360" y="126" class="group-label">FROZEN BACKBONES</text>
+
+  <rect x="360" y="142" width="260" height="104" rx="10" class="box blue"/>
+  <rect x="524" y="150" width="76" height="20" rx="8" class="badge" stroke="#2F6690"/>
+  <text x="562" y="164" class="badge-text" fill="#2F6690">FROZEN</text>
+  <text x="490" y="180" class="label">Qwen3-VL-2B</text>
+  <text x="490" y="204" class="small">images + language &#8594; hidden states</text>
+  <text x="490" y="226" class="tiny">policy tokens [33 &#215; 2048] &#183; action tokens [24 &#215; 2048]</text>
+
+  <rect x="360" y="286" width="260" height="104" rx="10" class="box blue"/>
+  <rect x="524" y="294" width="76" height="20" rx="8" class="badge" stroke="#2F6690"/>
+  <text x="562" y="308" class="badge-text" fill="#2F6690">FROZEN</text>
+  <text x="490" y="324" class="label">vj_encoder</text>
+  <text x="490" y="348" class="small">z_i per decision frame</text>
+  <text x="490" y="370" class="tiny">[256 tok &#215; 2048] &#183; writer source + retro targets</text>
+
+  <rect x="360" y="430" width="260" height="116" rx="10" class="box teal"/>
+  <rect x="380" y="438" width="104" height="20" rx="8" class="badge" stroke="#3A7D78"/>
+  <text x="432" y="452" class="badge-text" fill="#3A7D78">INIT FROM M1</text>
+  <rect x="496" y="438" width="112" height="20" rx="8" class="badge" stroke="#3A7D78"/>
+  <text x="552" y="452" class="badge-text" fill="#3A7D78">K=2 NON-DETACHED</text>
+  <text x="490" y="482" class="label">writer &#8594; M_t &#8594; R_t</text>
+  <text x="490" y="506" class="small">same module and source as Stage M1</text>
+  <text x="490" y="528" class="tiny">warmup 0&#8211;1K: writer frozen; then joint</text>
+
+  <path d="M280 170 C 320 170 320 306 360 306" class="edge"/>
+  <path d="M280 316 C 320 316 320 190 360 190" class="edge"/>
+  <path d="M170 238 V268" class="edge"/>
+  <path d="M280 430 C 322 430 322 210 360 210" class="edge"/>
+  <path d="M280 336 H360" class="edge"/>
+  <path d="M490 390 V430" class="mem-edge"/>
+
+  <!-- CONSUMERS group -->
+  <rect x="680" y="100" width="960" height="560" rx="12" class="group"/>
+  <text x="700" y="126" class="group-label">CONSUMERS &#183; LOSSES</text>
+
+  <rect x="700" y="142" width="420" height="160" rx="10" class="box amber"/>
+  <rect x="720" y="150" width="210" height="20" rx="8" class="badge" stroke="#C98B2E"/>
+  <text x="825" y="164" class="badge-text" fill="#C98B2E">NATIVE ATTENTION &#8212; NO FUSION VALVE</text>
+  <text x="910" y="192" class="label">DiT action expert (flow matching)</text>
+  <text x="910" y="218" class="small">cross-attn context = [ policy tokens &#8214; R_t read tokens ]</text>
+  <text x="910" y="242" class="tiny">the read is an attention choice inside the head BC already uses &#8212;</text>
+  <text x="910" y="260" class="tiny">there is no separately-parameterized valve the optimizer can close</text>
+  <text x="910" y="284" class="tiny">(memv2&#8217;s SparseKeyMemoryFusion is retired)</text>
+
+  <rect x="1200" y="166" width="380" height="96" rx="10" class="box amber"/>
+  <text x="1390" y="200" class="label">L_action</text>
+  <text x="1390" y="224" class="small">flow-matching BC on expert actions</text>
+  <text x="1390" y="246" class="tiny">clean frames only &#8212; no act-blind masking</text>
+
+  <rect x="700" y="352" width="420" height="160" rx="10" class="box teal"/>
+  <rect x="720" y="360" width="150" height="20" rx="8" class="badge" stroke="#3A7D78"/>
+  <text x="795" y="374" class="badge-text" fill="#3A7D78">STAYS ON DURING BC</text>
+  <text x="910" y="402" class="label">retro head (Stage M1 machinery)</text>
+  <text x="910" y="428" class="small">mask S &#8834; burn-in window &#183; retrodict masked</text>
+  <text x="910" y="450" class="small">burn-in frames from M_t via shared vj_predictor</text>
+  <text x="910" y="474" class="tiny">the anti-erasure lock: BC cannot empty the memory while the</text>
+  <text x="910" y="492" class="tiny">retrodiction objective still demands episode content (CAMP / RoboMME)</text>
+
+  <rect x="1200" y="376" width="380" height="112" rx="10" class="box amber"/>
+  <text x="1390" y="410" class="label">L_retro + L_pick</text>
+  <text x="1390" y="436" class="small">same definitions as Stage M1 &#183; fp32 branch</text>
+  <text x="1390" y="460" class="tiny">prior-advantage gate metric tracked alongside</text>
+
+  <rect x="700" y="556" width="420" height="72" rx="10" class="box gray"/>
+  <text x="910" y="584" class="small" style="font-weight:700">forward world loss (existing, unchanged)</text>
+  <text x="910" y="606" class="tiny">same predictor, causal mask, Qwen action-token conditioning</text>
+
+  <rect x="1200" y="556" width="380" height="72" rx="10" class="box gray"/>
+  <text x="1390" y="584" class="label" style="font-size:16px">L_total</text>
+  <text x="1390" y="610" class="tiny">L_action + &#955;_r&#183;L_retro + &#955;_p&#183;L_pick (+ world loss per config)</text>
+
+  <path d="M620 200 H700" class="edge"/>
+  <text x="660" y="188" class="edge-label">policy tok</text>
+  <path d="M620 488 C 656 488 656 232 700 232" class="mem-edge"/>
+  <text x="668" y="300" class="edge-label" fill="#3A7D78">R_t</text>
+  <path d="M620 506 C 664 506 664 420 700 420" class="mem-edge"/>
+  <path d="M1120 214 H1200" class="edge"/>
+  <path d="M1120 432 H1200" class="edge"/>
+  <path d="M620 356 C 676 356 676 440 700 440" class="dependency"/>
+  <text x="662" y="346" class="edge-label" fill="#C98B2E">targets sg(z_i)</text>
+  <path d="M910 302 V352" class="dependency" style="stroke-dasharray:2 4"/>
+  <text x="1045" y="332" class="tiny">shared policy-token stream (grad-scaled &#945;)</text>
+
+  <!-- REMOVED banner -->
+  <rect x="40" y="600" width="600" height="60" rx="10" class="box white" stroke="#C98B2E"/>
+  <text x="340" y="626" class="small" style="font-weight:700">REMOVED vs memv2: black-frame &#8220;act blind&#8221; masking</text>
+  <text x="340" y="648" class="tiny">it collapsed the guardrail (6% &#8594; 1%); masking now lives only on the retrodiction side</text>
+
+  <!-- SCHEDULE strip -->
+  <rect x="40" y="690" width="1600" height="140" rx="12" class="group"/>
+  <text x="60" y="716" class="group-label">SCHEDULE &#183; PRE-REGISTERED GATES</text>
+
+  <rect x="60" y="732" width="330" height="80" rx="10" class="box white"/>
+  <text x="225" y="758" class="small" style="font-weight:700">0 &#8211; 1K &#183; warmup</text>
+  <text x="225" y="780" class="tiny">writer FROZEN &#8212; the reader learns to consume an</text>
+  <text x="225" y="798" class="tiny">already-contentful M1 state (SAM2Act+ / CAMP graft)</text>
+
+  <rect x="420" y="732" width="330" height="80" rx="10" class="box white"/>
+  <text x="585" y="758" class="small" style="font-weight:700">1K &#8211; 10K &#183; joint</text>
+  <text x="585" y="780" class="tiny">K=2 non-detached &#183; retro losses always on</text>
+  <text x="585" y="798" class="tiny">wandb online &#183; gate watcher exports every 2.5K</text>
+
+  <rect x="780" y="732" width="400" height="80" rx="10" class="box white"/>
+  <text x="980" y="758" class="small" style="font-weight:700">gates @2.5K / 5K / 7.5K</text>
+  <text x="980" y="780" class="tiny">fwdseq state-swap endpoint n=32 (held-out) &#183; prior-advantage &gt; 0</text>
+  <text x="980" y="798" class="tiny">LIBERO-goal guardrail 20 eps &#183; kill rule pre-registered</text>
+
+  <rect x="1210" y="732" width="410" height="80" rx="10" class="box white"/>
+  <text x="1415" y="758" class="small" style="font-weight:700">10K &#183; endpoint battery</text>
+  <text x="1415" y="780" class="tiny">fwdseq n=96 both arms &#183; MIKASA live/bypass/foreign &#183;</text>
+  <text x="1415" y="798" class="tiny">LIBERO-Mem &#183; LIBERO full regression &#183; decision rule</text>
+
+  <path d="M390 772 H420" class="edge"/>
+  <path d="M750 772 H780" class="edge"/>
+  <path d="M1180 772 H1210" class="edge"/>
+
+  <!-- bottom strip -->
+  <rect x="40" y="860" width="1600" height="110" rx="12" class="group"/>
+  <text x="60" y="886" class="group-label">CONTROL ARM &#183; DECISION RULE</text>
+  <text x="420" y="916" class="small" style="font-weight:700">control: shuffled-state twin</text>
+  <text x="420" y="940" class="tiny">identical training with episode-shuffled memory states at the read &#8212; if it matches the</text>
+  <text x="420" y="958" class="tiny">real arm&#8217;s action loss and endpoints, no content read formed (paired at training level)</text>
+  <text x="1150" y="916" class="small" style="font-weight:700">PASS: endpoint gap_rec &#8805; 1&#215;10&#8315;&#8308; (p &lt; 0.01) &#183; control &#8776; 0 &#183; LIBERO-goal &#8805; 60%</text>
+  <text x="1150" y="940" class="tiny">pass &#8594; scale up + closed-loop chapter &#183; fail &#8594; the negative now covers writer-owned</text>
+  <text x="1150" y="958" class="tiny">objectives too, and the paper ships with the strongest instrumented null available</text>
+</svg>
