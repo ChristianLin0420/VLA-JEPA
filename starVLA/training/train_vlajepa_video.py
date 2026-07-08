@@ -321,8 +321,16 @@ class VLATrainer(TrainerUtils):
 
         while self.completed_steps < self.config.trainer.max_train_steps:
             step_to_complete = self.completed_steps + 1
-            do_jepa = bool(self.wandb_logger.enabled and step_to_complete % self.jepa_log_interval == 0)
-            do_fig = bool(self.wandb_logger.enabled and step_to_complete % self.jepa_figure_interval == 0)
+            do_jepa = bool(
+                self.wandb_logger.enabled
+                and self.jepa_log_interval > 0
+                and step_to_complete % self.jepa_log_interval == 0
+            )
+            do_fig = bool(
+                self.wandb_logger.enabled
+                and self.jepa_figure_interval > 0
+                and step_to_complete % self.jepa_figure_interval == 0
+            )
             unwrapped.capture_jepa = do_jepa or do_fig
 
             t0 = time.perf_counter()

@@ -1,4 +1,4 @@
-"""memv3 Retro-JEPA Stage M1: masked-past retrodiction unit tests (CPU)."""
+"""memv3 Retro-JEPA Stages M1 + M2: retrodiction and reader unit tests (CPU)."""
 
 import unittest
 from types import SimpleNamespace
@@ -8,13 +8,14 @@ import torch
 import torch.nn as nn
 from omegaconf import OmegaConf
 
-from starVLA.model.framework.VLA_JEPA import VLA_JEPA
+from starVLA.model.framework.VLA_JEPA import VLA_JEPA, QwenTokenBundle
 from starVLA.model.modules.world_model.vj2_predictor import VisionTransformerPredictorAC
 
 VJ_HIDDEN = 8
 TEACHER = 2 * VJ_HIDDEN
 QWEN_HIDDEN = 12
 TOKENS_PER_FRAME = 8
+EMBODIED_TOKENS = 5
 
 
 class _VjProcessorStub:
@@ -166,6 +167,122 @@ class PoolFrameTokensTest(unittest.TestCase):
     def test_indivisible_tokens_fail_loudly(self):
         with self.assertRaisesRegex(ValueError, "groups"):
             VLA_JEPA._pool_frame_tokens(torch.zeros(1, 6, 4), groups=8)
+
+
+class _QwenStub:
+    def __call__(self, images, instructions, prompt, require_embodied):
+        batch = len(images)
+        torch.manual_seed(23)
+        action = torch.randn(batch, 4, QWEN_HIDDEN)
+        embodied = torch.randn(batch, EMBODIED_TOKENS, QWEN_HIDDEN) if require_embodied else None
+        return QwenTokenBundle(torch.zeros(batch, 3, QWEN_HIDDEN), action, embodied)
+
+
+class _ActionModelStub(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.last_embodied_shape = None
+        self.probe = nn.Linear(QWEN_HIDDEN, 1)
+
+    def forward(self, embodied, actions, state):
+        self.last_embodied_shape = tuple(embodied.shape)
+        return self.probe(embodied).square().mean()
+
+    def predict_action(self, embodied, state, generator=None, initial_noise=None):
+        self.last_embodied_shape = tuple(embodied.shape)
+        return embodied.new_zeros(embodied.shape[0], 2, 7) + embodied.mean()
+
+
+def _robot_step(seed):
+    rng = np.random.default_rng(seed)
+    return {
+        "action": rng.uniform(-1.0, 1.0, size=(2, 7)).astype(np.float32),
+        "image": [],
+        "lang": "stub task",
+        "video": rng.integers(30, 220, size=(2, 4, 8, 8, 3)).astype(np.uint8),
+    }
+
+
+def _build_m2_model(read_source="live"):
+    model = _build_model()
+    model.config.trainer.update(
+        {
+            "robot_world_model_loss": False,
+            "memory_bptt_steps": 2,
+            "memory_detach_burn_in": False,
+            "repeated_diffusion_steps": 1,
+        }
+    )
+    model._read_source = read_source
+    model._encode_qwen_tokens = _QwenStub()
+    model.action_model = _ActionModelStub()
+    model.future_action_window_size = 1
+    model.past_action_window_size = 0
+    model.chunk_len = 2
+    return model
+
+
+def _segment(seed, length=12, burn_in=8):
+    steps = [_robot_step(seed * 100 + index) for index in range(length)]
+    loss_mask = np.zeros(length, dtype=bool)
+    loss_mask[burn_in:] = True
+    return {
+        "steps": steps,
+        "sequence_valid": np.ones(length, dtype=bool),
+        "loss_mask": loss_mask,
+        "update_mask": np.ones(length, dtype=bool),
+        "is_first": np.zeros(length, dtype=bool),
+        "segment_start": loss_mask.copy(),
+        "dataset_id": "stub",
+        "episode_id": seed,
+    }
+
+
+class M2SequenceTest(unittest.TestCase):
+    def test_reader_appends_tokens_and_retro_losses_emerge(self):
+        model = _build_m2_model()
+        output = model.forward_sequence([_segment(3)])
+        self.assertIn("action_loss", output)
+        self.assertIn("retro_loss", output)
+        self.assertIn("pick_loss", output)
+        for value in output.values():
+            self.assertTrue(bool(torch.isfinite(value)))
+        # embodied tokens + 4 (num_slots) read tokens reached the action head
+        self.assertEqual(model.action_model.last_embodied_shape[1], EMBODIED_TOKENS + 4)
+        self.assertIn("pick_acc", model.last_memory_diagnostics)
+
+    def test_retro_loss_trains_the_writer_through_bc_sequence(self):
+        model = _build_m2_model()
+        output = model.forward_sequence([_segment(5)])
+        (output["retro_loss"] + output["pick_loss"] + output["action_loss"]).backward()
+        writer_grads = [
+            parameter.grad
+            for parameter in model.memory_module.parameters()
+            if parameter.grad is not None
+        ]
+        self.assertTrue(any(float(grad.abs().sum()) > 0 for grad in writer_grads))
+
+    def test_prior_read_control_ignores_the_live_state(self):
+        torch.manual_seed(3)
+        live = _build_m2_model(read_source="live")
+        torch.manual_seed(3)
+        prior = _build_m2_model(read_source="prior")
+        segment = _segment(9)
+        live_out = live.forward_sequence([segment])
+        prior_out = prior.forward_sequence([segment])
+        self.assertFalse(
+            torch.allclose(live_out["action_loss"], prior_out["action_loss"])
+        )
+
+    def test_predict_action_serves_schema3(self):
+        from PIL import Image
+
+        model = _build_m2_model()
+        model.config.datasets.vla_data.update({"image_size": None})
+        views = [Image.new("RGB", (8, 8), color=(120, 60, 30)) for _ in range(2)]
+        result = model.predict_action([views], ["stub task"], return_memory_state=True)
+        self.assertEqual(model.action_model.last_embodied_shape[1], EMBODIED_TOKENS + 4)
+        self.assertIsNotNone(model.last_memory_diagnostics)
 
 
 class RealPredictorBidirectionalTest(unittest.TestCase):

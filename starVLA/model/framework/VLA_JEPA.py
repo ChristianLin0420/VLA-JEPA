@@ -224,6 +224,12 @@ class VLA_JEPA(baseframework):
             # Stage M2 reader: read tokens appended to the action expert's
             # cross-attention context (unused in Stage M1).
             self.memory_read_proj = nn.Linear(memory_dim, hidden_dim)
+            self._read_source = str(memory_cfg.get("read_source", "live"))
+            if self._read_source not in ("live", "prior"):
+                raise ValueError(f"unsupported read_source: {self._read_source}")
+            self._last_step_latents = None
+            self._last_pooled_source = None
+            self._last_read_tokens = None
             return
         if self.memory_schema_version >= 2:
             num_slots = int(short_cfg.get("num_slots", 8))
@@ -436,6 +442,13 @@ class VLA_JEPA(baseframework):
         tokens_per_frame = video_embeddings.shape[1] // latent_frames
         return video_embeddings, tokens_per_frame, latent_frames
 
+    def _encode_step_latents(
+        self, batch_videos: List[np.ndarray], reference: torch.Tensor
+    ) -> torch.Tensor:
+        """Frozen latents of a decision's final latent frame: [B, tokens, D]."""
+        z, tokens_per_frame, latent_frames = self._encode_video_latents(batch_videos, reference)
+        return z[:, (latent_frames - 1) * tokens_per_frame :, :]
+
     def _compute_world_loss(
         self,
         batch_videos: List[np.ndarray],
@@ -523,51 +536,40 @@ class VLA_JEPA(baseframework):
         cond = cond.unsqueeze(1).expand(B, latent_frames, -1, -1).reshape(B, -1, cond.shape[-1])
         return self.vj_predictor(context, cond, causal=False)
 
-    def _forward_retro_video(self, examples: List[dict]) -> Dict[str, torch.Tensor]:
-        """Stage M1: masked-past latent retrodiction from the recurrent memory.
+    def _retro_losses(
+        self,
+        frames: torch.Tensor,
+        read_tokens: torch.Tensor,
+        prior_read_tokens: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+        """Shared retrodiction core over [B, T, tokens, D] frozen step latents.
 
-        The writer rolls causally over every latent frame; a contiguous run of
-        past frames is masked in the retrodictor's context, and the memory
-        read is the only supply line for the interior run positions.  L_retro
-        regresses frozen-encoder latents in fp32; L_pick must identify each
-        masked frame among all pooled frames in the batch (same-episode and
-        cross-episode negatives).  BC never appears in this stage.
+        A contiguous run of past positions is masked in the context; the
+        memory read is the only supply line for the interior run positions.
+        L_retro regresses frozen-encoder latents in fp32; L_pick must identify
+        each masked position among all pooled positions in the batch.  When
+        ``prior_read_tokens`` is given the prior-advantage gate metric is
+        computed under no_grad.
         """
-        reference = next(self.retro_cond_proj.parameters())
-        z, tokens_per_frame, latent_frames = self._encode_video_latents(
-            [example["video"] for example in examples], reference
-        )
-        B = z.shape[0]
-        frames = z.view(B, latent_frames, tokens_per_frame, z.shape[-1])
-
-        state = self.memory_module.init_state(B, device=reference.device)
-        update_mask = torch.ones(B, dtype=torch.bool, device=reference.device)
-        for index in range(latent_frames):
-            state = self.memory_module.write(
-                self._pool_frame_tokens(frames[:, index]), state, update_mask=update_mask
-            )
-        pooled_last = self._pool_frame_tokens(frames[:, -1])
-        read_tokens = self.memory_module.read(pooled_last, state).tokens
-
+        B, latent_frames, tokens_per_frame, dim = frames.shape
         start, run_len = self._sample_retro_run(latent_frames)
-        masked = torch.zeros(latent_frames, dtype=torch.bool, device=reference.device)
+        masked = torch.zeros(latent_frames, dtype=torch.bool, device=frames.device)
         masked[start : start + run_len] = True
         mask_token = self.wm_mask_token.to(frames.dtype)[None, None, None, :]
         context = torch.where(masked[None, :, None, None], mask_token, frames)
-        predicted = self._retro_predict(
-            context.reshape(B, latent_frames * tokens_per_frame, -1), read_tokens, latent_frames
-        ).view(B, latent_frames, tokens_per_frame, -1)
+        context_flat = context.reshape(B, latent_frames * tokens_per_frame, dim)
+        predicted = self._retro_predict(context_flat, read_tokens, latent_frames).view(
+            B, latent_frames, tokens_per_frame, dim
+        )
 
         rec_fp32 = bool(self.config.trainer.get("rec_loss_fp32", True))
-        with torch.autocast("cuda", enabled=False) if reference.is_cuda else nullcontext():
+        with torch.autocast("cuda", enabled=False) if frames.is_cuda else nullcontext():
             pred_masked = predicted[:, masked]
             target = frames[:, masked].detach()
             if rec_fp32:
                 pred_masked, target = pred_masked.float(), target.float()
             retro_loss = F.l1_loss(pred_masked, target, reduction="mean")
 
-            # L_pick: every masked frame must identify its own frozen latent
-            # among all pooled frames of the batch (a template cannot).
             anchors = F.normalize(self.retro_pick_head(pred_masked.mean(dim=2).float()), dim=-1)
             candidates = F.normalize(
                 self.retro_pick_head(frames.mean(dim=2).detach().float()), dim=-1
@@ -588,19 +590,45 @@ class VLA_JEPA(baseframework):
             "pick_acc": pick_acc.detach(),
             "masked_frames": torch.tensor(float(run_len)),
         }
+        if prior_read_tokens is not None:
+            with torch.no_grad():
+                prior_pred = self._retro_predict(
+                    context_flat, prior_read_tokens, latent_frames
+                ).view(B, latent_frames, tokens_per_frame, dim)
+                prior_loss = F.l1_loss(prior_pred[:, masked].float(), target, reduction="mean")
+            diagnostics["prior_gap"] = (prior_loss - retro_loss).detach()
+        return retro_loss, pick_loss, diagnostics
+
+    def _forward_retro_video(self, examples: List[dict]) -> Dict[str, torch.Tensor]:
+        """Stage M1: masked-past latent retrodiction from the recurrent memory.
+
+        The writer rolls causally over every latent frame of an actionless
+        video sequence; BC never appears in this stage.
+        """
+        reference = next(self.retro_cond_proj.parameters())
+        z, tokens_per_frame, latent_frames = self._encode_video_latents(
+            [example["video"] for example in examples], reference
+        )
+        B = z.shape[0]
+        frames = z.view(B, latent_frames, tokens_per_frame, z.shape[-1])
+
+        state = self.memory_module.init_state(B, device=reference.device)
+        update_mask = torch.ones(B, dtype=torch.bool, device=reference.device)
+        for index in range(latent_frames):
+            state = self.memory_module.write(
+                self._pool_frame_tokens(frames[:, index]), state, update_mask=update_mask
+            )
+        pooled_last = self._pool_frame_tokens(frames[:, -1])
+        read_tokens = self.memory_module.read(pooled_last, state).tokens
+
+        prior_read_tokens = None
         if getattr(self, "capture_jepa", False):
             with torch.no_grad():
                 prior = self.memory_module.init_state(B, device=reference.device)
-                prior_read = self.memory_module.read(pooled_last, prior).tokens
-                prior_pred = self._retro_predict(
-                    context.reshape(B, latent_frames * tokens_per_frame, -1),
-                    prior_read,
-                    latent_frames,
-                ).view(B, latent_frames, tokens_per_frame, -1)
-                prior_loss = F.l1_loss(
-                    prior_pred[:, masked].float(), target, reduction="mean"
-                )
-            diagnostics["prior_gap"] = (prior_loss - retro_loss).detach()
+                prior_read_tokens = self.memory_module.read(pooled_last, prior).tokens
+        retro_loss, pick_loss, diagnostics = self._retro_losses(
+            frames, read_tokens, prior_read_tokens
+        )
         self.last_memory_diagnostics = diagnostics
 
         retro_weight = float(self.config.trainer.get("retro_loss_weight", 1.0))
@@ -663,9 +691,9 @@ class VLA_JEPA(baseframework):
         has_actions = "action" in examples[0]
         if any(("action" in example) != has_actions for example in examples):
             raise ValueError("a decision batch cannot mix robot and video-only samples")
-        if masked and (self.memory_schema_version < 2 or not has_actions):
+        if masked and (self.memory_schema_version != 2 or not has_actions):
             raise ValueError(
-                "masked decisions require robot samples and framework.memory.schema_version >= 2"
+                "masked decisions require robot samples and framework.memory.schema_version == 2"
             )
 
         inputs = self._black_step_inputs(examples) if masked else examples
@@ -698,7 +726,34 @@ class VLA_JEPA(baseframework):
         state_before = memory_state
         policy_tokens = qwen.embodied_action_tokens
         diagnostics: Dict[str, torch.Tensor] = {}
-        if self.memory_enabled and has_actions:
+        if self.memory_enabled and has_actions and self.memory_schema_version == 3:
+            # memv3: writer source and read tokens come from frozen VJ2 step
+            # latents; the read joins the action expert's native attention.
+            if state_before is None:
+                state_before = self.memory_module.init_state(batch_size, device=device)
+            state_before = self.memory_module.reset_state(state_before, reset_mask)
+            step_latents = self._encode_step_latents(
+                [example["video"] for example in inputs], policy_tokens
+            )
+            pooled_source = self._pool_frame_tokens(step_latents)
+            memory_read = self.memory_module.read(
+                pooled_source, state_before, read_mask=active_mask
+            )
+            diagnostics.update(memory_read.diagnostics)
+            read_tokens = memory_read.tokens
+            if self._read_source == "prior":
+                # Control arm: the reader is served a content-empty state.
+                prior = self.memory_module.init_state(batch_size, device=device)
+                read_tokens = self.memory_module.read(pooled_source, prior).tokens
+            if not fusion_bypass:
+                policy_tokens = torch.cat(
+                    [policy_tokens, self.memory_read_proj(read_tokens.to(policy_tokens.dtype))],
+                    dim=1,
+                )
+            self._last_step_latents = step_latents
+            self._last_pooled_source = pooled_source
+            self._last_read_tokens = read_tokens
+        elif self.memory_enabled and has_actions:
             if self.memory_module is None or self.policy_memory_fusion is None:
                 raise RuntimeError("memory is enabled but its modules were not constructed")
             if state_before is None:
@@ -745,7 +800,11 @@ class VLA_JEPA(baseframework):
         state_after = state_before
         # The writer is deliberately invoked only after all requested prediction/loss
         # tensors have been formed.  It consumes current Qwen markers, never targets.
-        if self.memory_enabled and has_actions:
+        if self.memory_enabled and has_actions and self.memory_schema_version == 3:
+            state_after = self.memory_module.write(
+                self._last_pooled_source, state_before, update_mask=update_mask
+            )
+        elif self.memory_enabled and has_actions:
             if self.memory_schema_version >= 2:
                 write_mask = torch.zeros_like(update_mask) if masked else update_mask
                 state_after = self.memory_module.write(
@@ -803,10 +862,14 @@ class VLA_JEPA(baseframework):
             np.asarray(segment["mask_plan"], dtype=bool) if segment.get("mask_plan") is not None else None
             for segment in segments
         ]
-        if self.memory_schema_version < 2 and any(
+        if self.memory_schema_version != 2 and any(
             plan is not None and bool(plan.any()) for plan in mask_plans
         ):
-            raise ValueError("mask_plan requires framework.memory.schema_version >= 2")
+            raise ValueError("mask_plan requires framework.memory.schema_version == 2")
+        retro_losses: List[torch.Tensor] = []
+        pick_losses: List[torch.Tensor] = []
+        step_history: List[torch.Tensor] = []
+        active_history: List[torch.Tensor] = []
 
         carriers = []
         for segment in segments:
@@ -885,7 +948,7 @@ class VLA_JEPA(baseframework):
                 if "rec_loss" in losses:
                     recon_losses.append(losses["rec_loss"])
                 if (
-                    self.memory_schema_version >= 2
+                    self.memory_schema_version == 2
                     and self.policy_memory_fusion.last_residual is not None
                 ):
                     nce_anchors.append(
@@ -894,8 +957,24 @@ class VLA_JEPA(baseframework):
                             dim=-1,
                         )
                     )
+                # memv3: retrodict a masked run of past step latents from the
+                # current read — the anti-erasure objective stays on under BC.
+                if self.memory_schema_version == 3 and len(step_history) >= 5:
+                    window = min(8, len(step_history))
+                    rows_ok = torch.stack(active_history[-window:], dim=1).all(dim=1) & active
+                    if bool(rows_ok.any()):
+                        frames = torch.stack(step_history[-window:], dim=1)[rows_ok]
+                        retro_loss, pick_loss, retro_diag = self._retro_losses(
+                            frames, self._last_read_tokens[rows_ok]
+                        )
+                        retro_losses.append(retro_loss)
+                        pick_losses.append(pick_loss)
+                        last_diagnostics.update(retro_diag)
             elif bool(update_mask.any()):
                 had_burn_in_update = True
+            if self.memory_schema_version == 3:
+                step_history.append(self._last_step_latents)
+                active_history.append(active)
 
         if not action_losses:
             raise ValueError("segment batch has no supervised decisions")
@@ -904,6 +983,11 @@ class VLA_JEPA(baseframework):
             output["wm_loss"] = torch.stack(world_losses).mean()
         if recon_losses:
             output["rec_loss"] = torch.stack(recon_losses).mean()
+        if retro_losses:
+            retro_weight = float(self.config.trainer.get("retro_loss_weight", 1.0))
+            pick_weight = float(self.config.trainer.get("pick_loss_weight", 0.2))
+            output["retro_loss"] = retro_weight * torch.stack(retro_losses).mean()
+            output["pick_loss"] = pick_weight * torch.stack(pick_losses).mean()
         if nce_anchors:
             positive = self._nce_positive(segments, nce_anchors[0])
             output["nce_anchor"] = torch.cat(nce_anchors, dim=0)
@@ -971,6 +1055,7 @@ class VLA_JEPA(baseframework):
             raise RuntimeError("inference prompt did not produce embodied-action tokens")
         state_before = memory_state
         diagnostics: Dict[str, torch.Tensor] = {}
+        serve_pooled_source = None
         if self.memory_enabled and not memory_bypass:
             batch_size = embodied.shape[0]
             device = embodied.device
@@ -982,12 +1067,35 @@ class VLA_JEPA(baseframework):
                 else torch.as_tensor(reset_mask, dtype=torch.bool, device=device)
             )
             state_before = self.memory_module.reset_state(state_before, reset)
-            memory_read = self.memory_module.read(qwen.action_tokens, state_before)
-            diagnostics.update(memory_read.diagnostics)
-            if self.memory_schema_version >= 2:
-                embodied = self.policy_memory_fusion(embodied, state_before)
+            if self.memory_schema_version == 3:
+                # Serve-time step latents: the current views duplicated to one
+                # tubelet (training uses a decision clip's final latent frame;
+                # the static approximation is disclosed in the memv3 report).
+                clips = [
+                    np.stack(
+                        [np.repeat(np.asarray(view)[None], 2, axis=0) for view in views],
+                        axis=0,
+                    )
+                    for views in batch_images
+                ]
+                step_latents = self._encode_step_latents(clips, embodied)
+                serve_pooled_source = self._pool_frame_tokens(step_latents)
+                memory_read = self.memory_module.read(serve_pooled_source, state_before)
+                diagnostics.update(memory_read.diagnostics)
+                read_tokens = memory_read.tokens
+                if self._read_source == "prior":
+                    prior = self.memory_module.init_state(batch_size, device=device)
+                    read_tokens = self.memory_module.read(serve_pooled_source, prior).tokens
+                embodied = torch.cat(
+                    [embodied, self.memory_read_proj(read_tokens.to(embodied.dtype))], dim=1
+                )
             else:
-                embodied = self.policy_memory_fusion(embodied, memory_read.tokens)
+                memory_read = self.memory_module.read(qwen.action_tokens, state_before)
+                diagnostics.update(memory_read.diagnostics)
+                if self.memory_schema_version >= 2:
+                    embodied = self.policy_memory_fusion(embodied, state_before)
+                else:
+                    embodied = self.policy_memory_fusion(embodied, memory_read.tokens)
 
         proprio = (
             torch.as_tensor(np.array(state), device=embodied.device, dtype=embodied.dtype)
@@ -1004,7 +1112,10 @@ class VLA_JEPA(baseframework):
 
         state_after = state_before
         if self.memory_enabled and update_memory and not memory_bypass:
-            state_after = self.memory_module.write(qwen.action_tokens, state_before)
+            if self.memory_schema_version == 3:
+                state_after = self.memory_module.write(serve_pooled_source, state_before)
+            else:
+                state_after = self.memory_module.write(qwen.action_tokens, state_before)
         if state_after is not None:
             state_after = state_after.detach()
         self.last_memory_diagnostics = {
