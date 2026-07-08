@@ -87,12 +87,14 @@ class VideoFolderDataset(Dataset):
         max_retry: int = 10,
         expected_video_count: int | None = None,
         expected_label_count: int | None = None,
+        frame_stride: int = 1,
     ):
         self.video_dir = video_dir
         self.n_frames = n_frames
         self.max_retry = max_retry
         self.crop_h_size = crop_h_size
         self.crop_w_size = crop_w_size
+        self.frame_stride = max(1, int(frame_stride))
 
         # 只扫描文件名
         self.video_files = sorted([
@@ -147,13 +149,14 @@ class VideoFolderDataset(Dataset):
             raise RuntimeError("无法打开视频")
         frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-        if frame_count < self.n_frames:
-            raise ValueError(f"Video {video_path} has only {frame_count} frames, which is less than the required {self.n_frames} frames.")
+        span = (self.n_frames - 1) * self.frame_stride + 1
+        if frame_count < span:
+            raise ValueError(f"Video {video_path} has only {frame_count} frames, which is less than the required span of {span} frames.")
 
-        start = random.randint(0, frame_count - self.n_frames)
+        start = random.randint(0, frame_count - span)
 
         # 3️⃣ 连续、递增、合法的 frame_ids
-        frame_ids = np.arange(start, start + self.n_frames, dtype=np.int64)
+        frame_ids = np.arange(start, start + span, self.frame_stride, dtype=np.int64)
 
         frames = []
         for idx in frame_ids:

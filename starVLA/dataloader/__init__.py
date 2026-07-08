@@ -119,7 +119,29 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe"): # TODO now here on
             max_retry=10,
             expected_video_count=video_dataset_cfg.get("expected_video_count", None),
             expected_label_count=video_dataset_cfg.get("expected_label_count", None),
+            frame_stride=video_dataset_cfg.get("frame_stride", 1),
         )
+        # memv3 M1: additional corpora (e.g. robot episode mp4 farms) mixed in
+        # proportionally to size, each with its own temporal stride.
+        extra_sources = video_dataset_cfg.get("extra_video_sources", None)
+        if extra_sources:
+            from torch.utils.data import ConcatDataset
+
+            datasets = [video_dataset]
+            for source in extra_sources:
+                datasets.append(
+                    VideoFolderDataset(
+                        video_dir=source["video_dir"],
+                        text_file=source["text_file"],
+                        n_frames=cfg.framework.vj2_model.num_frames,
+                        extensions=tuple(source.get("extensions", ["mp4"])),
+                        crop_h_size=video_dataset_cfg.video_resolution_size,
+                        crop_w_size=video_dataset_cfg.video_resolution_size,
+                        max_retry=10,
+                        frame_stride=source.get("frame_stride", 1),
+                    )
+                )
+            video_dataset = ConcatDataset(datasets)
 
         video_collate_fn = partial(collate_fn, 
             n_views=2,

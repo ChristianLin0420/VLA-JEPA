@@ -135,10 +135,12 @@ class VisionTransformerPredictorAC(nn.Module):
             rescale(layer.attn.proj.weight.data, layer_id + 1)
             rescale(layer.mlp.fc2.weight.data, layer_id + 1)
 
-    def forward(self, x, actions, extrinsics=None):
+    def forward(self, x, actions, extrinsics=None, causal=True):
         """
         :param x: context tokens [B, T, p_H*p_W, D]
         :param actions: action tokens [B, T * num, D]
+        :param causal: frame-causal attention (world loss); False gives full
+            bidirectional attention (retrodiction, memv3)
         """
         # Map tokens to predictor dimensions
         x = self.predictor_embed(x)
@@ -159,7 +161,9 @@ class VisionTransformerPredictorAC(nn.Module):
         else:
             x = torch.cat([a, x], dim=2).flatten(1, 2)  # [B, T*(H*W+2), D]
 
-        attn_mask = self.attn_mask[: x.size(1), : x.size(1)].to(x.device, non_blocking=True)
+        attn_mask = None
+        if causal and self.attn_mask is not None:
+            attn_mask = self.attn_mask[: x.size(1), : x.size(1)].to(x.device, non_blocking=True)
 
         # Fwd prop
         for i, blk in enumerate(self.predictor_blocks):

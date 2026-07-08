@@ -380,6 +380,17 @@ class VLATrainer(TrainerUtils):
                 result["opt/grad_norm"] = float(grad_norm)
             except Exception:
                 pass
+        # memv3 retro diagnostics (pick_acc, prior_gap, ...) ride the same
+        # scalar channel as losses; the model refreshes them every forward.
+        diagnostics = getattr(
+            self.accelerator.unwrap_model(self.model), "last_memory_diagnostics", None
+        )
+        if diagnostics:
+            for key, value in diagnostics.items():
+                try:
+                    result[f"memory/{key}"] = float(value)
+                except Exception:
+                    pass
         return result
 
     def _log_metrics(self, metrics):

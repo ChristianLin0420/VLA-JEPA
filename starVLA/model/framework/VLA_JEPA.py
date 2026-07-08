@@ -202,6 +202,29 @@ class VLA_JEPA(baseframework):
 
         hidden_dim = int(self.qwen_vl_interface.model.config.hidden_size)
         memory_dim = int(short_cfg.get("dim", 512))
+        if self.memory_schema_version == 3:
+            # memv3 Retro-JEPA: the writer consumes pooled frozen V-JEPA2
+            # latents (so Stage M1 runs on pure video), the retrodictor is the
+            # shared vj_predictor, and the policy read is native attention —
+            # no fusion module exists for the optimizer to squelch.
+            predictor_dim = int(self.vj_encoder.config.hidden_size) * 2
+            self.memory_module = RecurrentMemory(
+                source_dim=predictor_dim,
+                num_slots=int(short_cfg.get("num_slots", 8)),
+                memory_dim=memory_dim,
+                num_heads=int(short_cfg.get("num_heads", 8)),
+                update_gate_init=float(short_cfg.get("update_gate_init", 0.1)),
+            )
+            self.wm_mask_token = nn.Parameter(torch.empty(predictor_dim))
+            nn.init.normal_(self.wm_mask_token, mean=0.0, std=0.02)
+            self.retro_cond_proj = nn.Linear(memory_dim, predictor_dim)
+            self.retro_pick_head = nn.Sequential(
+                nn.Linear(predictor_dim, 256), nn.GELU(), nn.Linear(256, 256)
+            )
+            # Stage M2 reader: read tokens appended to the action expert's
+            # cross-attention context (unused in Stage M1).
+            self.memory_read_proj = nn.Linear(memory_dim, hidden_dim)
+            return
         if self.memory_schema_version >= 2:
             num_slots = int(short_cfg.get("num_slots", 8))
             key_dim = int(short_cfg.get("key_dim", 128))
@@ -470,6 +493,124 @@ class VLA_JEPA(baseframework):
             return F.l1_loss(predicted_states, gt_states, reduction="mean")
 
     @staticmethod
+    def _pool_frame_tokens(frame_tokens: torch.Tensor, groups: int = 8) -> torch.Tensor:
+        """Group-mean [B, tokens, D] -> [B, groups, D] (parameter-free writer source)."""
+        B, N, D = frame_tokens.shape
+        if N % groups != 0:
+            raise ValueError(f"{N} frame tokens do not divide into {groups} groups")
+        return frame_tokens.view(B, groups, N // groups, D).mean(dim=2)
+
+    def _sample_retro_run(self, latent_frames: int) -> Tuple[int, int]:
+        """Contiguous masked run over past latent frames; frame 0 stays visible.
+
+        Interior positions of a k>=3 run have both neighbours masked (the
+        memory-only targets of the design doc); k in {3..6} keeps >=1 frame
+        visible for context at latent_frames=8.
+        """
+        max_len = min(6, latent_frames - 2)
+        if max_len < 3:
+            raise ValueError("retrodiction needs >= 5 latent frames")
+        run_len = int(torch.randint(3, max_len + 1, (1,)).item())
+        start = int(torch.randint(1, latent_frames - run_len + 1, (1,)).item())
+        return start, run_len
+
+    def _retro_predict(
+        self, context: torch.Tensor, read_tokens: torch.Tensor, latent_frames: int
+    ) -> torch.Tensor:
+        """Shared vj_predictor, bidirectional, conditioned on memory read tokens."""
+        B = context.shape[0]
+        cond = self.retro_cond_proj(read_tokens.to(context.dtype))
+        cond = cond.unsqueeze(1).expand(B, latent_frames, -1, -1).reshape(B, -1, cond.shape[-1])
+        return self.vj_predictor(context, cond, causal=False)
+
+    def _forward_retro_video(self, examples: List[dict]) -> Dict[str, torch.Tensor]:
+        """Stage M1: masked-past latent retrodiction from the recurrent memory.
+
+        The writer rolls causally over every latent frame; a contiguous run of
+        past frames is masked in the retrodictor's context, and the memory
+        read is the only supply line for the interior run positions.  L_retro
+        regresses frozen-encoder latents in fp32; L_pick must identify each
+        masked frame among all pooled frames in the batch (same-episode and
+        cross-episode negatives).  BC never appears in this stage.
+        """
+        reference = next(self.retro_cond_proj.parameters())
+        z, tokens_per_frame, latent_frames = self._encode_video_latents(
+            [example["video"] for example in examples], reference
+        )
+        B = z.shape[0]
+        frames = z.view(B, latent_frames, tokens_per_frame, z.shape[-1])
+
+        state = self.memory_module.init_state(B, device=reference.device)
+        update_mask = torch.ones(B, dtype=torch.bool, device=reference.device)
+        for index in range(latent_frames):
+            state = self.memory_module.write(
+                self._pool_frame_tokens(frames[:, index]), state, update_mask=update_mask
+            )
+        pooled_last = self._pool_frame_tokens(frames[:, -1])
+        read_tokens = self.memory_module.read(pooled_last, state).tokens
+
+        start, run_len = self._sample_retro_run(latent_frames)
+        masked = torch.zeros(latent_frames, dtype=torch.bool, device=reference.device)
+        masked[start : start + run_len] = True
+        mask_token = self.wm_mask_token.to(frames.dtype)[None, None, None, :]
+        context = torch.where(masked[None, :, None, None], mask_token, frames)
+        predicted = self._retro_predict(
+            context.reshape(B, latent_frames * tokens_per_frame, -1), read_tokens, latent_frames
+        ).view(B, latent_frames, tokens_per_frame, -1)
+
+        rec_fp32 = bool(self.config.trainer.get("rec_loss_fp32", True))
+        with torch.autocast("cuda", enabled=False) if reference.is_cuda else nullcontext():
+            pred_masked = predicted[:, masked]
+            target = frames[:, masked].detach()
+            if rec_fp32:
+                pred_masked, target = pred_masked.float(), target.float()
+            retro_loss = F.l1_loss(pred_masked, target, reduction="mean")
+
+            # L_pick: every masked frame must identify its own frozen latent
+            # among all pooled frames of the batch (a template cannot).
+            anchors = F.normalize(self.retro_pick_head(pred_masked.mean(dim=2).float()), dim=-1)
+            candidates = F.normalize(
+                self.retro_pick_head(frames.mean(dim=2).detach().float()), dim=-1
+            )
+            logits = anchors.reshape(-1, anchors.shape[-1]) @ candidates.reshape(
+                -1, candidates.shape[-1]
+            ).T / 0.07
+            masked_index = torch.nonzero(masked, as_tuple=False).squeeze(-1)
+            labels = (
+                torch.arange(B, device=logits.device)[:, None] * latent_frames
+                + masked_index[None, :]
+            ).reshape(-1)
+            pick_loss = F.cross_entropy(logits, labels)
+            pick_acc = (logits.argmax(dim=-1) == labels).float().mean()
+
+        diagnostics = {
+            "retro_loss_raw": retro_loss.detach(),
+            "pick_acc": pick_acc.detach(),
+            "masked_frames": torch.tensor(float(run_len)),
+        }
+        if getattr(self, "capture_jepa", False):
+            with torch.no_grad():
+                prior = self.memory_module.init_state(B, device=reference.device)
+                prior_read = self.memory_module.read(pooled_last, prior).tokens
+                prior_pred = self._retro_predict(
+                    context.reshape(B, latent_frames * tokens_per_frame, -1),
+                    prior_read,
+                    latent_frames,
+                ).view(B, latent_frames, tokens_per_frame, -1)
+                prior_loss = F.l1_loss(
+                    prior_pred[:, masked].float(), target, reduction="mean"
+                )
+            diagnostics["prior_gap"] = (prior_loss - retro_loss).detach()
+        self.last_memory_diagnostics = diagnostics
+
+        retro_weight = float(self.config.trainer.get("retro_loss_weight", 1.0))
+        pick_weight = float(self.config.trainer.get("pick_loss_weight", 0.2))
+        return {
+            "retro_loss": retro_weight * retro_loss,
+            "pick_loss": pick_weight * pick_loss,
+        }
+
+    @staticmethod
     def _black_step_inputs(examples: List[dict]) -> List[dict]:
         """Blacked shallow copies of robot samples; the originals stay intact."""
         blacked = []
@@ -619,6 +760,13 @@ class VLA_JEPA(baseframework):
     def forward(self, examples: List[dict] = None, **kwargs) -> Dict[str, torch.Tensor]:
         if examples and isinstance(examples[0], dict) and "steps" in examples[0]:
             return self.forward_sequence(examples)
+        if (
+            self.memory_schema_version == 3
+            and examples
+            and isinstance(examples[0], dict)
+            and "action" not in examples[0]
+        ):
+            return self._forward_retro_video(examples)
         losses, _, diagnostics = self._forward_one(examples)
         self.last_memory_diagnostics = {
             key: value.detach() for key, value in diagnostics.items()

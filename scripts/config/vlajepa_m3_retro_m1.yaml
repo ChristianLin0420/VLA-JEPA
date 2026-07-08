@@ -1,0 +1,158 @@
+run_id: vlajepa_m3_retro_m1
+run_root_dir: /lustre/fsw/portfolios/edgeai/users/chrislin/vlajepa_runs
+experiment_id: E20260708-m3-retro-m1
+seed: 42
+trackers: [json]
+is_debug: false
+
+wandb:
+  mode: online
+  project: vla-jepa
+  entity: crlc112358
+  group: vlajepa-m3-retro
+
+framework:
+  name: VLA_JEPA
+  qwenvl:
+    base_vlm: /lustre/fsw/portfolios/edgeai/users/chrislin/vlajepa_stage/models/Qwen3-VL-2B-Instruct
+    attn_implementation: sdpa
+    vl_hidden_dim: 2048
+  action_model:
+    action_model_type: DiT-B
+    action_hidden_dim: 1024
+    hidden_size: 1024
+    add_pos_embed: true
+    max_seq_len: 1024
+    action_dim: 7
+    state_dim: 8
+    future_action_window_size: 6
+    action_horizon: 7
+    past_action_window_size: 0
+    repeated_diffusion_steps: 4
+    noise_beta_alpha: 1.5
+    noise_beta_beta: 1.0
+    noise_s: 0.999
+    num_timestep_buckets: 1000
+    num_inference_timesteps: 4
+    num_target_vision_tokens: 32
+    diffusion_model_cfg:
+      cross_attention_dim: 2048
+      dropout: 0.2
+      final_dropout: true
+      interleave_self_attention: true
+      norm_type: ada_norm
+      num_layers: 16
+      output_dim: 1024
+      positional_embeddings: null
+  vj2_model:
+    base_encoder: /lustre/fsw/portfolios/edgeai/users/chrislin/vlajepa_stage/models/vjepa2-vitl-fpc64-256
+    depth: 12
+    num_heads: 8
+    special_action_token: "<|action_{}|>"
+    num_action_tokens_per_timestep: 8
+    embodied_action_token: "<|embodied_action|>"
+    num_embodied_action_tokens_per_instruction: 32
+    # M1 samples 16-frame sequences -> 8 latent frames per retrodiction query.
+    num_frames: 16
+  memory:
+    enabled: true
+    schema_version: 3
+    short_term:
+      enabled: true
+      num_slots: 8
+      dim: 512
+      num_heads: 8
+      update_gate_init: 0.1
+    action_conditioning:
+      enabled: true
+    long_term:
+      enabled: false
+  reduce_in_full_precision: true
+
+datasets:
+  # Kept for framework/config completeness; the video trainer does not read it.
+  vla_data:
+    dataset_py: lerobot_datasets
+    data_root_dir: /lustre/fsw/portfolios/edgeai/users/chrislin/vlajepa_stage/datasets/lerobot
+    data_mix: all_robot
+    action_type: delta_qpos
+    CoT_prompt: "Your task is {instruction}. Infer the temporal dynamics from frames {actions} and produce the corresponding policy actions {e_actions}."
+    resolution_size: 224
+    video_resolution_size: 256
+    per_device_batch_size: 4
+    load_all_data_for_training: true
+    with_state: false
+  video_data:
+    dataset_py: video_datasets
+    video_dir: /lustre/fsw/portfolios/edgeai/users/chrislin/vlajepa_stage/datasets/ssv2/20bn-something-something-v2
+    text_file: /lustre/fsw/portfolios/edgeai/users/chrislin/vlajepa_stage/datasets/ssv2/labels_all.csv
+    CoT_prompt: "Your task is {instruction}. Infer the temporal dynamics of future frames {actions}."
+    extensions: [webm]
+    expected_video_count: 220847
+    expected_label_count: 193690
+    resolution_size: 224
+    video_resolution_size: 256
+    per_device_batch_size: 4
+    frame_stride: 2
+    extra_video_sources:
+      - video_dir: /lustre/fsw/portfolios/edgeai/users/chrislin/memexp_stage/m1_video_farm
+        text_file: /lustre/fsw/portfolios/edgeai/users/chrislin/memexp_stage/m1_video_farm/labels.csv
+        extensions: [mp4]
+        frame_stride: 4
+
+trainer:
+  epochs: 100
+  repeated_diffusion_steps: 4
+  max_train_steps: 30000
+  num_warmup_steps: 1000
+  save_interval: 1000
+  ckpt_interval: 1000
+  keep_last_checkpoints: 2
+  eval_interval: 0
+  resume_from_latest: true
+  grace_seconds: 300
+  jepa_log_interval: 50
+  jepa_figure_interval: 0
+  retro_loss_weight: 1.0
+  pick_loss_weight: 0.2
+  rec_loss_fp32: true
+  # Warm start: the video-pretrained predictor already knows forward
+  # prediction; M1 adds retrodiction + the memory writer on top.
+  pretrained_checkpoint: /lustre/fsw/portfolios/edgeai/users/chrislin/vlajepa_runs/vlajepa_memv1_video/final_model/pytorch_model.pt
+  checkpoint_migration:
+    enabled: true
+    strict: true
+    allow_missing_prefixes:
+      - memory_module.
+      - wm_mask_token
+      - retro_cond_proj.
+      - retro_pick_head.
+      - memory_read_proj.
+    allow_unexpected_prefixes: []
+  learning_rate:
+    base: 1.0e-04
+    vj_predictor: 3.0e-05
+    memory_module: 1.0e-04
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-06
+  freeze_modules: "qwen_vl_interface,vj_encoder,action_model"
+  loss_scale:
+    vla: 0.0
+    vlm: 1.0
+  max_grad_norm: 1.0
+  warmup_ratio: 0.05
+  weight_decay: 0.0
+  logging_frequency: 10
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 1
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-08
+  is_resume: false
+  resume_epoch: null
+  resume_step: null
+  enable_gradient_checkpointing: true
+  enable_mixed_precision_training: true
