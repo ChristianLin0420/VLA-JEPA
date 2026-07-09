@@ -45,9 +45,8 @@ def main(args) -> None:
             if memory_config.gate_scale is not None:
                 fusion.residual_scale = memory_config.gate_scale
                 logging.info("MEMORY_GATE_SCALE=%s applied to fusion.residual_scale", memory_config.gate_scale)
-        if getattr(vla, "memory_schema_version", 0) == 3:
-            for module_name in ("retro_cond_proj", "memory_read_proj"):
-                getattr(vla, module_name).float()
+        # Schema-3 read/cond projections stay in model dtype: predict_action
+        # casts read tokens to the consumer dtype before projecting.
 
     hostname = socket.gethostname()
     local_ip = socket.gethostbyname(hostname)
