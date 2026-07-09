@@ -31,6 +31,9 @@ class _VjEncoderStub(nn.Module):
         super().__init__()
         self.config = SimpleNamespace(tubelet_size=2, hidden_size=VJ_HIDDEN, image_size=8)
         self.register_buffer("probe", torch.linspace(0.5, 1.5, VJ_HIDDEN))
+        # second direction so content changes latent DIRECTION, not just scale
+        # (LayerNorm in the writer erases pure scale — a real-latents property)
+        self.register_buffer("probe2", torch.linspace(1.5, -0.5, VJ_HIDDEN))
 
     @property
     def device(self):
@@ -43,7 +46,11 @@ class _VjEncoderStub(nn.Module):
         frame_means = clips.reshape(count, latent_frames, -1).mean(dim=-1)
         tokens = frame_means.repeat_interleave(TOKENS_PER_FRAME, dim=1)
         offsets = torch.arange(tokens.shape[1], dtype=torch.float32)
-        return tokens[:, :, None] * self.probe + offsets[None, :, None] * 0.01
+        return (
+            torch.sin(tokens[:, :, None] * 0.05) * self.probe
+            + torch.cos(tokens[:, :, None] * 0.02) * self.probe2
+            + offsets[None, :, None] * 0.01
+        )
 
 
 class _RetroPredictorStub(nn.Module):
@@ -283,6 +290,29 @@ class M2SequenceTest(unittest.TestCase):
         result = model.predict_action([views], ["stub task"], return_memory_state=True)
         self.assertEqual(model.action_model.last_embodied_shape[1], EMBODIED_TOKENS + 4)
         self.assertIsNotNone(model.last_memory_diagnostics)
+
+    def test_predict_action_uses_frame_history_clip(self):
+        from PIL import Image
+
+        model = _build_m2_model()
+        model.config.datasets.vla_data.update({"image_size": None})
+        views = [Image.new("RGB", (8, 8), color=(200, 10, 10)) for _ in range(2)]
+        history = [
+            [
+                [Image.new("RGB", (8, 8), color=(10 * t, 20, 20)) for t in range(3)]
+                for _ in range(2)
+            ]
+        ]
+        _, state_history = model.predict_action(
+            [views], ["stub task"], frame_history=history, return_memory_state=True
+        )
+        self.assertEqual(model.action_model.last_embodied_shape[1], EMBODIED_TOKENS + 4)
+        _, state_still = model.predict_action(
+            [views], ["stub task"], return_memory_state=True
+        )
+        # short history is left-padded to 8 frames; the write from a real
+        # motion-bearing history must differ from the duplicated-still fallback
+        self.assertFalse(torch.allclose(state_history.working, state_still.working))
 
 
 class RealPredictorBidirectionalTest(unittest.TestCase):

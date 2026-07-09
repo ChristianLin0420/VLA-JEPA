@@ -289,6 +289,9 @@ class _ConnectionSession:
     donor_episode: int | None = None
     donor_state: object = None
     legacy_reset_warned: bool = False
+    # memv3 (schema 3): rolling raw-frame history per view so the writer sees
+    # a real motion-bearing clip at serve time (train/serve parity).
+    frame_history: list | None = None
 
 class WebsocketPolicyServer:
     """Serves a policy using the websocket protocol. See websocket_client_policy.py for a client implementation.
@@ -587,6 +590,7 @@ class WebsocketPolicyServer:
                 session.decision_index = 0
                 session.donor_episode = donor_episode
                 session.donor_state = donor_state
+                session.frame_history = None
                 return {
                     "status": "ok",
                     "ok": True,
@@ -629,6 +633,19 @@ class WebsocketPolicyServer:
 
                 call_payload = dict(payload)
                 call_payload["batch_images"] = image_tools.to_pil_preserve(batch_images)
+                if memory_enabled and getattr(self._policy, "memory_schema_version", 0) == 3:
+                    # Rolling per-view frame history (oldest -> newest, incl.
+                    # the current frame) so the schema-3 writer sees a real
+                    # motion-bearing clip instead of a duplicated still.
+                    current_views = call_payload["batch_images"][0]
+                    if session.frame_history is None:
+                        session.frame_history = [[] for _ in current_views]
+                    for view_index, view in enumerate(current_views):
+                        session.frame_history[view_index].append(view)
+                        del session.frame_history[view_index][:-8]
+                    call_payload["frame_history"] = [
+                        [list(view_frames) for view_frames in session.frame_history]
+                    ]
                 suppress_write = bool(call_payload.pop("suppress_write", False))
                 rng_before = (
                     session.generator.get_state().clone()

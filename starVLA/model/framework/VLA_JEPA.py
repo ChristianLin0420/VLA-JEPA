@@ -1033,6 +1033,7 @@ class VLA_JEPA(baseframework):
         memory_bypass: bool = False,
         qwen_cache: Optional[QwenTokenBundle] = None,
         keep_qwen_cache: bool = False,
+        frame_history: Optional[List[List[List[Image.Image]]]] = None,
         **kwargs,
     ):
         if qwen_cache is not None:
@@ -1068,16 +1069,27 @@ class VLA_JEPA(baseframework):
             )
             state_before = self.memory_module.reset_state(state_before, reset)
             if self.memory_schema_version == 3:
-                # Serve-time step latents: the current views duplicated to one
-                # tubelet (training uses a decision clip's final latent frame;
-                # the static approximation is disclosed in the memv3 report).
-                clips = [
-                    np.stack(
-                        [np.repeat(np.asarray(view)[None], 2, axis=0) for view in views],
-                        axis=0,
-                    )
-                    for views in batch_images
-                ]
+                # Serve-time step latents.  With frame_history (rolling raw
+                # frames per view, oldest -> newest, current included) the
+                # writer sees a real motion-bearing clip as in training; the
+                # duplicated-still fallback covers historyless callers.
+                if frame_history is not None:
+                    clips = []
+                    for row in frame_history:
+                        view_clips = []
+                        for view_frames in row:
+                            frames = list(view_frames)[-8:]
+                            frames = [frames[0]] * (8 - len(frames)) + frames
+                            view_clips.append(np.stack([np.asarray(f) for f in frames], axis=0))
+                        clips.append(np.stack(view_clips, axis=0))
+                else:
+                    clips = [
+                        np.stack(
+                            [np.repeat(np.asarray(view)[None], 2, axis=0) for view in views],
+                            axis=0,
+                        )
+                        for views in batch_images
+                    ]
                 step_latents = self._encode_step_latents(clips, embodied)
                 serve_pooled_source = self._pool_frame_tokens(step_latents)
                 memory_read = self.memory_module.read(serve_pooled_source, state_before)
