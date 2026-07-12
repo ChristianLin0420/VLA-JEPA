@@ -134,3 +134,107 @@ boundary. Tuning policy at the bottom.
 - **M2 COMPLETE (16:50), post-training window:** server schema-3 None-guard
   fixed (server_policy.py); fwdseq schema-3 patch upstreamed; report M2
   section written. Both 10K ckpts exported by the watcher.
+- **10K ENDPOINT (17:40): live gap_act = +7.03e-2 [CI +5.7,+8.5 e-2],
+  p<0.0001, n=72 held-out; priorread exactly 0 at n=72.** Full trajectory
+  2.25/3.12/4.94/5.16(n=24)/7.03(n=72) e-2 — 700x the pre-registered PASS
+  bar. Smoke found a server dtype bug from my own fix (fp32 projs vs bf16
+  model) — projs now follow model dtype (f20b23b); smoke resubmitted; the
+  first smoke's EGL teardown error is watched as possibly secondary.
+- **Closed-loop battery launched (18:20):** serve smoke round 2 proved the
+  schema-3 server (spatial ran 20 full episodes; 3 suites hit node EGL
+  flake — transient, full runs will confirm). Jobs: MIKASA 6114207-210
+  (live/bypass x live/priorread ckpts, 50 trials), LIBERO-Mem 6114211-212
+  (both ckpts, 20 trials), LIBERO regression 6114213 (live, 4 suites x 20).
+- **MIKASA closed-loop (19:25): 0/200 both ckpts (live and priorread; both
+  memory modes).** At floor, as the pre-registered caveat anticipated —
+  10K steps has never produced MIKASA behavioral acquisition in any round
+  (T-FT 1/200 at 15K, memv2.x 0/200). The content read is established by
+  the discriminator; converting it to MIKASA task success is a dose
+  question (longer M2 = the recommendation). LIBERO-Mem + regression pending.
+- **Serve-time collapse detected (19:55):** LIBERO regression emerging at
+  ~0-1% despite the live arm's best-ever action loss. Hypothesis: the
+  disclosed static-frame serve approximation is now HARMFUL because the
+  policy genuinely reads the memory (gap_act +0.07) — OOD writer input =>
+  corrupted read tokens => corrupted actions; the stronger the read, the
+  worse OOD memory hurts (memv1/2 were immune because they ignored it).
+  Probe submitted: live ckpt, MEMORY_MODE=bypass, 5 trials — if success
+  jumps, diagnosis confirmed => implement serve-time frame buffer (real
+  clips to the writer, train/serve parity), re-run closed-loop.
+- **Diagnosis pivot (20:45):** bypass probe ALSO at floor (0/50 per suite),
+  priorread ckpt (mismatch-free by construction) also 0/200 on libero_mem.
+  The serve static-frame theory cannot be the sole cause; common factor =
+  DOSE: 10K from a video warm start on 34%-vanilla stage2 mix is below
+  closed-loop acquisition for every arm (memv2.4 guardrail matched this on
+  the same mix; memv1 needed 30K+). Teacher-forced action losses are healthy.
+  DECISION (within granted tuning authority, stage boundary): EXTEND M2 to
+  40K steps, both arms, same mixture (mixture change would break arm
+  comparability), gates at 20K/30K/40K; implement the serve-time frame
+  buffer now regardless (parity for the 40K battery); no other knob moves.
+- **M2 extended to 40K (21:25):** both arms resumed from step_10000 full
+  state (jobs 6116263/64, MAX_TRAIN_STEPS=40000, SHA a27f6e3). Frame-buffer
+  serve fix committed (rolling 8-frame per-view history -> real writer
+  clips); the failing unit test was chased to a stub degeneracy (scale-only
+  latents die in the writer LayerNorm) — production latents unaffected; 14
+  tests green. Watcher rescheduled to 20K/30K/40K gates with functional
+  guardrails (fixed server). Same mixture, no other knob moves.
+- **40K extension @11.7K (22:20):** both arms resumed from step_10000
+  cleanly. Action 0.108/0.111 — transient bump above the 10K tail
+  (0.077/0.085), consistent with warm-restart scheduler; watch it recover
+  by ~14K. Live-vs-priorread ordering preserved.
+- **@13.5K (23:22):** transient recovered — live action 0.0687 (new best),
+  priorread 0.0987 (live +31%); retro_raw 1.398 still improving. Healthy.
+- **@15.3K (00:25):** live 0.0612 / priorread 0.0816 (+33% live advantage,
+  widening). Requeue boundary ~01:20; 20K gate ~03:00.
+- **Requeue failure + fix (01:30):** stale .training_complete from the 10K
+  run short-circuited the boundary requeue ("training complete -> no
+  requeue") — both arms stopped at 16,567 with clean boundary saves.
+  Markers deleted, arms resubmitted (resume from step_16567). RULE for any
+  future extension: clear .training_complete before relaunching.
+- **Resume verified (02:00):** 6118142/43 resumed from step_16567/16452,
+  stepping. ~23.4K steps remain ≈ 14h ≈ 4 requeue boundaries (markers clear).
+- **@19K (03:00):** live 0.0670 / priorread 0.1033 (+35% live advantage,
+  still widening). 20K gate fires within ~40 min.
+- **20K gate (04:05): live gap_act +7.84e-2 (p<0.001)** — trajectory
+  continues 7.03 -> 7.84 across the extension. Priorread gate + 20K
+  guardrail (6119478) in flight. Watcher guardrail steps were still
+  2500/5000 — fixed to 20K/30K/40K and watcher restarted cleanly.
+- **20K gates complete (05:05):** priorread gap_act exact 0 ✓ (control valid
+  through the extension). Guardrail at 153/200 eps: 2 successes (~1.3%) —
+  first nonzero closed-loop of the program but marginal; flagged per policy,
+  continue to 30K/40K and judge the SLOPE (memv1 needed 30K+ for LIBERO
+  competence from a stronger warm start).
+- **@24.2K (06:08):** requeue boundary passed cleanly (marker fix works).
+  Final 20K guardrail: 1.5% (3/200). Action live 0.0446 / prior 0.0659
+  (+32%), both steadily improving. 30K gate ~08:30.
+- **@25.9K (07:10):** live 0.0521 / priorread 0.0871 (+40% live advantage —
+  the widest yet). 30K gate ~08:40.
+- **Post-dark-period collection (07-11):** wakeup chain was dark ~2 days
+  (harness gap); both arms COMPLETED 40K on 07-09 15:45, watcher did all
+  exports + 30K/40K gates before going idle. Collected: gap_act trajectory
+  2.25/3.12/4.94/7.03/7.84/10.58/11.19 e-2 (2.5K->40K, ~5x growth, control
+  exact 0 at all 7 gates). Guardrail: 1.5/1.5/2.0% at 20/30/40K — FLAT:
+  the dose extension did NOT convert to LIBERO closed-loop competence; the
+  cap is the mixture/warm-start (34% vanilla from video start), not dose.
+  40K endpoint battery launched (6139039-47: n=96 both arms, MIKASA
+  live+bypass both ckpts, LIBERO-Mem both, lbreg live).
+- **40K endpoint collected (07-12 00:40):** live gap_act +1.427e-1
+  [CI +1.19,+1.68 e-1] p<1e-4 n=72; priorread exact 0 at n=72. Trajectory
+  final: 2.25 -> 14.27 e-2 (6x growth, 9 measurements, control 0 at all).
+  MIKASA 40K: floor (0-0.5%) both ckpts both modes. LIBERO-Mem running,
+  lbreg pending (weekend queue backlog).
+- **Mixture-semantics correction (07-12):** get_vla_dataset builds with
+  balance_dataset_weights=False → per-draw share = weight/sum(weights),
+  SIZE-INDEPENDENT. memv2_stage2_mix therefore actually drew ~35% vanilla /
+  4% libero_mem / 61% anchors (not the frames-weighted 34/20/47 documented
+  earlier — to be corrected in the report). Strengthens the competence-cap
+  diagnosis. memv3p1_mix calibrated under the CORRECT semantics: 67% vanilla
+  / 4% libero_mem / 29% certified anchors per draw.
+- **memv3.1 launched-prep (07-12):** warm-start surgery = allv2-100K
+  backbone+action head (LIBERO 47/78/88/91) + m3-live-40K memory stack incl.
+  retro predictor (merge job 6139670). Gentle LRs to protect competence;
+  retro losses on; gates must show BOTH gap_act >> 0 (read preserved) AND
+  guardrail >= ~50% (competence preserved).
+- **FINAL (07-12 02:40):** LIBERO-Mem 0/200 live, 0/190 priorread
+  (time-limit truncation). Report finalized: split verdict (read PASS
+  1400x / conversion not achieved), mixture correction, three-era Program
+  verdict, lessons, m3.1 recommendation. memv3 CLOSED; m3.1 launching.

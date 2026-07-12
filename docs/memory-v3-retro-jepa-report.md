@@ -53,7 +53,11 @@ content before BC ever entered the picture.
 ## Stage M2 — co-training into VLA-JEPA
 
 **Setup.** Two arms from the M1 final model, 10K steps each on
-`memv2_stage2_mix` (34 % LIBERO / 20 % libero_mem / 47 % certified anchors):
+`memv2_stage2_mix` (per-draw shares under the loader's
+`balance_dataset_weights=False` semantics: **~35 % vanilla LIBERO /
+4 % libero_mem / 61 % certified anchors** — corrected from the
+frames-weighted 34/20/47 first documented; the correction *strengthens* the
+competence-cap diagnosis below):
 **live** (reader receives the real memory read) and **prior-read control**
 (reader receives the learned initial state's read — content-severed).
 Reader = read tokens in the DiT's native cross-attention; retro + pick
@@ -144,8 +148,8 @@ memv2's best endpoint was +4.6×10⁻⁶.
 |---|---|---|
 | MIKASA anchors (4×50), live memory | 0.5 % (1/200) | 0 % |
 | MIKASA anchors, bypass | 0 % | 0.5 % |
-| LIBERO-Mem (10×20) | _(landing)_ | _(landing)_ |
-| LIBERO regression (4×20 ea.) | _(landing)_ | — |
+| LIBERO-Mem (10×20) | 0 % (0/200) | 0 % (0/190; time-limit truncation) |
+| LIBERO regression (200 eps/suite) | 0 / 2 / 0 / 0 % (10/goal/object/spatial) | — |
 | LIBERO-goal guardrail trend | 1.5 → 1.5 → 2.0 % (flat) | — |
 
 **The honest split verdict:** the content read is established beyond any
@@ -156,6 +160,52 @@ guardrail plateau at ~2 % localizes the cap in the configuration, not the
 memory: competence and read are now separately measurable, and this run
 bought the read at the price of competence-training dose.
 
-## Final analysis
+## Final analysis — the program verdict across three eras
 
-_(assembled after the last two evals land)_
+**Era 1 (memv1):** the differentiable memory under BC collapsed to an
+episode pacemaker — content stored, never behaviorally read (foreign swap
+p=0.46 at n=400). **Era 2 (memv2 → 2.4):** every trainability excuse was
+eliminated — gate init, gate evasion, amplitude, arithmetic, demand
+certification, interpolation shortcuts — and the read still never formed;
+the auxiliary reconstruction losses were proven template-soluble, and the
+program's own online meters were proven capable of showing pure
+memorization. **Era 3 (memv3 / Retro-JEPA):** with the writer trained by
+its own time-mirrored objective on unlabeled video (masking manufactures
+demand), the read native-attention, and the retro objective kept on under
+BC, **the read formed, grew 6× across training, and is causally attributed**
+(prior-read control identically zero at nine measurements).
+
+**Split verdict.**
+- *Mechanism:* **PASS, over-determined** — endpoint gap_act +0.143 (n=72,
+  p<10⁻⁴), 1,400× the pre-registered bar; 30–40 % teacher-forced action-loss
+  advantage over the content-severed control.
+- *Behavioral conversion:* **not achieved in this configuration** — all
+  closed-loop suites at ≈floor, LIBERO-goal plateau ~2 % across 20K→40K.
+  The corrected per-draw mixture accounting (~35 % vanilla, anchors
+  oversampled 61 %) plus the video warm start localize the cap: this run
+  paid for competence and reading from the same budget and could afford
+  only the read.
+
+**Lessons the program can defend:** (1) memory demand can be *manufactured*
+by masking on any unlabeled video — no task labels needed; (2) the writer
+must own an objective, and it must stay on under BC (anti-erasure);
+(3) the read belongs in native attention, not a gateable side module;
+(4) online meters lie — endpoint discriminators on held-out rollouts with a
+structural-zero control are the only trustworthy instrument; (5) train/serve
+parity for the writer's inputs matters exactly as much as the read is real.
+
+**Recommendations, in order:** (1) **memv3.1 graft** (prepared:
+`memory-v3p1-graft.md`) — competent 100K head + this run's memory stack,
+gentle 10K co-train, dual gates (read preserved AND competence preserved);
+(2) RL or a substantially longer demand-heavy run for MIKASA behavioral
+acquisition; (3) MemoryVLA-style bank consolidation if episodes outgrow the
+8-slot state; (4) keep the frame-buffer server permanently.
+
+**Caveats:** prior-read (not shuffled-state) control semantics at
+per-device batch 1; gap_rec confounded in schema 3 (splice moves the retro
+targets; gap_act is the endpoint); the 1K writer-freeze warmup was dropped
+(the M1 state made it unnecessary — validated by the ladder); serve-time
+static-frame approximation existed for the 10K battery only (frame buffer
+fixed it before all 40K evals); LIBERO-Mem prior-read arm truncated at 190
+episodes; sim EGL flakes required one retry wave; the stale
+`.training_complete` marker cost ~9 idle hours at one requeue (rule logged).
