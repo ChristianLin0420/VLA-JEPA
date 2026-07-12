@@ -201,6 +201,59 @@ gentle 10K co-train, dual gates (read preserved AND competence preserved);
 acquisition; (3) MemoryVLA-style bank consolidation if episodes outgrow the
 8-slot state; (4) keep the frame-buffer server permanently.
 
+## memv3.1 — the graft: the program's first competent *and* reading model
+
+**Construction** (`memory-v3p1-graft.md`, `m3p1_merge_warmstart.py`):
+state-dict merge of the no-memory 100K co-train (backbone + competent DiT
+head) with memv3's 40K live arm (memory stack + retrodiction-capable
+predictor), then 10K gentle co-training on `memv3p1_mix` (67 % vanilla
+per-draw) with the retro losses on.
+
+**Step-0 baselines:** the unadapted head does not read the grafted memory
+(gap_act −0.001, p=0.74) — the read had to be re-learned into the competent
+head; the step-0 competence eval never ran cleanly (EGL flake, superseded).
+
+**Adaptation:** action loss 0.23 → **0.047 by step 1,500** — below memv3's
+entire-run endpoint in 1.5K steps. Zero memory erasure throughout
+(retro_raw ≤ the memv3 endpoint from step 0).
+
+| gate | read (`gap_act`) | competence (LIBERO-goal, 200 eps) |
+|---|---|---|
+| step 0 (merged) | −0.001 (unadapted) | — |
+| 2,500 | **+2.74×10⁻²** (faster than memv3's from-scratch 2.25) | **88 %** (allv2 ref: 78 %) |
+| 5,000 | +3.61×10⁻² | (EGL-flaked) |
+| 7,500 | +3.85×10⁻² | — |
+| **10,000 (n=72)** | **+6.20×10⁻², p<10⁻⁴** | see battery |
+
+**10K battery:**
+
+| eval | m3.1 graft | allv2 no-memory ref | memv3-40K ref |
+|---|---|---|---|
+| libero_10 | **66.5 %** | 47 % | 0 % |
+| libero_goal | **91.5 %** | 78 % | 2 % |
+| libero_object | **96 %** | 88 % | 0 % |
+| libero_spatial | **94.5 %** | 91 % | 0 % |
+| LIBERO-Mem | 0 % | 0 % | 0 % |
+| MIKASA (live/bypass) | 0 % / 1 % | 0 % | 0–0.5 % |
+| read endpoint | **+6.2×10⁻², growing** | — | +14.3×10⁻² |
+
+**Verdict (dual-gate rule): PASS.** The graft **exceeds the no-memory
+baseline on every LIBERO suite** — the memory is no longer a tax but a net
+positive on ordinary tasks — while carrying a causally-verified, growing
+content read. What remains unconverted, honestly: LIBERO-Mem and MIKASA task
+success are still at floor — reading the memory and *acting on what is read
+in memory-critical tasks* are separable capabilities, and the second needs
+either RL pressure or substantially more demand-focused dose on top of this
+checkpoint (now finally a viable starting point, since competence no longer
+has to be repurchased). Incidents: the single-arm watcher loop bug and two
+EGL retry waves, both logged.
+
+**The recipe, distilled:** pretrain the writer on unlabeled video
+(Retro-JEPA M1) → teach a policy to read it under BC with retro-on (M2) →
+merge the memory stack into your best competent policy and co-train gently
+for ~10K (graft). Total marginal cost of memory over the base policy:
+~1.5 days of 8×H100.
+
 **Caveats:** prior-read (not shuffled-state) control semantics at
 per-device batch 1; gap_rec confounded in schema 3 (splice moves the retro
 targets; gap_act is the endpoint); the 1K writer-freeze warmup was dropped

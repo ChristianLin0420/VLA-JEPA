@@ -238,3 +238,61 @@ boundary. Tuning policy at the bottom.
   (time-limit truncation). Report finalized: split verdict (read PASS
   1400x / conversion not achieved), mixture correction, three-era Program
   verdict, lessons, m3.1 recommendation. memv3 CLOSED; m3.1 launching.
+- **m3.1 step-0 parallel validation (03:05):** while 6139847 queues, the
+  MERGED checkpoint is being evaluated directly — fwdseq n=32 (read intact
+  at step 0?) + LIBERO 4-suite (competence inherited at step 0?). Baselines
+  the graft premise before training; also gives the dual-gate references.
+- **m3.1 step-0 fwdseq (04:15): gap_act = -0.0013 (p=0.74) — the unadapted
+  allv2 head does NOT yet read the grafted memory** (expected: it has never
+  seen read tokens). Baseline interpretation: the graft's 10K must re-form
+  the read into this head — with content already present in the writer, the
+  ladder should show it forming much faster than memv3's from-scratch curve
+  (which needed the full run to reach +0.14). Training + step0-lbreg still
+  queued.
+- **(05:15)** m3.1 training + step0-lbreg still PENDING ~2h (weekend queue
+  congestion). Nothing actionable; chain holds.
+- **m3.1 STARTED (07:20), step 60:** merged ckpt loaded strict. Memory
+  transplant VERIFIED: retro_raw 1.309 (below the m3 endpoint), pick_acc
+  1.0 on robot burn-ins — the grafted stack reads perfectly. Action loss
+  0.23-0.33 — elevated vs the competent-head hope (~0.05-0.1): the allv2
+  head is disturbed by the 8 unadapted read tokens (consistent with step-0
+  gap_act ~0). This is what the 10K adaptation is for; decision point =
+  2.5K dual gate (action should be << 0.1 by then, read re-forming).
+- **m3.1 @1.5K (08:20): adaptation curve excellent** — action loss quarters
+  0.108/0.103/0.060/0.047: already BELOW memv3's 40K endpoint (0.052) at
+  1.5K steps. retro_raw stable 1.34 (zero erasure). The competent head is
+  absorbing the read tokens fast. 2.5K dual gate ~35 min.
+- **m3.1 watcher bug (08:25):** single-arm loop hit set -u (ARMS[1] unbound)
+  after the 2500 fwdseq submit — guardrail missed. Loop fixed, watcher
+  restarted; 2500 guardrail + parallel MIKASA-25 submitted manually.
+- **m3.1 2.5K gate (09:10): READ GATE GREEN** — gap_act +2.74e-2 (p<0.001),
+  re-formed from ~0 at merge to above memv3's from-scratch 2.5K pace. The
+  graft carries content that a NEW head learns to read in 2.5K steps.
+  MIKASA-25: 1/100 (floor at this depth, expected). Guardrail (competence)
+  still running — the decisive half.
+- **2.5K guardrail EGL-flaked (09:40):** 1 episode then client stall (server
+  clean) — the recurring sim-side flake; retried on a fresh node. Training
+  already at 5.1K, action 0.046 (still descending). Read gate remains green.
+- **DUAL GATES GREEN (11:45) — PROGRAM GOAL STATE REACHED.** 2.5K guardrail
+  retry: 88% LIBERO-goal (200 eps) — ABOVE the allv2 no-memory reference
+  (78%) at just 2.5K adaptation steps. 5K read gate: gap_act +3.61e-2
+  (growing: 2.74 -> 3.61). The graft recipe delivers the first competent
+  AND reading checkpoint of the program. Riding the ladder to 10K, then the
+  full battery decides the final m3.1 verdict.
+- **@7.5K gate (12:47): gap_act +3.85e-2** (2.74/3.61/3.85 — growing,
+  saturating gently). MIKASA-25 on 5K ckpt submitted (6145960). 5K guardrail
+  queued behind. 10K ETA ~13:30.
+- **m3.1 COMPLETE @10K (13:40):** full parallel battery launched (endpoint
+  n=96, LIBERO 4-suite, LIBERO-Mem, MIKASA live+bypass). 5K guardrail
+  EGL-flaked empty (superseded by the battery's regression); 5K MIKASA-25
+  floor as expected.
+- **m3.1 10K endpoint (14:42): gap_act +6.20e-2 (n=72, p<1e-4)** — read
+  ladder 2.74/3.61/3.85/6.20 e-2, still growing at 10K in a COMPETENT
+  model. MIKASA 0-1% (floor, honest note: memory->MIKASA conversion
+  remains future work). LIBERO-Mem at 104/200; 4-suite regression queued.
+- **m3.1 FINAL (07-12 15:30): DUAL-GATE PASS — program complete.** LIBERO
+  66.5/91.5/96/94.5 — ABOVE the no-memory baseline (47/78/88/91) on every
+  suite, with read endpoint +6.2e-2 (p<1e-4) still growing. LIBERO-Mem +
+  MIKASA remain floor (read->memory-task-success conversion = future work,
+  now startable from a competent+reading checkpoint). Final model:
+  vlajepa_runs/vlajepa_m3p1_graft/checkpoints/VLA-JEPA-m3p1-graft-step_10000.pt
