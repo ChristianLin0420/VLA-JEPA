@@ -1,0 +1,72 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="560" viewBox="0 0 1400 560" role="img" aria-labelledby="title">
+  <title id="title">memv3.1: grafting the certified memory read onto the competent policy</title>
+  <defs>
+    <marker id="ah3" markerWidth="9" markerHeight="8" refX="7.5" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#333333"/>
+    </marker>
+    <style>
+      .mod   { font: 700 17px Helvetica, Arial, sans-serif; fill: #1B2A3A; text-anchor: middle; }
+      .sub   { font: 400 13px Helvetica, Arial, sans-serif; fill: #5B6573; text-anchor: middle; }
+      .mathm { font: italic 600 16px Georgia, 'Times New Roman', serif; fill: #1B2A3A; text-anchor: middle; }
+      .loss  { font: italic 700 16px Georgia, 'Times New Roman', serif; fill: #B4531B; }
+      .note  { font: 400 13px Helvetica, Arial, sans-serif; fill: #5B6573; }
+      .cap   { font: 700 15px Helvetica, Arial, sans-serif; fill: #1B2A3A; }
+      .frozen    { fill: #F0F3F7; stroke: #6B7A8D; stroke-width: 1.4; }
+      .trainable { fill: #FDEBD7; stroke: #C87B2E; stroke-width: 1.4; }
+      .merge     { fill: #E8F4F2; stroke: #3A7D78; stroke-width: 1.6; }
+      .flow  { fill: none; stroke: #333333; stroke-width: 1.6; marker-end: url(#ah3); }
+      .sg    { fill: none; stroke: #6B7A8D; stroke-width: 1.4; stroke-dasharray: 5 4; marker-end: url(#ah3); }
+    </style>
+  </defs>
+
+  <rect x="0" y="0" width="1400" height="560" fill="#FFFFFF"/>
+  <text x="30" y="34" class="cap">memv3.1 &#183; graft: competent policy + certified memory read, trained together gently</text>
+
+  <!-- donors -->
+  <rect x="40" y="80" width="330" height="120" rx="10" class="frozen"/>
+  <text x="205" y="112" class="mod">no-memory co-train, 100K &#10052;</text>
+  <text x="205" y="138" class="sub">Qwen &#183; encoder &#183; competent DiT head</text>
+  <text x="205" y="160" class="sub">LIBERO 47 / 78 / 88 / 91 %</text>
+  <text x="205" y="184" class="mathm">supplies: backbone + action head</text>
+
+  <rect x="40" y="270" width="330" height="120" rx="10" class="frozen"/>
+  <text x="205" y="302" class="mod">memv3 M2 live arm, 40K &#10052;</text>
+  <text x="205" y="328" class="sub">certified read: gap_act +0.143, control 0</text>
+  <text x="205" y="350" class="sub">writer &#183; read/cond projections &#183; retro predictor</text>
+  <text x="205" y="374" class="mathm">supplies: the memory stack</text>
+
+  <!-- merge -->
+  <path d="M370 140 C 430 140 430 210 480 224" class="flow"/>
+  <path d="M370 330 C 430 330 430 260 480 246" class="flow"/>
+  <rect x="480" y="190" width="240" height="90" rx="10" class="merge"/>
+  <text x="600" y="226" class="mod">state-dict merge</text>
+  <text x="600" y="252" class="sub">m3p1_merge_warmstart.py</text>
+
+  <!-- graft training -->
+  <path d="M720 235 H790" class="flow"/>
+  <rect x="790" y="120" width="330" height="230" rx="10" class="trainable"/>
+  <text x="955" y="154" class="mod">graft co-training &#183; 10K steps</text>
+  <text x="955" y="182" class="sub">mixture: 67 % vanilla LIBERO (per-draw)</text>
+  <text x="955" y="202" class="sub">+ 29 % certified anchors + libero_mem</text>
+  <text x="955" y="228" class="mathm">&#8466; = &#8466;_action + 0.5&#183;&#8466;_retro + 0.2&#183;&#8466;_pick</text>
+  <text x="955" y="254" class="sub">gentle rates: DiT 3e-5 &#183; memory 5e-5 &#183; predictor 1e-5</text>
+  <text x="955" y="274" class="sub">retro losses stay ON (anti-erasure)</text>
+  <text x="955" y="294" class="sub">K=2 non-detached &#183; fp32 retro branch</text>
+  <text x="955" y="318" class="sub">frame-buffer server at every eval</text>
+
+  <!-- gates -->
+  <path d="M1120 235 H1190" class="flow"/>
+  <rect x="1190" y="150" width="180" height="170" rx="10" class="frozen" stroke-dasharray="6 5"/>
+  <text x="1280" y="182" class="mod" style="font-size:16px">dual gates</text>
+  <text x="1280" y="210" class="sub">every 2.5K:</text>
+  <text x="1280" y="234" class="loss" text-anchor="middle">gap_act &#8811; 0</text>
+  <text x="1280" y="256" class="sub">(read preserved)</text>
+  <text x="1280" y="282" class="loss" text-anchor="middle">goal &#8805; 50 %</text>
+  <text x="1280" y="304" class="sub">(competence preserved)</text>
+
+  <!-- footer -->
+  <text x="30" y="430" class="note">Why this variant: memv3 proved the read (gap_act 2.25 &#8594; 14.27 &#215;10&#8315;&#178; with the causal control at exactly 0) but its video warm start + 35 %-vanilla</text>
+  <text x="30" y="452" class="note">draws never bought closed-loop competence (goal plateau ~2 %). memv3.1 stops paying for competence and reading from the same budget: competence is</text>
+  <text x="30" y="474" class="note">inherited from the 100K co-train, the read is inherited from memv3, and 10K gentle steps let the competent action head learn to consume the extra</text>
+  <text x="30" y="496" class="note">8 read tokens while the retro losses keep the memory content alive. PASS = both gates simultaneously &#8212; the first checkpoint that is competent AND reads.</text>
+</svg>

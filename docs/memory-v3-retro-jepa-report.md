@@ -94,10 +94,68 @@ lock also held throughout: `retro_loss_raw` *improved* under BC (1.587 →
 1.42) instead of being optimized away, and pick accuracy rose to ~0.87 on
 robot burn-in windows.
 
-## Endpoint evaluation
+## The 10K closed-loop result and the dose extension
 
-_(pending)_
+The 10K battery came back at floor everywhere (MIKASA 0/200 both arms,
+LIBERO-Mem 0/200 both, LIBERO regression 1/0/0/~0 %). Diagnosis, in order:
+the disclosed static-frame serve approximation was suspected first — but the
+bypass probe (read tokens removed) was *also* at floor, and the prior-read
+checkpoint (mismatch-free by construction) was too. The common factor is the
+**training configuration**: 10K steps from a *video* warm start on a
+34 %-vanilla mixture is below the closed-loop acquisition threshold for
+every arm (memv2.4's guardrail had shown the same on this mixture). The
+teacher-forced action losses were the best of the program throughout.
+
+Decision (within the granted tuning authority, logged): extend M2 to 40K,
+same mixture (a mixture change would break arm comparability), and implement
+the **serve-time frame buffer** regardless — the server now keeps a rolling
+8-frame per-view history so the writer sees real motion-bearing clips at
+inference (train/serve parity).
+
+**Extension incidents, all disclosed:** a stale `.training_complete` marker
+from the 10K run silently blocked the first requeue (arms resubmitted from
+boundary saves; rule logged); the gate watcher's guardrail schedule needed
+updating for the new steps; one server dtype bug from our own fix (fp32
+projections vs bf16 serving) was caught by the smoke and reverted; sim-side
+EGL flakes required one retry wave.
+
+## The complete gate ladder (2.5K → 40K) — the program's central result
+
+| step | live `gap_act` (n=32; n=72 at endpoints) | prior-read control | LIBERO-goal guardrail |
+|---|---|---|---|
+| 2,500 | +2.25×10⁻² | exactly 0 | — |
+| 5,000 | +3.12×10⁻² | exactly 0 | — |
+| 7,500 | +4.94×10⁻² | exactly 0 | — |
+| 10,000 (n=72) | +7.03×10⁻² | exactly 0 | ~0–1 % |
+| 20,000 | +7.84×10⁻² | exactly 0 | 1.5 % |
+| 30,000 | +10.58×10⁻² | exactly 0 | 1.5 % |
+| **40,000 (n=72)** | **+14.27×10⁻²** [+1.19, +1.68]×10⁻¹, p<10⁻⁴ | **exactly 0** | 2.0 % |
+
+The memory-read effect on actions grew **6×** across training, never
+saturated, and the causal control returned *identically zero* at all nine
+measurements. The live arm's teacher-forced action loss ran 30–40 % below
+the control's throughout. For scale: the pre-registered PASS bar was
+1×10⁻⁴ (endpoint: 1,400×); memv1's foreign swap was p=0.46 at n=400;
+memv2's best endpoint was +4.6×10⁻⁶.
+
+## Closed-loop at 40K
+
+| eval | live ckpt | prior-read ckpt |
+|---|---|---|
+| MIKASA anchors (4×50), live memory | 0.5 % (1/200) | 0 % |
+| MIKASA anchors, bypass | 0 % | 0.5 % |
+| LIBERO-Mem (10×20) | _(landing)_ | _(landing)_ |
+| LIBERO regression (4×20 ea.) | _(landing)_ | — |
+| LIBERO-goal guardrail trend | 1.5 → 1.5 → 2.0 % (flat) | — |
+
+**The honest split verdict:** the content read is established beyond any
+reasonable doubt (mechanism-level PASS, over-determined), but this training
+configuration — video warm start, 34 % vanilla share, BC only — does **not**
+convert the read into closed-loop task success within 40K steps. The
+guardrail plateau at ~2 % localizes the cap in the configuration, not the
+memory: competence and read are now separately measurable, and this run
+bought the read at the price of competence-training dose.
 
 ## Final analysis
 
-_(pending)_
+_(assembled after the last two evals land)_

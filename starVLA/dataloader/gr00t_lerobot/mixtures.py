@@ -231,4 +231,29 @@ DATASET_NAMED_MIXTURES = {
         ("mikasa_timed_transfer_medium_vla_v0", 1.0, "mikasa_robo"),
     ],
 
+    # memv3.1 graft: competence-first shares — ~61% vanilla LIBERO carries
+    # the already-competent action head; certified anchors (x0.5) + libero_mem
+    # keep the retro losses supplied with demand-bearing episodes.
+    "memv3p1_mix": [
+        ("libero_object_no_noops_1.0.0_lerobot", 4.0, "libero_franka"),
+        ("libero_goal_no_noops_1.0.0_lerobot", 4.0, "libero_franka"),
+        ("libero_spatial_no_noops_1.0.0_lerobot", 4.0, "libero_franka"),
+        ("libero_10_no_noops_1.0.0_lerobot", 4.0, "libero_franka"),
+        ("libero_mem_1.0.0_lerobot", 1.0, "libero_franka"),
+        ("mikasa_shell_game_shuffle_color_lamp_touch_vla_v0", 0.5, "mikasa_robo"),
+        ("mikasa_gather_and_recall_5_vla_v0", 0.5, "mikasa_robo"),
+        ("mikasa_batteries_checker_easy_3_vla_v0", 0.5, "mikasa_robo"),
+        ("mikasa_gather_and_recall_3_vla_v0", 0.5, "mikasa_robo"),
+        ("mikasa_shell_game_shuffle_touch_vla_v0", 0.5, "mikasa_robo"),
+        ("mikasa_trace_shape_medium_vla_v0", 0.5, "mikasa_robo"),
+        ("mikasa_chain_of_colors_7_vla_v0", 0.5, "mikasa_robo"),
+        ("mikasa_bunch_of_colors_5_vla_v0", 0.5, "mikasa_robo"),
+        ("mikasa_blink_count_button_press_medium_vla_v0", 0.5, "mikasa_robo"),
+        ("mikasa_seq_of_colors_5_vla_v0", 0.5, "mikasa_robo"),
+        ("mikasa_chain_of_colors_5_vla_v0", 0.5, "mikasa_robo"),
+        ("mikasa_chain_of_colors_3_vla_v0", 0.5, "mikasa_robo"),
+        ("mikasa_take_it_back_vla_v0", 0.5, "mikasa_robo"),
+        ("mikasa_timed_transfer_medium_vla_v0", 0.5, "mikasa_robo"),
+    ],
+
 }
