@@ -260,7 +260,7 @@ DATASET_NAMED_MIXTURES = {
     # strongest C0-certified anchors 7.9% each (47.4%), vanilla LIBERO 21.1%
     # as the retention anchor. From the m3.1 competent+reading checkpoint.
     "memv3p2_mix": [
-        ("libero_mem_1.0.0_lerobot", 6.0, "libero_franka"),
+        ("libero_mem_1.0.0_lerobot", 10.0, "libero_franka"),
         ("libero_object_no_noops_1.0.0_lerobot", 1.0, "libero_franka"),
         ("libero_goal_no_noops_1.0.0_lerobot", 1.0, "libero_franka"),
         ("libero_spatial_no_noops_1.0.0_lerobot", 1.0, "libero_franka"),
