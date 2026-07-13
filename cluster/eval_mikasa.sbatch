@@ -57,7 +57,7 @@ SIM_BACKEND=${SIM_BACKEND:-auto}          # 'auto' = CPU sim + Vulkan GPU render
 RENDER_MODE=${RENDER_MODE:-none}          # 'none' keeps the human render camera off
 MAX_STEPS_CAP=${MAX_STEPS_CAP:-0}
 WITH_STATE=${WITH_STATE:-true}
-UNNORM_KEY=${UNNORM_KEY:-franka}
+UNNORM_KEY=${UNNORM_KEY:-mikasa_robo}
 # Job-unique port: co-scheduled eval jobs on one node must not collide
 # (the client-server mode handshake aborts on a mismatched server).
 BASE_PORT=${BASE_PORT:-$((15183 + SLURM_JOB_ID % 997))}

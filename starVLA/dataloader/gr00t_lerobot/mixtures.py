@@ -256,4 +256,21 @@ DATASET_NAMED_MIXTURES = {
         ("mikasa_timed_transfer_medium_vla_v0", 0.5, "mikasa_robo"),
     ],
 
+    # memv3.2 memory-dose (per-draw = weight/sum): libero_mem 31.6%, the six
+    # strongest C0-certified anchors 7.9% each (47.4%), vanilla LIBERO 21.1%
+    # as the retention anchor. From the m3.1 competent+reading checkpoint.
+    "memv3p2_mix": [
+        ("libero_mem_1.0.0_lerobot", 6.0, "libero_franka"),
+        ("libero_object_no_noops_1.0.0_lerobot", 1.0, "libero_franka"),
+        ("libero_goal_no_noops_1.0.0_lerobot", 1.0, "libero_franka"),
+        ("libero_spatial_no_noops_1.0.0_lerobot", 1.0, "libero_franka"),
+        ("libero_10_no_noops_1.0.0_lerobot", 1.0, "libero_franka"),
+        ("mikasa_shell_game_shuffle_color_lamp_touch_vla_v0", 1.5, "mikasa_robo"),
+        ("mikasa_gather_and_recall_5_vla_v0", 1.5, "mikasa_robo"),
+        ("mikasa_batteries_checker_easy_3_vla_v0", 1.5, "mikasa_robo"),
+        ("mikasa_gather_and_recall_3_vla_v0", 1.5, "mikasa_robo"),
+        ("mikasa_shell_game_shuffle_touch_vla_v0", 1.5, "mikasa_robo"),
+        ("mikasa_trace_shape_medium_vla_v0", 1.5, "mikasa_robo"),
+    ],
+
 }
