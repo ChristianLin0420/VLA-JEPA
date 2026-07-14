@@ -254,6 +254,59 @@ merge the memory stack into your best competent policy and co-train gently
 for ~10K (graft). Total marginal cost of memory over the base policy:
 ~1.5 days of 8×H100.
 
+## memv3.2 — the memory-dose run: the structural verdict
+
+**Question.** m3.1 left one gap: the model reads its memory but scores 0 on
+the memory benchmarks. Diagnosis (video-confirmed): on repetition tasks the
+policy executes the first primitive then **freezes at the subgoal decision**
+("was that rep 1 or 3?") — every episode times out at exactly 103 decisions;
+MIKASA is additionally under-fit open-loop (teacher-forced action loss 3–6×
+LIBERO's). m3.2 tested the *dose* hypothesis: from the m3.1 checkpoint,
+train with LIBERO-Mem and the strongest anchors dominating the mixture.
+
+**Dose ladder (pre-registered escalation fired at 10K):** libero_mem 31.6 %
+of draws for 10K steps → **43.5 % for the final 10K** (single-knob rule from
+the decision log), action-head LR restored to 1×10⁻⁴.
+
+| gate | read `gap_act` | LIBERO-goal retention | LIBERO-Mem (200 eps) |
+|---|---|---|---|
+| 5K | +4.0×10⁻² | 82.5 % | 0 succ / 0 early-term |
+| 10K | +5.7×10⁻² | 90 % | 0 / 0 → **escalation** |
+| 15K | +5.8×10⁻² | 95 % | 0 / 0 |
+| **20K (n=72)** | **+11.8×10⁻², p<10⁻⁴** | 90.5 % | **0 / 0** |
+
+**20K battery:** LIBERO 55.5/90.5/92/96 (goal/object/spatial at m3.1 level;
+libero_10 traded 66.5→55.5 under the mixture shift); LIBERO-Mem 0/200 with
+zero early terminations at every gate; MIKASA with the *corrected* unnorm
+key (`new_embodiment`): live 0 %, bypass 0.5 % — still floor, confirming
+the unnormalization was never the MIKASA blocker (the program-long `franka`
+default was a ~6 % scale distortion; the first "fix" to `mikasa_robo` used a
+nonexistent key and failed loudly; all three states disclosed).
+
+**Verdict: STRUCTURAL.** With ~13K libero_mem-equivalent training steps
+(more than every prior round combined), retention at 90–95 % proving
+capacity was never the constraint, and the strongest memory read of the
+whole program (+0.118) — **not one of 800 evaluated episodes ever terminated
+early**. Behavior cloning on this data does not produce
+repetition-subgoal *selection*, regardless of dose: the expert
+demonstrations at the freeze states are multimodal (place-again vs proceed),
+BC averages the modes, and the average is a fixed point (hover). The read
+supplies the disambiguating information; the *objective* never forces the
+policy to act on it.
+
+**Next variant, concrete:**
+1. **(cheapest first) Transition-biased segment sampling** — oversample
+   training segments whose supervised window *crosses a subgoal boundary*
+   (detectable in demos from gripper open/close + object-height signatures),
+   so BC sees the decision states with their memory-conditioned resolutions
+   at high frequency instead of ~1/103 of draws. Dataloader-only change.
+2. **(principled fix) RL fine-tune with sparse success reward** on
+   LIBERO-Mem from the m3.2 checkpoint — at the freeze state, "hover" earns
+   nothing and "act on the count" earns reward; the multimodality collapses
+   toward the memory-conditioned mode. This is also what the MIKASA
+   literature (NeurIPS'25) found to be the only objective that converts.
+3. (architectural) SlotSSM-style subgoal-stage head if 1–2 both fail.
+
 **Caveats:** prior-read (not shuffled-state) control semantics at
 per-device batch 1; gap_rec confounded in schema 3 (splice moves the retro
 targets; gap_act is the endpoint); the 1K writer-freeze warmup was dropped

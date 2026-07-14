@@ -296,3 +296,56 @@ boundary. Tuning policy at the bottom.
   MIKASA remain floor (read->memory-task-success conversion = future work,
   now startable from a competent+reading checkpoint). Final model:
   vlajepa_runs/vlajepa_m3p1_graft/checkpoints/VLA-JEPA-m3p1-graft-step_10000.pt
+- **m3.2 memory-dose LAUNCHED (07-12 16:20, job 6146759, SHA c4c02a7):**
+  from the m3.1 ckpt; memv3p2_mix (libero_mem 31.6% / six strongest anchors
+  47.4% / vanilla 21.1% per-draw); action LR restored 1e-4; 20K steps;
+  MIKASA eval unnorm fixed to mikasa_robo. Gates 5K/10K/15K/20K = fwdseq +
+  goal-retention guardrail (>=80% of 91.5%) + libero_mem emergence eval.
+  Diagnosis basis: LIBERO-Mem freeze-at-subgoal (103-decision timeouts,
+  video-confirmed mid-air stall), MIKASA open-loop under-fit (act loss
+  3-6x LIBERO).
+- **m3.2 started (19:02), step 590:** m3.1 ckpt loaded strict, fresh run
+  dir, zero Tracebacks. Action 0.0508 — starts LOW as expected (competence
+  carried over even under the libero_mem-heavy mixture); retro_raw 1.307 —
+  read machinery intact. Healthy. 20K ETA ~7h; first gate at 5K (~1.7h).
+- **m3.2 5K fwdseq (22:38): gap_act +4.0e-2 (p=0.003)** — read alive under
+  the inverted mixture. Guardrail + libero_mem emergence evals queued.
+- **m3.2 watcher tag bug (23:42):** guardrail block gated on tag="live" but
+  m3.2's tag is "memdose" — 5K guardrail+libero_mem never submitted. Fixed,
+  watcher restarted, both 5K evals submitted manually. Training requeued at
+  its 4h boundary (marker clean, resumes ~5.4K).
+- **m3.2 5K verdicts (04:55): retention GREEN — 82.5% goal** (bar ~73%);
+  the inverted mixture is not costing competence. libero_mem at 79/200 eps:
+  0 successes, 0 early terminations — freeze not yet broken at 5K (only
+  ~1.6K libero_mem-equivalent steps); the 10K wave carries the pre-logged
+  tuning decision. Read gate was already green (+4.0e-2).
+- **m3.2 ESCALATION FIRED (07-13 07:00):** 10K gate 0-success/0-early-term
+  at 112 eps + retention healthy -> pre-logged single knob: libero_mem
+  weight 6.0->10.0 (share 31.6%->43.5%). Killed 6146759 (boundary saves
+  intact), committed fc2b73c, relaunched as 6153703 (resumes ~11K, runs to
+  20K under the heavier mixture). EXPECTATION SET: if the remaining ~9K at
+  43.5% share also yields 0/0, the freeze is NOT dose-limited -> report
+  verdict pivots to structural BC limitation on repetition subgoals; next
+  lever = RL or transition-biased sampling.
+- **10K libero_mem baseline FINAL (08:30): 200 eps, 0 successes, 0 early
+  terminations** — the pre-escalation baseline is locked. Training +
+  10K guardrail still queued.
+- **Escalated run live (10:05):** resumed at 11,500 under 43.5% libero_mem.
+  **10K guardrail: 90% goal** — retention rock solid under the memory-heavy
+  mixture (m3.1 ref 91.5%). All gates green except the emergence question,
+  which the 15K/20K waves decide.
+- **15K verdicts (12:32): retention 95% (!!) — climbing under the 43.5%
+  mixture (82.5/90/95). libero_mem STILL 0/0 at 150 eps after ~4K escalated
+  steps. The structural interpretation hardens: read alive + retention
+  excellent + heavy in-distribution dose + zero early terminations = BC
+  does not produce repetition-subgoal behavior on this data. 20K finalizes.
+- **m3.2 FINAL (07-13 16:30): STRUCTURAL VERDICT.** 20K: endpoint gap_act
+  +0.118 (n=72, p<1e-4, program max); retention ladder 82.5/90/95/90.5;
+  lbreg 55.5/90.5/92/96; libero_mem 0/200 with ZERO early terminations at
+  every gate (800 episodes total). BC does not produce repetition-subgoal
+  selection regardless of dose — expert multimodality at freeze states
+  averages to hover. MIKASA unnorm saga: franka (program-long, ~6% distort)
+  -> mikasa_robo (nonexistent key, jobs failed) -> new_embodiment (correct;
+  rerun 6160975/76 in flight = first properly-unnormalized MIKASA numbers).
+  Next variant: transition-biased sampling (cheap) or RL sparse-success
+  (principled).
